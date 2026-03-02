@@ -3,6 +3,14 @@ import array
 
 
 class CMemoryManager:
+    """
+    一个高效的、零拷贝的内存管理器。
+    它负责 C 级别连续内存的申请、生命周期管理和 Pythonic 视图生成。
+    核心目标是为 Cython/C++ 模块提供安全、高效的裸指针访问，同时防止内存被 Python GC 意外回收。
+    """
+    # --- 优化: 使用 __slots__ 替代 __dict__，提升属性访问速度并降低内存占用 ---
+    __slots__ = ("_cache", "view", "ptr", "format_char", "shape")
+
     _CTYPES_MAP = {
         "d": ctypes.c_double,
         "f": ctypes.c_float,
@@ -13,9 +21,10 @@ class CMemoryManager:
     }
 
     def __init__(self):
+        """初始化一个空的内存管理器实例。"""
         self._cache = None
         self.view = None
-        self.ptr_addr = 0
+        self.ptr = 0
         self.format_char = ""
         self.shape = ()
 
@@ -37,12 +46,12 @@ class CMemoryManager:
         if total_elements <= 0:
             return instance
 
-        # 1. 申请物理内存并存入 cache 防 GC
+        # 1. 申请物理内存并存入 _cache 防 GC
         ctype_base = CMemoryManager._CTYPES_MAP[format_char]
         instance._cache = (ctype_base * total_elements)()
 
         # 2. 记录基础信息
-        instance.ptr_addr = ctypes.addressof(instance._cache)
+        instance.ptr = ctypes.addressof(instance._cache)
         instance.format_char = format_char
         instance.shape = shape
 
@@ -55,97 +64,74 @@ class CMemoryManager:
     def from_list(data_list: list, format_char: str = "f", shape: tuple = None):
         """
         将 Python 列表转化为 C 连续内存，返回管理器实例。
-        用法: mem = CMemoryManager.from_list([1.0, 2.0], "f", (2, 1))
         """
         instance = CMemoryManager()
         if not data_list:
             return instance
 
-        # 存入实例变量，强行续命防 GC！
+        # 1. 使用 array.array 高效创建 C 数组，并存入 _cache 防 GC
         instance._cache = array.array(format_char, data_list)
-        mv = memoryview(instance._cache)
 
+        # 2. 记录基础信息
+        instance.ptr, _ = instance._cache.buffer_info()
         instance.format_char = format_char
-        instance.shape = shape if shape else (len(data_list),)
-        instance.ptr_addr = instance._cache.buffer_info()[0]
-
-        # 💥 优化: 直接使用原生 .cast 链式重塑，抛弃旧函数依赖
-        if shape is not None:
-            instance.view = mv.cast("B").cast(format_char, shape=shape)
-        else:
-            instance.view = mv
+        
+        # 3. 生成零拷贝视图
+        # 💥 优化: 直接使用原生 .cast 链式重塑
+        final_shape = shape if shape is not None else (len(data_list),)
+        instance.shape = final_shape
+        instance.view = memoryview(instance._cache).cast("B").cast(format_char, shape=final_shape)
 
         return instance
 
     @staticmethod
-    def from_ptr(ptr_addr: int, format_char: str, shape: tuple):
+    def from_ptr(address: int, format_char: str, shape: tuple):
         """
-        从外部 C/C++ 裸指针直接映射内存视图。
-        它不拥有内存的生命周期（_cache 为 None），只提供安全读写的 Python 视图。
-        用法: mem = CMemoryManager.from_ptr(raw_addr, "f", (100, 3))
+        从已存在的内存地址创建一个只读的内存视图管理器。
+        注意: 此方法不管理内存的生命周期，调用者需确保该内存地址持续有效。
         """
         instance = CMemoryManager()
-
-        if ptr_addr == 0 or not shape:
+        if not address or not shape:
             return instance
-
-        if format_char not in CMemoryManager._CTYPES_MAP:
-            raise ValueError(f"Unsupported format character: {format_char}")
-
+            
         total_elements = 1
         for dim in shape:
             total_elements *= dim
-
         if total_elements <= 0:
             return instance
 
-        # 建立 ctypes 数组映射
+        # 1. 计算内存大小和 C 类型
         ctype_base = CMemoryManager._CTYPES_MAP[format_char]
-        ArrayType = ctype_base * total_elements
-        ctypes_array = ArrayType.from_address(ptr_addr)
-
-        # 记录基础信息
-        instance.ptr_addr = ptr_addr
+        buffer_size = total_elements * ctypes.sizeof(ctype_base)
+        
+        # 2. 从裸指针创建 ctypes 数组 (无拷贝)
+        c_array_type = (ctype_base * total_elements)
+        instance._cache = c_array_type.from_address(address)
+        
+        # 3. 记录基础信息
+        instance.ptr = address
         instance.format_char = format_char
         instance.shape = shape
 
-        # 💥 生成零拷贝视图
-        instance.view = memoryview(ctypes_array).cast("B").cast(format_char, shape=shape)
+        # 4. 生成零拷贝视图
+        # 💥 优化: ctypes 对象原生支持 memoryview 协议，无需二次转换
+        instance.view = memoryview(instance._cache).cast("B").cast(format_char, shape=shape)
 
         return instance
 
-    def reshape(self, new_shape: tuple):
+    def reshape(self, new_shape: tuple) -> "CMemoryManager":
         """
-        重塑当前持有的视图，并返回一个新的 CMemoryManager 实例。
-        原对象的数据和状态不会受到任何影响（绝对安全）。
-        自动适配机制：如果新形状需要的元素少于当前容量，自动截断尾部无效数据。
+        在不改变底层数据的情况下，返回一个具有新维度的内存管理器实例。
+        这是一个零拷贝操作。
         """
-        if self.view is None:
-            raise RuntimeError("当前管理器没有持有任何视图！")
+        # 创建一个新的实例来持有新的视图，但共享底层的 _cache
+        new_instance = CMemoryManager()
+        new_instance._cache = self._cache  # 共享引用，防止 GC
+        new_instance.ptr = self.ptr
+        new_instance.format_char = self.format_char
+        new_instance.shape = new_shape
+        new_instance.view = self.view.cast(self.format_char, shape=new_shape)
+        return new_instance
 
-        # 1. 计算目标形状到底需要多少个元素
-        target_elements = 1
-        for dim in new_shape:
-            target_elements *= dim
-
-        # 2. 将当前视图强行展平为 1D 视图，方便计算和切片
-        flat_view = self.view.cast("B").cast(self.format_char)
-        current_elements = len(flat_view)
-
-        # 3. 拦截越界：你要的积木比我总共拥有的还多，那只能报错了
-        if target_elements > current_elements:
-            raise ValueError(f"重塑失败: 目标形状需要 {target_elements} 个元素，但当前内存仅有 {current_elements} 个。")
-
-        # 4. 🌟 创建全新的管理器实例
-        new_manager = CMemoryManager()
-        new_manager.format_char = self.format_char
-        new_manager.shape = new_shape
-        new_manager.ptr_addr = self.ptr_addr
-        
-        # 💥 核心：将底层的 _cache 引用传递给新对象，确保原生内存不会被提早 GC 回收
-        new_manager._cache = self._cache 
-
-        # 5. 在新对象上生成零拷贝的重塑视图
-        new_manager.view = flat_view[:target_elements].cast("B").cast(self.format_char, shape=new_shape)
-
-        return new_manager
+    def __repr__(self) -> str:
+        return f"<CMemoryManager ptr=0x{self.ptr:X} format='{self.format_char}' shape={self.shape}>"

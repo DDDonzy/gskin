@@ -95,7 +95,7 @@ def raycast(
             thread_u[tid] = u
             thread_v[tid] = v
 
-    # 💥 3. 全局比对大收网！
+    # 3. 全局比对
     global_closest_t: cython.float = 999999.0
     global_hit_tri: cython.int = -1
     global_u: cython.float = 0.0
@@ -108,18 +108,42 @@ def raycast(
             global_u = thread_u[i]
             global_v = thread_v[i]
 
-    # 💥 4. 直接在这里算出碰撞坐标！
-    hit_x: cython.float
-    hit_y: cython.float
-    hit_z: cython.float
+    # 4. 计算最终结果
+    hit_x: cython.float; hit_y: cython.float; hit_z: cython.float
+    normal_x: cython.float; normal_y: cython.float; normal_z: cython.float
 
     if global_hit_tri != -1:
+        # --- 在 Cython 中计算法线 ---
+        v0_idx = tri_indices2D[global_hit_tri, 0]
+        v1_idx = tri_indices2D[global_hit_tri, 1]
+        v2_idx = tri_indices2D[global_hit_tri, 2]
+
+        edge1_x = points[v1_idx, 0] - points[v0_idx, 0]
+        edge1_y = points[v1_idx, 1] - points[v0_idx, 1]
+        edge1_z = points[v1_idx, 2] - points[v0_idx, 2]
+        edge2_x = points[v2_idx, 0] - points[v0_idx, 0]
+        edge2_y = points[v2_idx, 1] - points[v0_idx, 1]
+        edge2_z = points[v2_idx, 2] - points[v0_idx, 2]
+
+        raw_normal_x: cython.float = edge1_y * edge2_z - edge1_z * edge2_y
+        raw_normal_y: cython.float = edge1_z * edge2_x - edge1_x * edge2_z
+        raw_normal_z: cython.float = edge1_x * edge2_y - edge1_y * edge2_x
+        
+        norm_len: cython.float = (raw_normal_x**2 + raw_normal_y**2 + raw_normal_z**2)**0.5
+        if norm_len > 0.000001:
+            normal_x = raw_normal_x / norm_len
+            normal_y = raw_normal_y / norm_len
+            normal_z = raw_normal_z / norm_len
+        else:
+            normal_x, normal_y, normal_z = 0.0, 0.0, 1.0
+
+        # --- 计算碰撞点坐标 ---
         hit_x = orig_x + dir_x * global_closest_t
         hit_y = orig_y + dir_y * global_closest_t
         hit_z = orig_z + dir_z * global_closest_t
         
-        # 完美对齐你要的签名: status, position, id, t, u, v
-        return True, (hit_x, hit_y, hit_z), global_hit_tri, global_closest_t, global_u, global_v
+        # --- 返回所有结果 ---
+        return True, (hit_x, hit_y, hit_z), (normal_x, normal_y, normal_z), global_hit_tri, global_closest_t, global_u, global_v
     else:
-        # 没击中时，给一套安全的默认防爆破参数
-        return False, (0.0, 0.0, 0.0), -1, 0.0, 0.0, 0.0
+        # --- 未击中 ---
+        return False, (0.0, 0.0, 0.0), (0.0, 0.0, 0.0), -1, 0.0, 0.0, 0.0

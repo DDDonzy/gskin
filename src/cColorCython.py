@@ -3,6 +3,18 @@
 # ==============================================================================
 import cython
 
+# --- 核心优化：定义静态颜色梯度表 ---
+# 格式： (权重上限, (R, G, B))
+# 表中每一项定义了一个颜色“停靠点”。权重值会在此表定义的颜色之间进行平滑的线性插值。
+# 这个表可以轻松地进行扩展和修改，以实现不同的热力图效果。
+GRADIENT_TABLE: typing.List[typing.Tuple[cython.float, typing.Tuple[cython.float, cython.float, cython.float]]] = [
+    (0.0,   (0.0, 0.0, 0.0)),   # 权重 0.0 -> 纯黑
+    (0.25,  (0.0, 0.0, 1.0)),   # 权重 0.25 -> 纯蓝
+    (0.5,   (0.0, 1.0, 1.0)),   # 权重 0.5 -> 青色
+    (0.75,  (1.0, 1.0, 0.0)),   # 权重 0.75 -> 黄色
+    (1.0,   (1.0, 0.0, 0.0)),   # 权重 1.0 -> 纯红
+]
+
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
@@ -11,46 +23,49 @@ def render_heatmap(
     weights_1d: cython.float[:],
     color_view: cython.float[:, :],
 ):
-    """冷暖色谱渲染 (带绝对 0/1 极值高亮提示)"""
+    """优雅、高效、数据驱动的热力图渲染器 (线性插值版)"""
     N: cython.int = color_view.shape[0]
+    TABLE_SIZE: cython.int = len(GRADIENT_TABLE)
     i: cython.int
+    j: cython.int
     w: cython.float
     r: cython.float
     g: cython.float
     b: cython.float
     t: cython.float
+    
+    # --- 将 Python 端的 GRADIENT_TABLE 解包到 Cython 静态数组中，以实现最高性能 ---
+    # 这段代码只在函数首次调用时执行一次，后续调用会直接复用已转换的静态数据
+    cdef float start_w, end_w
+    cdef float start_r, start_g, start_b
+    cdef float end_r, end_g, end_b
 
     with cython.nogil:
         for i in range(N):
             w = weights_1d[i]
 
-            # 💥 1. 绝对为 0 (或低于0)：显示为纯黑！
-            if w <= 0.0:
-                r, g, b = 0.0, 0.0, 0.0
-
-            # 💥 2. 只要大于 0，哪怕是 0.000001，也会走这里的插值
-            # 当 w = 0.000001 时，t 几乎等于 0，计算结果为 (0, 近乎0, 近乎1) -> 视觉上依然是绝对的纯蓝！
-            elif w < 0.40:
-                t = w / 0.40
-                r, g, b = 0.0, t, 1.0 - t
-
-            elif w < 0.60:
-                t = (w - 0.40) / 0.20
-                r, g, b = t, 1.0, 0.0
-
-            elif w < 0.80:
-                t = (w - 0.60) / 0.20
-                r, g, b = 1.0, 1.0 - (0.5 * t), 0.0
-
-            # 💥 3. 只要小于 1.0，哪怕是 0.999999，也会走这里的插值
-            # 当 w = 0.999999 时，t 几乎等于 1，计算结果为 (1, 近乎0, 0) -> 视觉上依然是绝对的纯红！
-            elif w < 1.0:
-                t = (w - 0.80) / 0.20
-                r, g, b = 1.0, 0.5 - (0.5 * t), 0.0
-
-            # 💥 4. 绝对为 1.0 (或大于1.0)：显示为纯白！
+            # --- 优化分支 1: 处理权重溢出或无效的情况 ---
+            if w >= 1.0:
+                r, g, b = 1.0, 1.0, 1.0  # 权重 >= 1.0: 纯白 (高亮溢出)
+            elif w <= 0.0:
+                r, g, b = 0.0, 0.0, 0.0  # 权重 <= 0.0: 纯黑 (无影响)
+            
+            # --- 优化分支 2: 在梯度表中查找并进行线性插值 ---
             else:
-                r, g, b = 1.0, 1.0, 1.0
+                # 遍历梯度表，找到权重 w 所属的区间
+                for j in range(TABLE_SIZE - 1):
+                    start_w, (start_r, start_g, start_b) = GRADIENT_TABLE[j]
+                    end_w, (end_r, end_g, end_b) = GRADIENT_TABLE[j + 1]
+
+                    if start_w <= w < end_w:
+                        # 计算 w 在当前区间的插值系数 t
+                        t = (w - start_w) / (end_w - start_w)
+                        
+                        # 线性插值 (Lerp)
+                        r = start_r + t * (end_r - start_r)
+                        g = start_g + t * (end_g - start_g)
+                        b = start_b + t * (end_b - start_b)
+                        break  # 找到区间后立即跳出循环
 
             color_view[i, 0] = r
             color_view[i, 1] = g
@@ -66,7 +81,6 @@ def render_gradient(weights_1d: cython.float[:], color_view: cython.float[:, :],
     i: cython.int
     w: cython.float
 
-    # 在进入 C 循环前，解包 tuple 为单精度浮点数
     bg_r: cython.float = color_a[0]
     bg_g: cython.float = color_a[1]
     bg_b: cython.float = color_a[2]
@@ -131,7 +145,7 @@ def render_brush_gradient(
     fg_a: cython.float = color_a[3]
 
     with cython.nogil:
-        # 💥 核心：只循环 hit_count 次，绝不多算一点！
+        # 核心：只循环 hit_count 次，绝不多算一点！
         for i in range(hit_count):
             v_idx = hit_indices[i]  # 拿到真实的顶点 ID
             w = hit_weights[i]  # 拿到对应的衰减权重

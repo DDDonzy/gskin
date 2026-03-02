@@ -1,20 +1,18 @@
-from typing import TYPE_CHECKING
+import typing
 from dataclasses import dataclass
 
-if TYPE_CHECKING:
-    from z_np.src.cSkinDeform import CythonSkinDeformer
+# 统一使用相对路径和模块导入
+from . import cMemoryView
+from . import cBrushCython
 
-from z_np.src.cMemoryView import CMemoryManager
-import z_np.src.cBrushCython as cBrushCython
-
+if typing.TYPE_CHECKING:
+    from . import cDisplayNode
 
 # ==========================================
-# 📦 数据结构定义区 (可以放在这，或者统一定义在总线文件里)
+# 📦 数据结构定义
 # ==========================================
 @dataclass
 class BrushSettings:
-    """UI 面板直接修改此对象的属性，控制器通过引用实时读取。"""
-
     radius: float = 0.5
     strength: float = 0.1
     falloff_type: int = 0
@@ -23,140 +21,72 @@ class BrushSettings:
 
 
 class BrushHitState:
-    """笔刷计算输出的渲染信箱，供 displayNode 读取绘制"""
+    __slots__ = ("hit_count", "hit_indices_mgr", "hit_weights_mgr", "hit_center_position", "hit_center_normal")
 
-    __slots__ = (
-        "hit_count",
-        "hit_indices_mgr",
-        "hit_weights_mgr",
-        "hit_center_position",
-        "hit_center_normal",
-    )
-
-    def __init__(self, vertex_count):
+    def __init__(self, vertex_count: int):
         self.hit_count: int = 0
-        self.hit_indices_mgr: "CMemoryManager" = CMemoryManager.allocate("i", (vertex_count,))
-        self.hit_weights_mgr: "CMemoryManager" = CMemoryManager.allocate("f", (vertex_count,))
-
+        self.hit_indices_mgr: "cMemoryView.CMemoryManager" = cMemoryView.CMemoryManager.allocate("i", (vertex_count,))
+        self.hit_weights_mgr: "cMemoryView.CMemoryManager" = cMemoryView.CMemoryManager.allocate("f", (vertex_count,))
         self.hit_center_position: tuple = (0.0, 0.0, 0.0)
-        self.hit_center_normal: tuple = (0.0, 0.0, 1.0)
+        self.hit_center_normal: tuple = (0.0, 1.0, 0.0)
 
     def clear(self):
         self.hit_count = 0
         self.hit_center_position = (0.0, 0.0, 0.0)
-        self.hit_center_normal = (0.0, 0.0, 1.0)
+        self.hit_center_normal = (0.0, 1.0, 0.0)
 
 
 # ==========================================
-# 🧠 核心控制器
+# 🧠 核心笔刷逻辑控制器
 # ==========================================
 class WeightBrushCore:
-    """
-    纯粹的无状态逻辑控制器 (Stateless Controller)
-    配置来自引用注入，渲染通过总线提交。
-    """
+    def __init__(self, preview_shape: "cDisplayNode.WeightPreviewShape"):
+        self.preview_shape = preview_shape
+        self.settings: BrushSettings = self.preview_shape.brush_context.brush_settings
+        vertex_count = self.preview_shape.mesh_context.vertex_count
+        self.hit_state = BrushHitState(vertex_count)
+        self.preview_shape.brush_context.brush_hit_state = self.hit_state
 
-    def __init__(self, cSkin: "CythonSkinDeformer"):
-        self.cSkin = cSkin
-
-        # ==========================================
-        # 🔽 1. 输入对接 (Input): 引用总线上的 UI 配置
-        # ==========================================
-        if getattr(self.cSkin.DATA, "brush_settings", None) is None:
-            self.cSkin.DATA.brush_settings = BrushSettings()
-
-        self.settings: BrushSettings = self.cSkin.DATA.brush_settings
-
-        # ==========================================
-        # 🔼 2. 输出挂载 (Output): 自身实例化，并发布到总线
-        # ==========================================
-        v_count = self.cSkin.DATA.vertex_count
-        # 💥 由 WeightBrushCore 全权实例化自己的物理计算结果
-        self.hit_state = BrushHitState(v_count)
-        # 💥 挂载到总线，供 displayNode 和 Undo 读取！
-        self.cSkin.DATA.brush_hit_state = self.hit_state
-
-        # ==========================================
-        # ⚙️ 3. 模型环境数据: 兜底初始化锁定状态
-        # ==========================================
-        i_count = self.cSkin.DATA.influences_count
-        if getattr(self.cSkin.DATA, "influences_locks_mgr", None) is None or len(self.cSkin.DATA.influences_locks_mgr.view) != i_count:
-            self.cSkin.DATA.influences_locks_mgr = CMemoryManager.allocate("B", (i_count,))
-            for i in range(i_count):
-                self.cSkin.DATA.influences_locks_mgr.view[i] = 0
+        skin_ctx = self.preview_shape.skin_context
+        influences_count = skin_ctx.influences_count
+        if not skin_ctx.influences_locks_mgr or len(skin_ctx.influences_locks_mgr.view) != influences_count:
+            skin_ctx.influences_locks_mgr = cMemoryView.CMemoryManager.allocate("B", (influences_count,))
+            skin_ctx.influences_locks_mgr.view[:] = 0
 
     def teardown(self):
-        """生命周期终结，彻底物理销毁"""
-        # 1. 把自己的数据从总线上摘除 (断开对外广播)
-        if hasattr(self.cSkin.DATA, "brush_hit_state"):
-            self.cSkin.DATA.brush_hit_state = None
-
-        # 2. 销毁内部对象引用
-        self.hit_state = None
-        self.settings = None
-        self.cSkin = None
+        if self.preview_shape and self.preview_shape.brush_context: self.preview_shape.brush_context.brush_hit_state = None
+        self.hit_state = None; self.settings = None; self.preview_shape = None
 
     def clear_hit_state(self):
-        """替代原来的 clear_preview_registry"""
-        if self.hit_state:
-            self.hit_state.clear()
+        if self.hit_state: self.hit_state.clear()
 
-    def detect_range(self, center_xyz: tuple, hit_tri: int):
-        """调用 Cython 检测笔刷衰减范围 (侦察兵)"""
-        if self.cSkin.DATA.rawPoints2D_output is None:
-            return 0
+    def detect_range(self, center_xyz: tuple, hit_tri: int) -> int:
+        mesh_ctx = self.preview_shape.mesh_context
+        brush_ctx = self.preview_shape.brush_context
+        if not mesh_ctx or not mesh_ctx.rawPoints2D_output: return 0
 
-        # 💥 全部改为从 self.hit_state 中写入数据
-        self.cSkin.DATA.brush_epoch += 1
+        brush_ctx.brush_epoch += 1
 
         self.hit_state.hit_count = cBrushCython.compute_brush_weights_god_mode(
-            center_xyz,
-            self.cSkin.DATA.rawPoints2D_output.view,
-            self.cSkin.DATA.tri_indices_2D.view,
-            hit_tri,
-            self.cSkin.DATA.adj_offsets.view,
-            self.cSkin.DATA.adj_indices.view,
-            self.settings.radius,
-            self.settings.falloff_type,
-            self.settings.use_surface,
-            self.cSkin.DATA.brush_epoch,
-            self.cSkin.DATA.pool_node_epochs.view,
-            self.cSkin.DATA.pool_dist.view,
-            self.cSkin.DATA.pool_queue.view,
-            self.cSkin.DATA.pool_in_queue.view,
-            self.hit_state.hit_indices_mgr.view,
-            self.hit_state.hit_weights_mgr.view,
-        )
+            center_xyz, mesh_ctx.rawPoints2D_output.view, mesh_ctx.tri_indices_2D.view, hit_tri,
+            mesh_ctx.adj_offsets.view, mesh_ctx.adj_indices.view, self.settings.radius, self.settings.falloff_type,
+            self.settings.use_surface, brush_ctx.brush_epoch, brush_ctx.pool_node_epochs.view,
+            brush_ctx.pool_dist.view, brush_ctx.pool_queue.view, brush_ctx.pool_in_queue.view,
+            self.hit_state.hit_indices_mgr.view, self.hit_state.hit_weights_mgr.view)
 
         self.hit_state.hit_center_position = center_xyz
         return self.hit_state.hit_count
 
     def apply_weight_math(self) -> bool:
-        """
-        调度 Cython 数学核心，修改实际权重 (炮兵)
-        返回: bool (True 表示成功修改了内存，False 表示未作任何修改)
-        """
-        if self.hit_state.hit_count == 0:
-            return False
+        if self.hit_state.hit_count == 0: return False
 
-        modify_weights2D, target_inf, is_mask = self.cSkin.DATA.active_paint_target
+        skin_ctx = self.preview_shape.skin_context
+        modify_weights2D, target_inf, is_mask = self.preview_shape.active_paint_target
+        if modify_weights2D is None: return False
 
-        if modify_weights2D is None:
-            return False
-
-        if is_mask:
-            safe_locks_view = CMemoryManager.allocate("B", (1,)).view
-        else:
-            safe_locks_view = self.cSkin.DATA.influences_locks_mgr.view
+        locks_view = cMemoryView.CMemoryManager.allocate("B", (1,)).view if is_mask else skin_ctx.influences_locks_mgr.view
 
         cBrushCython.skin_weight_brush(
-            self.settings.strength,
-            self.settings.mode,
-            target_inf,
-            safe_locks_view,
-            self.hit_state.hit_indices_mgr.view,
-            self.hit_state.hit_weights_mgr.view,
-            self.hit_state.hit_count,
-            modify_weights2D.view,
-        )
+            self.settings.strength, self.settings.mode, target_inf, locks_view, self.hit_state.hit_indices_mgr.view,
+            self.hit_state.hit_weights_mgr.view, self.hit_state.hit_count, modify_weights2D.view)
         return True
