@@ -5,7 +5,7 @@ import maya.OpenMayaMPx as ompx
 # 鉴于 cSkinDeform 节点本身是基于旧版 API (OM1) 开发的，
 # 它的插件加载器必须使用旧版的 MFnPlugin (ompx.MFnPlugin)。
 # 这是一个为了兼容性而必须保留的特例。
-from ..src import cSkinDeform
+from gskin.src import cSkinDeform
 
 NODE_NAME = "cSkinDeformer"
 # MTypeId 必须使用旧版 API 的对象

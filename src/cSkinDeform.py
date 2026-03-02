@@ -9,7 +9,6 @@ from . import cMemoryView
 from . import cWeightsHandle as CWH
 from . import cSkinDeformCython
 from . import _cRegistry
-from . import _profile
 
 if typing.TYPE_CHECKING:
     from . import cWeightsHandle
@@ -86,46 +85,54 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
 
     def setDependentsDirty(self, plug, dirtyPlugArray):
         weights_plugs = (self.aWeights, self.aWeightsLayerCompound, self.aWeightsLayerMask, self.aWeightsLayer, self.aWeightsLayerEnabled)
-        if plug in weights_plugs: self._weights_is_dirty = True
-        elif plug == self.aInfluenceMatrix: self._influencesMatrix_is_dirty = True
-        elif plug == self.aBindPreMatrix: self._bindPreMatrix_is_dirty = True
-        elif plug == self.aGeomMatrix: self._geoMatrix_is_dirty = True
+        if plug in weights_plugs:
+            self._weights_is_dirty = True
+        elif plug == self.aInfluenceMatrix:
+            self._influencesMatrix_is_dirty = True
+        elif plug == self.aBindPreMatrix:
+            self._bindPreMatrix_is_dirty = True
+        elif plug == self.aGeomMatrix:
+            self._geoMatrix_is_dirty = True
         return super(CythonSkinDeformer, self).setDependentsDirty(plug, dirtyPlugArray)
 
     def preEvaluation(self, context, evaluationNode):
         if context.isNormal():
-            if evaluationNode.dirtyPlugExists(self.aGeomMatrix): self._geoMatrix_is_dirty = True
-            if evaluationNode.dirtyPlugExists(self.aInfluenceMatrix): self._influencesMatrix_is_dirty = True
-            if evaluationNode.dirtyPlugExists(self.aBindPreMatrix): self._bindPreMatrix_is_dirty = True
-            if (evaluationNode.dirtyPlugExists(self.aWeights) or evaluationNode.dirtyPlugExists(self.aWeightsLayerCompound) or
-                evaluationNode.dirtyPlugExists(self.aWeightsLayerMask) or evaluationNode.dirtyPlugExists(self.aWeightsLayer) or
-                evaluationNode.dirtyPlugExists(self.aWeightsLayerEnabled)): self._weights_is_dirty = True
+            if evaluationNode.dirtyPlugExists(self.aGeomMatrix):
+                self._geoMatrix_is_dirty = True
+            if evaluationNode.dirtyPlugExists(self.aInfluenceMatrix):
+                self._influencesMatrix_is_dirty = True
+            if evaluationNode.dirtyPlugExists(self.aBindPreMatrix):
+                self._bindPreMatrix_is_dirty = True
+            if evaluationNode.dirtyPlugExists(self.aWeights) or evaluationNode.dirtyPlugExists(self.aWeightsLayerCompound) or evaluationNode.dirtyPlugExists(self.aWeightsLayerMask) or evaluationNode.dirtyPlugExists(self.aWeightsLayer) or evaluationNode.dirtyPlugExists(self.aWeightsLayerEnabled):
+                self._weights_is_dirty = True
         return super(CythonSkinDeformer, self).preEvaluation(context, evaluationNode)
 
     def deform(self, dataBlock: om1.MDataBlock, geoIter, localToWorldMatrix, multiIndex):
         envelope = dataBlock.inputValue(ompx.cvar.MPxGeometryFilter_envelope).asFloat()
-        if envelope == 0.0: return
+        if envelope == 0.0:
+            return
 
         input_handle = dataBlock.inputArrayValue(ompx.cvar.MPxGeometryFilter_input)
         input_handle.jumpToElement(multiIndex)
         input_geom_obj = input_handle.inputValue().child(ompx.cvar.MPxGeometryFilter_inputGeom).asMesh()
-        
+
         output_handle = dataBlock.outputArrayValue(ompx.cvar.MPxGeometryFilter_outputGeom)
         output_handle.jumpToElement(multiIndex)
         output_geom_obj = output_handle.outputValue().asMesh()
 
-        if input_geom_obj.isNull() or output_geom_obj.isNull(): return
+        if input_geom_obj.isNull() or output_geom_obj.isNull():
+            return
 
         mFnMesh_in = om1.MFnMesh(input_geom_obj)
         vertex_count = mFnMesh_in.numVertices()
         rawPoints_original_mgr = cMemoryView.CMemoryManager.from_ptr(int(mFnMesh_in.getRawPoints()), "f", (vertex_count * 3,))
-        
+
         mFnMesh_out = om1.MFnMesh(output_geom_obj)
         rawPoints_output_mgr = cMemoryView.CMemoryManager.from_ptr(int(mFnMesh_out.getRawPoints()), "f", (vertex_count * 3,))
 
         influences_handle = dataBlock.inputArrayValue(self.aInfluenceMatrix)
         influences_count = influences_handle.elementCount()
-        
+
         if self.skin_context.influences_count != influences_count:
             self.skin_context.influences_count = influences_count
             self.skin_context._influencesMatrix_mgr = cMemoryView.CMemoryManager.allocate("d", (influences_count, 16))
@@ -167,17 +174,27 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
             self.skin_context.weightsLayer = self._get_weights_layers_data(dataBlock)
             self._weights_is_dirty = False
 
-        if not self.skin_context.weightsLayer or not self.skin_context.weightsLayer[-1].weightsHandle.is_valid: return
+        if not self.skin_context.weightsLayer or not self.skin_context.weightsLayer[-1].weightsHandle.is_valid:
+            return
 
         cSkinDeformCython.compute_deform_matrices(
-            int(self._geo_matrix.this), int(self._get_matrix_i.this), self.skin_context._bindPreMatrix_mgr.view,
-            self.skin_context._influencesMatrix_mgr.view, self.skin_context._rotateMatrix_mgr.view,
-            self.skin_context._translateVector_mgr.view, self._geo_matrix_is_identity)
+            int(self._geo_matrix.this),
+            int(self._get_matrix_i.this),
+            self.skin_context._bindPreMatrix_mgr.view,
+            self.skin_context._influencesMatrix_mgr.view,
+            self.skin_context._rotateMatrix_mgr.view,
+            self.skin_context._translateVector_mgr.view,
+            self._geo_matrix_is_identity,
+        )
 
         cSkinDeformCython.run_skinning_core(
-            rawPoints_original_mgr.view, rawPoints_output_mgr.view,
-            self.skin_context.weightsLayer[-1].weightsHandle.memory.view, self.skin_context._rotateMatrix_mgr.view,
-            self.skin_context._translateVector_mgr.view, envelope)
+            rawPoints_original_mgr.view,
+            rawPoints_output_mgr.view,
+            self.skin_context.weightsLayer[-1].weightsHandle.memory.view,
+            self.skin_context._rotateMatrix_mgr.view,
+            self.skin_context._translateVector_mgr.view,
+            envelope,
+        )
 
     def _get_weights_layers_data(self, dataBlock: om1.MDataBlock) -> dict[int, CWH.WeightsLayerData]:
         layer_data_dict = {}
@@ -198,15 +215,30 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
     @classmethod
     def nodeInitializer(cls):
         tAttr, mAttr, nAttr, cAttr = om1.MFnTypedAttribute(), om1.MFnMatrixAttribute(), om1.MFnNumericAttribute(), om1.MFnCompoundAttribute()
-        cls.aGeomMatrix = mAttr.create("geomMatrix", "gm"); mAttr.setHidden(True); mAttr.setKeyable(False)
-        cls.aWeights = tAttr.create("cWeights", "cw", om1.MFnData.kMesh); tAttr.setHidden(True)
-        cls.aInfluenceMatrix = mAttr.create("matrix", "bm"); mAttr.setArray(True); mAttr.setHidden(True); mAttr.setUsesArrayDataBuilder(True)
-        cls.aBindPreMatrix = tAttr.create("bindPreMatrixArray", "bpm", om1.MFnData.kMatrixArray); tAttr.setHidden(True)
-        cls.aWeightsLayer = tAttr.create("cWeightsLayer", "cwl", om1.MFnData.kMesh); tAttr.setHidden(True)
-        cls.aWeightsLayerMask = tAttr.create("cWeightsLayerMask", "cwlm", om1.MFnData.kMesh); tAttr.setHidden(True)
-        cls.aWeightsLayerEnabled = nAttr.create("cWeightsLayerEnabled", "cwle", om1.MFnNumericData.kBoolean, False); nAttr.setHidden(True)
-        cls.aWeightsLayerCompound = cAttr.create("cWeightsLayers", "cwls"); cAttr.setArray(True); cAttr.setHidden(True); cAttr.setUsesArrayDataBuilder(True)
-        cAttr.addChild(cls.aWeightsLayerEnabled); cAttr.addChild(cls.aWeightsLayer); cAttr.addChild(cls.aWeightsLayerMask)
+        cls.aGeomMatrix = mAttr.create("geomMatrix", "gm")
+        mAttr.setHidden(True)
+        mAttr.setKeyable(False)
+        cls.aWeights = tAttr.create("cWeights", "cw", om1.MFnData.kMesh)
+        tAttr.setHidden(True)
+        cls.aInfluenceMatrix = mAttr.create("matrix", "bm")
+        mAttr.setArray(True)
+        mAttr.setHidden(True)
+        mAttr.setUsesArrayDataBuilder(True)
+        cls.aBindPreMatrix = tAttr.create("bindPreMatrixArray", "bpm", om1.MFnData.kMatrixArray)
+        tAttr.setHidden(True)
+        cls.aWeightsLayer = tAttr.create("cWeightsLayer", "cwl", om1.MFnData.kMesh)
+        tAttr.setHidden(True)
+        cls.aWeightsLayerMask = tAttr.create("cWeightsLayerMask", "cwlm", om1.MFnData.kMesh)
+        tAttr.setHidden(True)
+        cls.aWeightsLayerEnabled = nAttr.create("cWeightsLayerEnabled", "cwle", om1.MFnNumericData.kBoolean, False)
+        nAttr.setHidden(True)
+        cls.aWeightsLayerCompound = cAttr.create("cWeightsLayers", "cwls")
+        cAttr.setArray(True)
+        cAttr.setHidden(True)
+        cAttr.setUsesArrayDataBuilder(True)
+        cAttr.addChild(cls.aWeightsLayerEnabled)
+        cAttr.addChild(cls.aWeightsLayer)
+        cAttr.addChild(cls.aWeightsLayerMask)
         for attr in [cls.aGeomMatrix, cls.aWeights, cls.aInfluenceMatrix, cls.aBindPreMatrix, cls.aWeightsLayerCompound]:
             cls.addAttribute(attr)
         outputGeom = ompx.cvar.MPxGeometryFilter_outputGeom

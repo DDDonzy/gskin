@@ -1,7 +1,9 @@
+
 # ==============================================================================
 # 🎨 cColor.py - 纯 Python 语法版 (支持 Cython 极限编译)
 # ==============================================================================
 import cython
+import typing
 
 # --- 核心优化：定义静态颜色梯度表 ---
 # 格式： (权重上限, (R, G, B))
@@ -15,6 +17,13 @@ GRADIENT_TABLE: typing.List[typing.Tuple[cython.float, typing.Tuple[cython.float
     (1.0,   (1.0, 0.0, 0.0)),   # 权重 1.0 -> 纯红
 ]
 
+# --- Cython 3.0 纯C静态数据区 ---
+# 使用 cython.declare 在.py文件中声明C级别的数据结构
+# 这是一个5x4的C浮点数组，用于存储上述梯度表，以便在nogil环境中高速访问
+gradient_c_array = cython.declare(cython.float, ndim=2, shape=(5, 4))
+# 一个C布尔标志，确保数组只被初始化一次
+gradient_initialized: cython.bint = cython.declare(cython.bint, False)
+
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
@@ -23,9 +32,25 @@ def render_heatmap(
     weights_1d: cython.float[:],
     color_view: cython.float[:, :],
 ):
-    """优雅、高效、数据驱动的热力图渲染器 (线性插值版)"""
+    '''优雅、高效、数据驱动的热力图渲染器 (线性插值版)'''
+    # 声明全局C变量
+    global gradient_c_array, gradient_initialized
+
+    # --- 首次调用时，将Python的梯度表转译为C数组 ---
+    # 这个块只执行一次，且在GIL环境下执行
+    if not gradient_initialized:
+        TABLE_SIZE_CONST = 5
+        for i in range(TABLE_SIZE_CONST):
+            w_py, (r_py, g_py, b_py) = GRADIENT_TABLE[i]
+            gradient_c_array[i, 0] = w_py
+            gradient_c_array[i, 1] = r_py
+            gradient_c_array[i, 2] = g_py
+            gradient_c_array[i, 3] = b_py
+        gradient_initialized = True
+
+    # --- C级别的局部变量声明 (使用Python注解语法) ---
     N: cython.int = color_view.shape[0]
-    TABLE_SIZE: cython.int = len(GRADIENT_TABLE)
+    TABLE_SIZE: cython.int = 5
     i: cython.int
     j: cython.int
     w: cython.float
@@ -33,12 +58,14 @@ def render_heatmap(
     g: cython.float
     b: cython.float
     t: cython.float
-    
-    # --- 将 Python 端的 GRADIENT_TABLE 解包到 Cython 静态数组中，以实现最高性能 ---
-    # 这段代码只在函数首次调用时执行一次，后续调用会直接复用已转换的静态数据
-    cdef float start_w, end_w
-    cdef float start_r, start_g, start_b
-    cdef float end_r, end_g, end_b
+    start_w: cython.float
+    end_w: cython.float
+    start_r: cython.float
+    start_g: cython.float
+    start_b: cython.float
+    end_r: cython.float
+    end_g: cython.float
+    end_b: cython.float
 
     with cython.nogil:
         for i in range(N):
@@ -46,26 +73,29 @@ def render_heatmap(
 
             # --- 优化分支 1: 处理权重溢出或无效的情况 ---
             if w >= 1.0:
-                r, g, b = 1.0, 1.0, 1.0  # 权重 >= 1.0: 纯白 (高亮溢出)
+                r, g, b = 1.0, 1.0, 1.0
             elif w <= 0.0:
-                r, g, b = 0.0, 0.0, 0.0  # 权重 <= 0.0: 纯黑 (无影响)
+                r, g, b = 0.0, 0.0, 0.0
             
-            # --- 优化分支 2: 在梯度表中查找并进行线性插值 ---
+            # --- 优化分支 2: 在C数组中查找并进行线性插值 ---
             else:
-                # 遍历梯度表，找到权重 w 所属的区间
                 for j in range(TABLE_SIZE - 1):
-                    start_w, (start_r, start_g, start_b) = GRADIENT_TABLE[j]
-                    end_w, (end_r, end_g, end_b) = GRADIENT_TABLE[j + 1]
+                    start_w = gradient_c_array[j, 0]
+                    start_r = gradient_c_array[j, 1]
+                    start_g = gradient_c_array[j, 2]
+                    start_b = gradient_c_array[j, 3]
 
+                    end_w = gradient_c_array[j + 1, 0]
+                    end_r = gradient_c_array[j + 1, 1]
+                    end_g = gradient_c_array[j + 1, 2]
+                    end_b = gradient_c_array[j + 1, 3]
+                    
                     if start_w <= w < end_w:
-                        # 计算 w 在当前区间的插值系数 t
                         t = (w - start_w) / (end_w - start_w)
-                        
-                        # 线性插值 (Lerp)
                         r = start_r + t * (end_r - start_r)
                         g = start_g + t * (end_g - start_g)
                         b = start_b + t * (end_b - start_b)
-                        break  # 找到区间后立即跳出循环
+                        break
 
             color_view[i, 0] = r
             color_view[i, 1] = g
@@ -76,7 +106,7 @@ def render_heatmap(
 @cython.boundscheck(False)
 @cython.wraparound(False)
 def render_gradient(weights_1d: cython.float[:], color_view: cython.float[:, :], color_a: tuple, color_b: tuple):
-    """通用双色插值器 (纯 Python 语法)"""
+    '''通用双色插值器 (纯 Python 语法)'''
     N: cython.int = color_view.shape[0]
     i: cython.int
     w: cython.float
@@ -103,7 +133,7 @@ def render_gradient(weights_1d: cython.float[:], color_view: cython.float[:, :],
 @cython.boundscheck(False)
 @cython.wraparound(False)
 def render_fill(color_view: cython.float[:, :], color: tuple):
-    """纯色填充器 (纯 Python 语法)"""
+    '''纯色填充器 (纯 Python 语法)'''
     N: cython.int = color_view.shape[0]
     i: cython.int
 
@@ -130,7 +160,7 @@ def render_brush_gradient(
     color_a: tuple,
     color_b: tuple,
 ):
-    """散点渐变器：专门用于通过顶点ID精准映射笔刷衰减颜色"""
+    '''散点渐变器：专门用于通过顶点ID精准映射笔刷衰减颜色'''
     i: cython.int
     v_idx: cython.int
     w: cython.float
@@ -147,10 +177,9 @@ def render_brush_gradient(
     with cython.nogil:
         # 核心：只循环 hit_count 次，绝不多算一点！
         for i in range(hit_count):
-            v_idx = hit_indices[i]  # 拿到真实的顶点 ID
-            w = hit_weights[i]  # 拿到对应的衰减权重
+            v_idx = hit_indices[i]
+            w = hit_weights[i]
 
-            # 精准投放到对应的显存位置
             color_view[v_idx, 0] = bg_r + w * (fg_r - bg_r)
             color_view[v_idx, 1] = bg_g + w * (fg_g - bg_g)
             color_view[v_idx, 2] = bg_b + w * (fg_b - bg_b)
@@ -170,7 +199,6 @@ def _offset_indices_direct(
     count: cython.int,
     offset: cython.uint,
 ) -> cython.void:
-    # 👆 💥 加上 -> cython.void:
     i: cython.int
     for i in range(count):
         dst_ptr[i] = src_ptr[i] + offset
@@ -182,7 +210,7 @@ def offset_indices_direct(
     count: cython.int,
     offset: cython.int,
 ):
-    """Python 包装器：接收整型地址，强转为 unsigned int 指针"""
+    '''Python 包装器：接收整型地址，强转为 unsigned int 指针'''
     src_ptr = cython.cast(cython.p_uint, src_addr)
     dst_ptr = cython.cast(cython.p_uint, dst_addr)
 

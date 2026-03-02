@@ -3,14 +3,14 @@ from pathlib import Path
 import maya.api.OpenMaya as om
 
 
-root_dir = Path(r"E:\d_maya\z_np")
+root_dir = Path(r"E:\d_maya\gskin\plugin")
 
 
 def reload_all_plugins():
     cmds.file(new=True, force=True)
 
     def _reload():
-        plugin_paths = list(root_dir.glob("*Plugin.py"))
+        plugin_paths = list(root_dir.glob("*skinPlugin.py"))
 
         if not plugin_paths:
             om.MGlobal.displayWarning(f"在 {root_dir} 下未找到任何 *Plugin.py 文件！")
