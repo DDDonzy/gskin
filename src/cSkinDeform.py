@@ -2,8 +2,8 @@ from __future__ import annotations
 import typing
 import ctypes
 
-import maya.OpenMaya as om1
-import maya.OpenMayaMPx as ompx
+import maya.OpenMaya as om1  # type:ignore
+import maya.OpenMayaMPx as ompx  # type:ignore
 
 from . import cMemoryView
 from . import cWeightsHandle as CWH
