@@ -135,7 +135,7 @@ class WeightBrushCore:
         从射线命中的三角形开始，在模型表面或空间中检测笔刷范围内的所有顶点，
         并计算它们的权重。
         """
-        render_mesh = self.preview_shape.render_mesh
+        render_mesh = self.preview_shape.mesh_context
         brush_ctx = self.preview_shape.brush_context
         
         if not render_mesh or not render_mesh.vertex_positions_2d_view:
@@ -177,7 +177,7 @@ class WeightBrushCore:
 
         cskin = self.preview_shape.cSkin
         # 获取当前正在绘制的权重或遮罩的内存视图
-        modify_weights2D, target_inf, is_mask = self.preview_shape.active_paint_target
+        modify_weights2D, target_inf, is_mask = self.preview_shape.active_paint_weights
         
         if modify_weights2D is None or cskin is None:
             return False

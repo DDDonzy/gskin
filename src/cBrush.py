@@ -78,8 +78,8 @@ class WeightBrushContext(omui.MPxContext):
     def doRelease(self, event, drawMgr, context): self._isPressed = False
 
     def _raycast(self, ray_source_MPoint, ray_dir_MVector):
-        if not self.preview_shape or not self.preview_shape.render_mesh: return None
-        render_mesh = self.preview_shape.render_mesh
+        if not self.preview_shape or not self.preview_shape.mesh_context: return None
+        render_mesh = self.preview_shape.mesh_context
         source_arr, dir_arr = tuple(ray_source_MPoint)[0:3], tuple(ray_dir_MVector)
         
         hit_success, hit_pos_obj, hit_normal_obj, hit_tri, _, _, _ = cRaycastCython.raycast(
@@ -94,7 +94,7 @@ class WeightBrushContext(omui.MPxContext):
         last_hit = self._hit_result
         x, y = event.position
         self._view.viewToWorld(x, y, self._ray_source, self._ray_direction)
-        if not self.preview_shape or not self.preview_shape.render_mesh: return
+        if not self.preview_shape or not self.preview_shape.mesh_context: return
 
         inv_matrix = self.mesh_dag_path.inclusiveMatrixInverse()
         ray_source_obj, ray_dir_obj = self._ray_source * inv_matrix, self._ray_direction * inv_matrix

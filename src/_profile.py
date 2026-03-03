@@ -17,7 +17,7 @@ class MicroProfiler:
     def __enter__(self):
         if MicroProfiler._enabled:
             # 记录起始的纳秒时间戳
-            self.t_start = time.perf_counter_ns()
+            self.t_start = time.thread_time_ns()
         return self
 
     def step(self, step_name):
@@ -25,7 +25,7 @@ class MicroProfiler:
         if not MicroProfiler._enabled:
             return
 
-        t_now = time.perf_counter_ns()
+        t_now = time.thread_time_ns()
         elapsed = t_now - self.t_start
         self.t_start = t_now  # 重置起点
 
@@ -57,3 +57,72 @@ class MicroProfiler:
             # 清空重置
             MicroProfiler._counter = 0
             MicroProfiler._records.clear()
+
+
+import cProfile
+import pstats
+import io
+
+
+class DeepProfiler:
+    """基于 cProfile 的深度函数调用分析器"""
+
+    _profiler = cProfile.Profile()
+    _counter = 0
+    _target_runs = 30
+
+    def __enter__(self):
+        # 进入时开启抓取
+        self._profiler.enable()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # 退出时暂停抓取
+        self._profiler.disable()
+        DeepProfiler._counter += 1
+
+        # 达到指定帧数，打印报告
+        if DeepProfiler._counter >= DeepProfiler._target_runs:
+            print(f"\n🔬 [DeepProfiler | 累计 {DeepProfiler._target_runs} 帧深度函数分析]")
+            print("-" * 80)
+
+            s = io.StringIO()
+            # 💡 核心：按 'tottime' (自身内部耗时) 排序
+            # 如果想看包含子函数的总耗时，可以改成 'cumtime'
+            sortby = "tottime"
+            ps = pstats.Stats(self._profiler, stream=s).sort_stats(sortby)
+
+            # 去掉冗长的绝对路径，让界面清爽
+            ps.strip_dirs()
+            # 只打印排名前 20 的“性能刺客”
+            ps.print_stats(20)
+
+            print(s.getvalue())
+            print("=" * 80 + "\n")
+
+            # 清空缓存，准备下一轮
+            DeepProfiler._counter = 0
+            self._profiler.clear()
+
+
+import maya.OpenMaya as om1  # 👈 切回 API 1.0
+
+# 注册类别
+MY_PLUGIN_CATEGORY = om1.MProfiler.addCategory("CythonSkinPlugin", "Cython Nodes")
+
+class MayaNativeProfiler:
+    """基于 Maya API 1.0 的原生性能分析器"""
+    
+    def __init__(self, event_name, color=5):
+        self.event_name = event_name
+        # 颜色 ID 推荐: 2(橘红), 5(蓝色), 6(红色), 7(绿色)
+        self.color = color 
+        self.event_id = 0
+
+    def __enter__(self):
+        # API 1.0 的调用方式
+        self.event_id = om1.MProfiler.eventBegin(MY_PLUGIN_CATEGORY, self.color, self.event_name)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        om1.MProfiler.eventEnd(self.event_id)
