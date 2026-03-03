@@ -20,9 +20,13 @@ GRADIENT_TABLE: typing.List[typing.Tuple[cython.float, typing.Tuple[cython.float
 # --- Cython 3.0 纯C静态数据区 ---
 # 使用 cython.declare 在.py文件中声明C级别的数据结构
 # 这是一个5x4的C浮点数组，用于存储上述梯度表，以便在nogil环境中高速访问
-gradient_c_array = cython.declare(cython.float, ndim=2, shape=(5, 4))
+# --- Cython 3.0 纯C静态数据区 ---
+# 使用 cython.declare 在.py文件中声明C级别的数据结构
+# 这是一个5x4的C浮点数组，用于存储上述梯度表，以便在nogil环境中高速访问
+gradient_c_array: cython.float[5][4] = cython.declare(cython.float[5][4])
 # 一个C布尔标志，确保数组只被初始化一次
-gradient_initialized: cython.bint = cython.declare(cython.bint, False)
+gradient_initialized: cython.bint = cython.declare(cython.bint)
+gradient_initialized = False
 
 
 @cython.boundscheck(False)
@@ -42,10 +46,10 @@ def render_heatmap(
         TABLE_SIZE_CONST = 5
         for i in range(TABLE_SIZE_CONST):
             w_py, (r_py, g_py, b_py) = GRADIENT_TABLE[i]
-            gradient_c_array[i, 0] = w_py
-            gradient_c_array[i, 1] = r_py
-            gradient_c_array[i, 2] = g_py
-            gradient_c_array[i, 3] = b_py
+            gradient_c_array[i][0] = w_py
+            gradient_c_array[i][1] = r_py
+            gradient_c_array[i][2] = g_py
+            gradient_c_array[i][3] = b_py
         gradient_initialized = True
 
     # --- C级别的局部变量声明 (使用Python注解语法) ---
@@ -80,15 +84,15 @@ def render_heatmap(
             # --- 优化分支 2: 在C数组中查找并进行线性插值 ---
             else:
                 for j in range(TABLE_SIZE - 1):
-                    start_w = gradient_c_array[j, 0]
-                    start_r = gradient_c_array[j, 1]
-                    start_g = gradient_c_array[j, 2]
-                    start_b = gradient_c_array[j, 3]
+                    start_w = gradient_c_array[j][0]
+                    start_r = gradient_c_array[j][1]
+                    start_g = gradient_c_array[j][2]
+                    start_b = gradient_c_array[j][3]
 
-                    end_w = gradient_c_array[j + 1, 0]
-                    end_r = gradient_c_array[j + 1, 1]
-                    end_g = gradient_c_array[j + 1, 2]
-                    end_b = gradient_c_array[j + 1, 3]
+                    end_w = gradient_c_array[j + 1][0]
+                    end_r = gradient_c_array[j + 1][1]
+                    end_g = gradient_c_array[j + 1][2]
+                    end_b = gradient_c_array[j + 1][3]
                     
                     if start_w <= w < end_w:
                         t = (w - start_w) / (end_w - start_w)

@@ -3,17 +3,17 @@ import maya.api.OpenMayaRender as omr
 
 # 统一使用相对路径和模块导入
 
-from ..src import cDisplayNode as cDisplay
+from gskin.src import cDisplayNode as cDisplay
 
 # 定义插件元数据
 PLUGIN_NAME = "cDisplayNodePlugin"
 NODE_NAME = "WeightPreviewShape"
 NODE_ID = om.MTypeId(0x80005)
+
 DRAW_CLASSIFICATION = "drawdb/geometry/WeightPreview"
 DRAW_REGISTRAR_ID = "WeightPreviewShapeRegistrar"
 
 def maya_useNewAPI():
-    """告诉Maya我们要使用API 2.0"""
     pass
 
 def initializePlugin(mobject):

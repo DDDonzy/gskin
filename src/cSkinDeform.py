@@ -14,38 +14,22 @@ if typing.TYPE_CHECKING:
     from . import cWeightsHandle
 
 
-class SkinDeformerContext:
-    __slots__ = (
-        "geo_matrix",
-        "influences_count",
-        "influences_locks_mgr",
-        "_influencesMatrix_mgr",
-        "_bindPreMatrix_mgr",
-        "_rotateMatrix_mgr",
-        "_translateVector_mgr",
-        "weightsLayer",
-        "hashCode",
-        "mObject",
-        "mFnDep",
-    )
-
-    def __init__(self) -> None:
-        self.geo_matrix: om1.MMatrix = None
-        self.influences_count: int = 0
-        self.influences_locks_mgr: "cMemoryView.CMemoryManager" = None
-        self._influencesMatrix_mgr: "cMemoryView.CMemoryManager" = None
-        self._bindPreMatrix_mgr: "cMemoryView.CMemoryManager" = None
-        self._rotateMatrix_mgr: "cMemoryView.CMemoryManager" = None
-        self._translateVector_mgr: "cMemoryView.CMemoryManager" = None
-        self.weightsLayer: typing.Dict[int, "cWeightsHandle.WeightsLayerData"] = {}
-        self.hashCode: int = None
-        self.mObject: om1.MObject = None
-        self.mFnDep: om1.MFnDependencyNode = None
-
-
 class CythonSkinDeformer(ompx.MPxDeformerNode):
     __slots__ = (
-        "skin_context",
+        # ==========================================
+        # 🟢 公有数据 (Public API) - 供外部(Display/Brush)读取
+        # ==========================================
+        "vertex_count",  # 模型顶点数
+        "rawPoints_output_mgr",  # 变形后的顶点坐标物理内存块
+        "influences_count",  # 骨骼/影响物总数
+        "influences_locks_mgr",  # 骨骼锁定状态
+        "weightsLayer",  # 权重层级字典
+        "hashCode",  # 节点唯一哈希
+        "mObject",  # 变形器自身对象
+        "mFnDep",  # 依赖图函数集
+        # ==========================================
+        # 🔴 私有数据 (Private) - 仅供 deform 内部计算使用
+        # ==========================================
         "_weights_is_dirty",
         "_influencesMatrix_is_dirty",
         "_bindPreMatrix_is_dirty",
@@ -53,7 +37,10 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         "_geo_matrix",
         "_get_matrix_i",
         "_geo_matrix_is_identity",
-        "mObject",
+        "_influencesMatrix_mgr",
+        "_bindPreMatrix_mgr",
+        "_rotateMatrix_mgr",
+        "_translateVector_mgr",
     )
 
     aGeomMatrix = om1.MObject()
@@ -67,20 +54,36 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
 
     def __init__(self):
         super(CythonSkinDeformer, self).__init__()
-        self.skin_context = SkinDeformerContext()
+
+        # --- 初始化公有数据 ---
+        self.vertex_count: int = 0
+        self.rawPoints_output_mgr: "cMemoryView.CMemoryManager" = None
+        self.influences_count: int = 0
+        self.influences_locks_mgr: "cMemoryView.CMemoryManager" = None
+        self.weightsLayer: typing.Dict[int, "cWeightsHandle.WeightsLayerData"] = {}
+        self.hashCode: int = None
+        self.mObject: om1.MObject = None
+        self.mFnDep: om1.MFnDependencyNode = None
+
+        # --- 初始化私有数据 ---
         self._weights_is_dirty: bool = True
         self._influencesMatrix_is_dirty: bool = True
         self._bindPreMatrix_is_dirty: bool = True
         self._geoMatrix_is_dirty: bool = True
+
         self._geo_matrix = om1.MMatrix()
         self._get_matrix_i = om1.MMatrix()
         self._geo_matrix_is_identity = True
 
+        self._influencesMatrix_mgr: "cMemoryView.CMemoryManager" = None
+        self._bindPreMatrix_mgr: "cMemoryView.CMemoryManager" = None
+        self._rotateMatrix_mgr: "cMemoryView.CMemoryManager" = None
+        self._translateVector_mgr: "cMemoryView.CMemoryManager" = None
+
     def postConstructor(self):
         self.mObject = self.thisMObject()
-        self.skin_context.mObject = self.mObject
-        self.skin_context.mFnDep = om1.MFnDependencyNode(self.skin_context.mObject)
-        self.skin_context.hashCode = om1.MObjectHandle(self.skin_context.mObject).hashCode()
+        self.mFnDep = om1.MFnDependencyNode(self.mObject)
+        self.hashCode = om1.MObjectHandle(self.mObject).hashCode()
         _cRegistry.SkinRegistry.register(self.mObject, self)
 
     def setDependentsDirty(self, plug, dirtyPlugArray):
@@ -124,27 +127,27 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
             return
 
         mFnMesh_in = om1.MFnMesh(input_geom_obj)
-        vertex_count = mFnMesh_in.numVertices()
-        rawPoints_original_mgr = cMemoryView.CMemoryManager.from_ptr(int(mFnMesh_in.getRawPoints()), "f", (vertex_count * 3,))
+        self.vertex_count = mFnMesh_in.numVertices()
+        rawPoints_original_mgr = cMemoryView.CMemoryManager.from_ptr(int(mFnMesh_in.getRawPoints()), "f", (self.vertex_count * 3,))
 
         mFnMesh_out = om1.MFnMesh(output_geom_obj)
-        rawPoints_output_mgr = cMemoryView.CMemoryManager.from_ptr(int(mFnMesh_out.getRawPoints()), "f", (vertex_count * 3,))
+        self.rawPoints_output_mgr = cMemoryView.CMemoryManager.from_ptr(int(mFnMesh_out.getRawPoints()), "f", (self.vertex_count * 3,))
 
         influences_handle = dataBlock.inputArrayValue(self.aInfluenceMatrix)
         influences_count = influences_handle.elementCount()
 
-        if self.skin_context.influences_count != influences_count:
-            self.skin_context.influences_count = influences_count
-            self.skin_context._influencesMatrix_mgr = cMemoryView.CMemoryManager.allocate("d", (influences_count, 16))
-            self.skin_context._rotateMatrix_mgr = cMemoryView.CMemoryManager.allocate("f", (influences_count, 9))
-            self.skin_context._translateVector_mgr = cMemoryView.CMemoryManager.allocate("f", (influences_count, 3))
+        if self.influences_count != influences_count:
+            self.influences_count = influences_count
+            self._influencesMatrix_mgr = cMemoryView.CMemoryManager.allocate("d", (influences_count, 16))
+            self._rotateMatrix_mgr = cMemoryView.CMemoryManager.allocate("f", (influences_count, 9))
+            self._translateVector_mgr = cMemoryView.CMemoryManager.allocate("f", (influences_count, 3))
             for b in range(influences_count):
                 for i in range(16):
-                    self.skin_context._influencesMatrix_mgr.view[b, i] = 1.0 if (i % 5 == 0) else 0.0
+                    self._influencesMatrix_mgr.view[b, i] = 1.0 if (i % 5 == 0) else 0.0
 
         if self._influencesMatrix_is_dirty:
             if influences_count > 0:
-                dest_base_addr = self.skin_context._influencesMatrix_mgr.ptr
+                dest_base_addr = self._influencesMatrix_mgr.ptr
                 for i in range(influences_count):
                     influences_handle.jumpToArrayElement(i)
                     influence_idx = influences_handle.elementIndex()
@@ -160,39 +163,38 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
                 bind_m_array = fn_bind_array.array()
                 if bind_m_array.length() > 0:
                     addr_base = int(bind_m_array[0].this)
-                    self.skin_context._bindPreMatrix_mgr = cMemoryView.CMemoryManager.from_ptr(addr_base, "d", (bind_m_array.length(), 16))
+                    self._bindPreMatrix_mgr = cMemoryView.CMemoryManager.from_ptr(addr_base, "d", (bind_m_array.length(), 16))
                 self._bindPreMatrix_is_dirty = False
 
         if self._geoMatrix_is_dirty:
             self._geo_matrix = dataBlock.inputValue(self.aGeomMatrix).asMatrix()
             self._get_matrix_i = self._geo_matrix.inverse()
             self._geo_matrix_is_identity = self._geo_matrix.isEquivalent(om1.MMatrix.identity)
-            self.skin_context.geo_matrix = self._geo_matrix
             self._geoMatrix_is_dirty = False
 
         if self._weights_is_dirty:
-            self.skin_context.weightsLayer = self._get_weights_layers_data(dataBlock)
+            self.weightsLayer = self._get_weights_layers_data(dataBlock)
             self._weights_is_dirty = False
 
-        if not self.skin_context.weightsLayer or not self.skin_context.weightsLayer[-1].weightsHandle.is_valid:
+        if not self.weightsLayer or not self.weightsLayer[-1].weightsHandle.is_valid:
             return
 
         cSkinDeformCython.compute_deform_matrices(
             int(self._geo_matrix.this),
             int(self._get_matrix_i.this),
-            self.skin_context._bindPreMatrix_mgr.view,
-            self.skin_context._influencesMatrix_mgr.view,
-            self.skin_context._rotateMatrix_mgr.view,
-            self.skin_context._translateVector_mgr.view,
+            self._bindPreMatrix_mgr.view,
+            self._influencesMatrix_mgr.view,
+            self._rotateMatrix_mgr.view,
+            self._translateVector_mgr.view,
             self._geo_matrix_is_identity,
         )
 
         cSkinDeformCython.run_skinning_core(
             rawPoints_original_mgr.view,
-            rawPoints_output_mgr.view,
-            self.skin_context.weightsLayer[-1].weightsHandle.memory.view,
-            self.skin_context._rotateMatrix_mgr.view,
-            self.skin_context._translateVector_mgr.view,
+            self.rawPoints_output_mgr.view,
+            self.weightsLayer[-1].weightsHandle.memory.view,
+            self._rotateMatrix_mgr.view,
+            self._translateVector_mgr.view,
             envelope,
         )
 

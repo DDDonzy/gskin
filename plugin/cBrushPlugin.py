@@ -1,7 +1,7 @@
 import maya.api.OpenMaya as om
 
 # 统一使用相对路径和模块导入
-from ..src.cBrush import WeightBrushContextCmd
+from gskin.src.cBrush import WeightBrushContextCmd
 
 # 定义插件元数据
 PLUGIN_NAME = "cBrushContextPlugin"

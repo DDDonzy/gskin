@@ -1,3 +1,23 @@
 {
-    "python-envs.defaultEnvManager": "ms-python.python:system"
+    "python.analysis.extraPaths": [
+        "./",
+        "./_oldTools",
+        "./_maya_config/scripts",
+        "./_maya_config/hotkeys"
+    ],
+    "python.autoComplete.extraPaths": [
+        "./",
+        "./_oldTools",
+        "./_maya_config/scripts",
+        "./_maya_config/hotkeys"
+    ],
+    "python.terminal.useEnvFile": true,
+    "cSpell.words": [
+        "ompx",
+        "ssdr",
+        "tris",
+        "userprefs"
+    ],
+    "python-envs.defaultEnvManager": "ms-python.python:system",
+    "python-envs.pythonProjects": []
 }
