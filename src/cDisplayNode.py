@@ -27,36 +27,22 @@ DRAW_REGISTRAR = "WeightPreviewShapeRegistrar"
 # 📦 数据结构：Shape 节点专属的网格与笔刷上下文
 # ==============================================================================
 # fmt:off
-class TopologyCache:
-    """存放网格的静态拓扑数据，仅在拓扑改变时重建"""
-
+class RenderableMesh:
+    """统一的数据结构，包含渲染所需的所有网格数据，包括动态的顶点位置和静态的拓扑。"""
     __slots__ = (
         "vertex_count",
-        "tri_indices_2D",
-        "tri_to_face_map",
-        "base_edge_indices",
-        "adj_offsets",
-        "adj_indices",
+        "vertex_positions",
+        "vertex_positions_2d_view",
+        "triangle_indices",
+        "edge_indices",
     )
 
     def __init__(self):
-        self.vertex_count     : int            = 0
-        self.tri_indices_2D   : CMemoryManager = None
-        self.tri_to_face_map  : CMemoryManager = None
-        self.base_edge_indices: CMemoryManager = None
-        self.adj_offsets      : CMemoryManager = None
-        self.adj_indices      : CMemoryManager = None
-
-
-class MeshDisplayContext:
-    """专供视口显示与笔刷射线检测的拓扑与坐标缓存"""
-    __slots__ = ("vertex_count", "rawPoints_output", "rawPoints2D_output", "topology")
-    
-    def __init__(self):
-        self.vertex_count      : int            = 0
-        self.rawPoints_output  : CMemoryManager = None
-        self.rawPoints2D_output: CMemoryManager = None
-        self.topology          : TopologyCache  = None
+        self.vertex_count: int = 0
+        self.vertex_positions: CMemoryManager = None
+        self.vertex_positions_2d_view: CMemoryManager = None
+        self.triangle_indices: CMemoryManager = None
+        self.edge_indices: CMemoryManager = None
 
 
 class BrushDisplayContext:
@@ -67,11 +53,6 @@ class BrushDisplayContext:
         "brush_hit_indices",
         "brush_hit_weights",
         "brush_epoch",
-        "pool_node_epochs",
-        "pool_dist",
-        "pool_queue",
-        "pool_in_queue",
-        "pool_touched",
     )
 
     def __init__(self):
@@ -79,12 +60,6 @@ class BrushDisplayContext:
         self.brush_hit_indices: CMemoryManager = None
         self.brush_hit_weights: CMemoryManager = None
         self.brush_epoch      : int            = 1
-
-        self.pool_node_epochs: CMemoryManager = None
-        self.pool_dist       : CMemoryManager = None
-        self.pool_queue      : CMemoryManager = None
-        self.pool_in_queue   : CMemoryManager = None
-        self.pool_touched    : CMemoryManager = None
 
 
 class RenderState:
@@ -133,12 +108,6 @@ class RenderState:
         self.color_brush_remapB   = color_brush_remapB
     # fmt:on
 
-    def __eq__(self, other):
-        """高效的相等性检测，替代 dataclass 的自动生成，用于检测状态是否发生改变"""
-        if not isinstance(other, RenderState):
-            return False
-        return all(getattr(self, attr) == getattr(other, attr) for attr in self.__slots__)
-
 
 # ==============================================================================
 # 🎨 视口渲染器 (View)
@@ -154,7 +123,7 @@ class WeightGeometryOverride(omr.MPxGeometryOverride):
         "_cached_point_mgr",
         "_indices_initialized",
         "_last_topo_cache",
-        "_cached_raw_points_mgr",
+        "_cached_vertex_positions_mgr",
         "_cached_weights_1d",
         "_cached_brush_hit_count",
         "_cached_brush_hit_indices",
@@ -187,7 +156,7 @@ class WeightGeometryOverride(omr.MPxGeometryOverride):
         self._last_topo_cache = None
 
         # 💥 渲染负载快照 (Render Payload) - 每一帧都会硬性刷新
-        self._cached_raw_points_mgr = None
+        self._cached_vertex_positions_mgr = None
         self._cached_weights_1d = None
         self._cached_brush_hit_count = 0
         self._cached_brush_hit_indices = None
@@ -219,15 +188,15 @@ class WeightGeometryOverride(omr.MPxGeometryOverride):
             # 1. 强制拉取上游的网格解算结果
             shape.update_mesh_points()
 
-            mesh_ctx = shape.mesh_context
-            if not mesh_ctx.rawPoints_output:
+            render_mesh = shape.render_mesh
+            if not render_mesh.vertex_positions:
                 return
 
             prof.step("updateDG:---------更新模型结构")
             # 2. 同步 UI 状态到 Shape 内部
             shape.sync_ui_state_to_blackboard()
 
-            _cache = self._get_topology_index_buffers(mesh_ctx)
+            _cache = self._get_topology_index_buffers(render_mesh)
             if _cache:
                 (
                     self._cached_solid_mgr,
@@ -239,7 +208,7 @@ class WeightGeometryOverride(omr.MPxGeometryOverride):
                     self._indices_initialized = False
                     self._last_topo_cache = _cache
 
-            self._cached_raw_points_mgr = mesh_ctx.rawPoints_output
+            self._cached_vertex_positions_mgr = render_mesh.vertex_positions
 
             # 1. 直接获取 Shape 侧同步好的状态包
             self._state = shape.render_state
@@ -264,7 +233,7 @@ class WeightGeometryOverride(omr.MPxGeometryOverride):
 
     def populateGeometry(self, requirements, renderItems, data):
         N = self._cached_vertex_count
-        points_mgr = self._cached_raw_points_mgr
+        points_mgr = self._cached_vertex_positions_mgr
 
         for req in requirements.vertexRequirements():
             if req.semantic == omr.MGeometry.kPosition:
@@ -348,12 +317,10 @@ class WeightGeometryOverride(omr.MPxGeometryOverride):
 
         self._indices_initialized = True
 
-    def _get_topology_index_buffers(self, mesh_ctx: MeshDisplayContext):
-        N = mesh_ctx.vertex_count
-        topo = mesh_ctx.topology  # ✅ 获取内部的拓扑缓存对象
+    def _get_topology_index_buffers(self, render_mesh: RenderableMesh):
+        N = render_mesh.vertex_count
 
-        # ✅ 从 topo 对象判断是否存在
-        if N == 0 or topo is None or topo.tri_indices_2D is None:
+        if N == 0 or render_mesh.triangle_indices is None:
             return None
 
         if (self._cached_vertex_count == N) and (self._cached_solid_mgr is not None):
@@ -364,9 +331,8 @@ class WeightGeometryOverride(omr.MPxGeometryOverride):
                 self._cached_vertex_count,
             )
 
-        # ✅ 正确地从 topo 中读取数据
-        new_solid_mgr = topo.tri_indices_2D
-        new_wire_mgr = topo.base_edge_indices
+        new_solid_mgr = render_mesh.triangle_indices
+        new_wire_mgr = render_mesh.edge_indices
         new_point_mgr = CMemoryManager.from_list(list(range(N)), "i")
 
         return new_solid_mgr, new_wire_mgr, new_point_mgr, N
@@ -435,7 +401,7 @@ class WeightPreviewShape(om.MPxSurfaceShape):
     aColorBrushRemapB = None
 
     __slots__ = (
-        "mesh_context",
+        "render_mesh",
         "brush_context",
         "render_state",
         "_boundingBox",
@@ -464,7 +430,7 @@ class WeightPreviewShape(om.MPxSurfaceShape):
         self._cached_cSkin = None
 
         # 初始化上下文 (代替以前的全局 DATA)
-        self.mesh_context = MeshDisplayContext()
+        self.render_mesh = RenderableMesh()
         self.brush_context = BrushDisplayContext()
 
         # 占位：如果有需要在UI直接访问的笔刷设置，可以在这里实例化
@@ -517,11 +483,11 @@ class WeightPreviewShape(om.MPxSurfaceShape):
         if state.paintMask:
             if not active_layer.maskHandle or not active_layer.maskHandle.is_valid:
                 return None, None, None
-            return active_layer.maskHandle.memory.reshape((self.mesh_context.vertex_count, 1)), 0, True
+            return active_layer.maskHandle.memory.reshape((self.render_mesh.vertex_count, 1)), 0, True
         else:
             if not active_layer.weightsHandle or not active_layer.weightsHandle.is_valid:
                 return None, None, None
-            return active_layer.weightsHandle.memory.reshape((self.mesh_context.vertex_count, cSkin.influences_count)), state.paintInfluenceIndex, False
+            return active_layer.weightsHandle.memory.reshape((self.render_mesh.vertex_count, cSkin.influences_count)), state.paintInfluenceIndex, False
 
     def update_mesh_points(self):
         """
@@ -539,77 +505,43 @@ class WeightPreviewShape(om.MPxSurfaceShape):
             return
 
         # 如果顶点数变了，触发拓扑缓存重建
-        if self.mesh_context.vertex_count != vtx_count:
-            # 拓扑不会每帧变，用 om2 重新捞一遍边和邻接表
-            import maya.api.OpenMaya as om2
-
-            mFnMesh_om2 = om2.MFnMesh(self._deformMesh_plug.asMObject())
-            self._build_topology_cache(mFnMesh_om2, vtx_count)
+        if self.render_mesh.vertex_count != vtx_count:
+            # 拓扑不会每帧变，用 om 重新捞一遍边和邻接表
+            mFnMesh = om.MFnMesh(self._deformMesh_plug.asMObject())
+            self._build_renderable_mesh_topology(mFnMesh)
 
         # 写入 Mesh Context
-        self.mesh_context.vertex_count = vtx_count
+        self.render_mesh.vertex_count = vtx_count
 
         # 💥 跨域读取！
-        self.mesh_context.rawPoints_output = cSkin.rawPoints_output_mgr
+        self.render_mesh.vertex_positions = cSkin.rawPoints_output_mgr
 
         # 将原始一维指针映射为 N*3 的二维视图供笔刷用
-        if self.mesh_context.rawPoints_output:
-            ptr = self.mesh_context.rawPoints_output.ptr
-            self.mesh_context.rawPoints2D_output = CMemoryManager.from_ptr(ptr, "f", (vtx_count, 3))
+        if self.render_mesh.vertex_positions:
+            ptr = self.render_mesh.vertex_positions.ptr
+            self.render_mesh.vertex_positions_2d_view = CMemoryManager.from_ptr(ptr, "f", (vtx_count, 3))
 
-    def _build_topology_cache(self, mFnMesh_om2, vtx_count: int):
+    def _build_renderable_mesh_topology(self, mFnMesh: om.MFnMesh):
         """
         [补全] 拓扑数据生成器
-        使用 mFnMesh_om2 (OpenMaya 2.0) 生成三角形索引、邻接表等拓扑数据。
+        使用 mFnMesh (OpenMaya) 生成三角形和边索引数据用于渲染。
         """
-        # ✅ 1. 实例化一个专门的拓扑缓存对象
-        topo = TopologyCache()
-        topo.vertex_count = vtx_count
+        render_mesh = self.render_mesh
+        vtx_count = mFnMesh.numVertices
+        render_mesh.vertex_count = vtx_count
 
-        # 提取三角形索引与面映射
-        tri_counts, tri_vtx_indices = mFnMesh_om2.getTriangles()
-        topo.tri_indices_2D = CMemoryManager.from_list(list(tri_vtx_indices), "i")
+        # 提取三角形索引
+        _, tri_vtx_indices = mFnMesh.getTriangles()
+        render_mesh.triangle_indices = CMemoryManager.from_list(list(tri_vtx_indices), "i")
 
-        tri_to_face = []
-        for face_idx, count in enumerate(tri_counts):
-            tri_to_face.extend([face_idx] * count)
-        topo.tri_to_face_map = CMemoryManager.from_list(tri_to_face, "i")
-
-        # 提取边索引并构建邻接关系
-        num_edges = mFnMesh_om2.numEdges
+        # 提取边索引
+        num_edges = mFnMesh.numEdges
         edge_indices = [0] * (num_edges * 2)
-        adj_list = [set() for _ in range(vtx_count)]
-
         for i in range(num_edges):
-            u, v = mFnMesh_om2.getEdgeVertices(i)
-            edge_indices[i * 2] = u
-            edge_indices[i * 2 + 1] = v
-            # 双向连接
-            adj_list[u].add(v)
-            adj_list[v].add(u)
-
-        topo.base_edge_indices = CMemoryManager.from_list(edge_indices, "i")
-
-        # 将邻接表转换为高性能的 CSR 格式
-        flat_adj = []
-        adj_offsets = [0] * (vtx_count + 1)
-        for i in range(vtx_count):
-            neighbors = sorted(list(adj_list[i]))
-            flat_adj.extend(neighbors)
-            adj_offsets[i + 1] = adj_offsets[i] + len(neighbors)
-
-        topo.adj_offsets = CMemoryManager.from_list(adj_offsets, "i")
-        topo.adj_indices = CMemoryManager.from_list(flat_adj, "i")
-
-        # ✅ 2. 将装满数据的 topo 实例，赋值给 mesh_context
-        self.mesh_context.topology = topo
-
-        # 同时为笔刷分配对应顶点数量的缓存池
-        self.brush_context.pool_node_epochs = CMemoryManager.allocate("i", (vtx_count,))
-        self.brush_context.pool_dist = CMemoryManager.allocate("f", (vtx_count,))
-        self.brush_context.pool_queue = CMemoryManager.allocate("i", (vtx_count,))
-        self.brush_context.pool_in_queue = CMemoryManager.allocate("B", (vtx_count,))
-        self.brush_context.pool_touched = CMemoryManager.allocate("i", (vtx_count,))
+            p1, p2 = mFnMesh.getEdgeVertices(i)
+            edge_indices[i * 2] = p1
+            edge_indices[i * 2 + 1] = p2
+        render_mesh.edge_indices = CMemoryManager.from_list(edge_indices, "i")
 
     def sync_ui_state_to_blackboard(self):
         """将前端 Plug 属性同步到 Shape 的本地状态中"""
@@ -623,7 +555,7 @@ class WeightPreviewShape(om.MPxSurfaceShape):
             )
 
         # fmt:off
-        new_state = RenderState(
+        self.render_state = RenderState(
             paintLayerIndex      = self._layer_plug.asInt(),
             paintInfluenceIndex  = self._influence_plug.asInt(),
             paintMask            = self._mask_plug.asBool(),
@@ -639,9 +571,6 @@ class WeightPreviewShape(om.MPxSurfaceShape):
         )
         # fmt:on
 
-        # 只有在状态真正改变时才替换，触发后续可能的重绘逻辑
-        if self.render_state != new_state:
-            self.render_state = new_state
 
     def connectionBroken(self, plug, otherPlug, asSrc):
         if plug == self._deformMesh_plug:
@@ -727,9 +656,9 @@ class WeightPreviewShape(om.MPxSurfaceShape):
         return True
 
     def boundingBox(self):
-        mesh_ctx = self.mesh_context
-        if mesh_ctx and mesh_ctx.rawPoints_output:
-            boxMin, boxMax = cBoundingBoxCython.compute_bbox_fast(mesh_ctx.rawPoints_output.view, mesh_ctx.vertex_count)
+        render_mesh = self.render_mesh
+        if render_mesh and render_mesh.vertex_positions:
+            boxMin, boxMax = cBoundingBoxCython.compute_bbox_fast(render_mesh.vertex_positions.view, render_mesh.vertex_count)
             self._boundingBox = om.MBoundingBox(om.MPoint(boxMin), om.MPoint(boxMax))
         return self._boundingBox
 

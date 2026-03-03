@@ -60,7 +60,7 @@ class WeightBrushContext(omui.MPxContext):
             if not self.preview_shape: raise RuntimeError("在网格上找不到连接的 WeightPreviewShape 节点。")
 
             self._view = omui.M3dView.active3dView()
-            self.core = cBrushCore.WeightBrushCore(self.preview_shape)
+            self.core = cBrushCore.WeightBrushCore(self.preview_shape, self.fn_mesh)
             print("[Brush] 引擎已启动。已连接到 WeightPreviewShape。")
 
         except Exception as e:
@@ -78,16 +78,15 @@ class WeightBrushContext(omui.MPxContext):
     def doRelease(self, event, drawMgr, context): self._isPressed = False
 
     def _raycast(self, ray_source_MPoint, ray_dir_MVector):
-        if not self.preview_shape or not self.preview_shape.mesh_context: return None
-        mesh_ctx = self.preview_shape.mesh_context
+        if not self.preview_shape or not self.preview_shape.render_mesh: return None
+        render_mesh = self.preview_shape.render_mesh
         source_arr, dir_arr = tuple(ray_source_MPoint)[0:3], tuple(ray_dir_MVector)
         
         hit_success, hit_pos_obj, hit_normal_obj, hit_tri, _, _, _ = cRaycastCython.raycast(
-            source_arr, dir_arr, mesh_ctx.rawPoints_output.view, mesh_ctx.tri_indices_2D.view)
+            source_arr, dir_arr, render_mesh.vertex_positions.view, render_mesh.triangle_indices.view)
         
         if hit_success:
-            hit_face = mesh_ctx.tri_to_face_map.view[hit_tri]
-            return hit_pos_obj, hit_normal_obj, hit_tri, hit_face
+            return hit_pos_obj, hit_normal_obj, hit_tri
         return None
 
     def _shoot_ray_and_process(self, event, is_pressed, drawMgr):
@@ -95,7 +94,7 @@ class WeightBrushContext(omui.MPxContext):
         last_hit = self._hit_result
         x, y = event.position
         self._view.viewToWorld(x, y, self._ray_source, self._ray_direction)
-        if not self.preview_shape or not self.preview_shape.mesh_context: return
+        if not self.preview_shape or not self.preview_shape.render_mesh: return
 
         inv_matrix = self.mesh_dag_path.inclusiveMatrixInverse()
         ray_source_obj, ray_dir_obj = self._ray_source * inv_matrix, self._ray_direction * inv_matrix
@@ -106,7 +105,7 @@ class WeightBrushContext(omui.MPxContext):
             if last_hit is not None and self.core: self.core.clear_hit_state(); self._refresh_viewport()
             return
 
-        hit_point_obj, hit_normal_obj, hit_tri, _ = self._hit_result
+        hit_point_obj, hit_normal_obj, hit_tri = self._hit_result
         
         self.core.hit_state.hit_center_normal = hit_normal_obj
         self.core.detect_range(hit_point_obj, hit_tri)
