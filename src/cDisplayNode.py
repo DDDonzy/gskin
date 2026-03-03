@@ -1,5 +1,4 @@
 import ctypes
-from dataclasses import dataclass
 
 import maya.api.OpenMaya as om
 import maya.api.OpenMayaUI as omui
@@ -8,7 +7,7 @@ import maya.api.OpenMayaRender as omr
 from . import cBoundingBoxCython
 from .cMemoryView import CMemoryManager
 from ._cRegistry import SkinRegistry
-from z_np.src import cColorCython as cColor
+from . import cColorCython as cColor
 from . import _profile
 
 from typing import TYPE_CHECKING
@@ -27,68 +26,118 @@ DRAW_REGISTRAR = "WeightPreviewShapeRegistrar"
 # ==============================================================================
 # 📦 数据结构：Shape 节点专属的网格与笔刷上下文
 # ==============================================================================
-@dataclass(frozen=True, slots=True)
+# fmt:off
 class TopologyCache:
     """存放网格的静态拓扑数据，仅在拓扑改变时重建"""
 
-    # fmt:off
-    vertex_count      : int            = 0
-    tri_indices_2D    : CMemoryManager = None
-    tri_to_face_map   : CMemoryManager = None
-    base_edge_indices : CMemoryManager = None
-    adj_offsets       : CMemoryManager = None
-    adj_indices       : CMemoryManager = None
-    # fmt:on
+    __slots__ = (
+        "vertex_count",
+        "tri_indices_2D",
+        "tri_to_face_map",
+        "base_edge_indices",
+        "adj_offsets",
+        "adj_indices",
+    )
+
+    def __init__(self):
+        self.vertex_count     : int            = 0
+        self.tri_indices_2D   : CMemoryManager = None
+        self.tri_to_face_map  : CMemoryManager = None
+        self.base_edge_indices: CMemoryManager = None
+        self.adj_offsets      : CMemoryManager = None
+        self.adj_indices      : CMemoryManager = None
 
 
-@dataclass(slots=True)
 class MeshDisplayContext:
     """专供视口显示与笔刷射线检测的拓扑与坐标缓存"""
+    __slots__ = ("vertex_count", "rawPoints_output", "rawPoints2D_output", "topology")
+    
+    def __init__(self):
+        self.vertex_count      : int            = 0
+        self.rawPoints_output  : CMemoryManager = None
+        self.rawPoints2D_output: CMemoryManager = None
+        self.topology          : TopologyCache  = None
 
-    # 几何状态 (每帧都可能更新)
-    rawPoints_output: CMemoryManager = None
-    rawPoints2D_output: CMemoryManager = None
-    # 拓扑缓存 (仅在拓扑改变时更新)
-    topology: TopologyCache = None
 
-
-@dataclass(slots=True)
 class BrushDisplayContext:
     """存放笔刷在当前 Shape 上的运行时状态"""
 
-    # fmt:off
-    # 笔刷渲染数据 (由外部工具填充)
-    brush_hit_count  : int             = 0
-    brush_hit_indices: CMemoryManager  = None
-    brush_hit_weights: CMemoryManager  = None
-    brush_epoch      : int             = 1
-    # 距离和队列的缓存池 (供笔刷算法使用)
-    pool_node_epochs : CMemoryManager  = None
-    pool_dist        : CMemoryManager  = None
-    pool_queue       : CMemoryManager  = None
-    pool_in_queue    : CMemoryManager  = None
-    pool_touched     : CMemoryManager  = None
-    # fmt:on
+    __slots__ = (
+        "brush_hit_count",
+        "brush_hit_indices",
+        "brush_hit_weights",
+        "brush_epoch",
+        "pool_node_epochs",
+        "pool_dist",
+        "pool_queue",
+        "pool_in_queue",
+        "pool_touched",
+    )
+
+    def __init__(self):
+        self.brush_hit_count  : int            = 0
+        self.brush_hit_indices: CMemoryManager = None
+        self.brush_hit_weights: CMemoryManager = None
+        self.brush_epoch      : int            = 1
+
+        self.pool_node_epochs: CMemoryManager = None
+        self.pool_dist       : CMemoryManager = None
+        self.pool_queue      : CMemoryManager = None
+        self.pool_in_queue   : CMemoryManager = None
+        self.pool_touched    : CMemoryManager = None
 
 
-@dataclass(frozen=True, slots=True)
 class RenderState:
     """存放 UI 颜色、渲染模式等显示配置的快照"""
+    __slots__ = (
+        "render_mode",
+        "paintLayerIndex",
+        "paintInfluenceIndex",
+        "paintMask",
+        "color_wire",
+        "color_point",
+        "color_mask_remapA",
+        "color_mask_remapB",
+        "color_weights_remapA",
+        "color_weights_remapB",
+        "color_brush_remapA",
+        "color_brush_remapB",
+    )
 
-    # fmt:off
-    render_mode         : int   = 0
-    paintLayerIndex     : int   = -1
-    paintInfluenceIndex : int   = 0
-    paintMask           : bool  = False
-    color_wire          : tuple = (0.0, 1.0, 1.0, 1.0)
-    color_point         : tuple = (1.0, 0.0, 0.0, 1.0)
-    color_mask_remapA   : tuple = (0.1, 0.1, 0.1, 0.0)
-    color_mask_remapB   : tuple = (0.1, 1.0, 0.1, 0.0)
-    color_weights_remapA: tuple = (0.0, 0.0, 0.0, 0.0)
-    color_weights_remapB: tuple = (1.0, 1.0, 1.0, 0.0)
-    color_brush_remapA  : tuple = (1.0, 0.0, 0.0, 1.0)
-    color_brush_remapB  : tuple = (1.0, 1.0, 0.0, 1.0)
+    def __init__(
+        self,
+        render_mode         : int   = 0,
+        paintLayerIndex     : int   = -1,
+        paintInfluenceIndex : int   = 0,
+        paintMask           : bool  = False,
+        color_wire          : tuple = (0.0, 1.0, 1.0, 1.0),
+        color_point         : tuple = (1.0, 0.0, 0.0, 1.0),
+        color_mask_remapA   : tuple = (0.1, 0.1, 0.1, 0.0),
+        color_mask_remapB   : tuple = (0.1, 1.0, 0.1, 0.0),
+        color_weights_remapA: tuple = (0.0, 0.0, 0.0, 0.0),
+        color_weights_remapB: tuple = (1.0, 1.0, 1.0, 0.0),
+        color_brush_remapA  : tuple = (1.0, 0.0, 0.0, 1.0),
+        color_brush_remapB  : tuple = (1.0, 1.0, 0.0, 1.0),
+    ):
+        self.render_mode          = render_mode
+        self.paintLayerIndex      = paintLayerIndex
+        self.paintInfluenceIndex  = paintInfluenceIndex
+        self.paintMask            = paintMask
+        self.color_wire           = color_wire
+        self.color_point          = color_point
+        self.color_mask_remapA    = color_mask_remapA
+        self.color_mask_remapB    = color_mask_remapB
+        self.color_weights_remapA = color_weights_remapA
+        self.color_weights_remapB = color_weights_remapB
+        self.color_brush_remapA   = color_brush_remapA
+        self.color_brush_remapB   = color_brush_remapB
     # fmt:on
+
+    def __eq__(self, other):
+        """高效的相等性检测，替代 dataclass 的自动生成，用于检测状态是否发生改变"""
+        if not isinstance(other, RenderState):
+            return False
+        return all(getattr(self, attr) == getattr(other, attr) for attr in self.__slots__)
 
 
 # ==============================================================================
@@ -178,7 +227,6 @@ class WeightGeometryOverride(omr.MPxGeometryOverride):
             # 2. 同步 UI 状态到 Shape 内部
             shape.sync_ui_state_to_blackboard()
 
-            # region Topology Cache
             _cache = self._get_topology_index_buffers(mesh_ctx)
             if _cache:
                 (
@@ -190,11 +238,9 @@ class WeightGeometryOverride(omr.MPxGeometryOverride):
                 if self._last_topo_cache is not _cache:
                     self._indices_initialized = False
                     self._last_topo_cache = _cache
-            # endregion
 
             self._cached_raw_points_mgr = mesh_ctx.rawPoints_output
 
-            # region Color & Weights & State System
             # 1. 直接获取 Shape 侧同步好的状态包
             self._state = shape.render_state
 
@@ -207,7 +253,6 @@ class WeightGeometryOverride(omr.MPxGeometryOverride):
                 safe_idx = max(0, min(target_idx, cols - 1))
                 mv_1d_flat = mv_2d.cast("B").cast("f")
                 self._cached_weights_1d = mv_1d_flat[safe_idx::cols]
-            # endregion
 
             # Brush DATA
             brush_ctx = shape.brush_context
@@ -223,14 +268,14 @@ class WeightGeometryOverride(omr.MPxGeometryOverride):
 
         for req in requirements.vertexRequirements():
             if req.semantic == omr.MGeometry.kPosition:
-                if points_mgr and points_mgr.ptr_addr:
+                if points_mgr and points_mgr.ptr:
                     vtx_buf = data.createVertexBuffer(req)
                     vtx_addr = vtx_buf.acquire(N * 3, True)
                     if vtx_addr:
                         stride = N * 12
-                        ctypes.memmove(vtx_addr, points_mgr.ptr_addr, stride)
-                        ctypes.memmove(vtx_addr + stride, points_mgr.ptr_addr, stride)
-                        ctypes.memmove(vtx_addr + stride * 2, points_mgr.ptr_addr, stride)
+                        ctypes.memmove(vtx_addr, points_mgr.ptr, stride)
+                        ctypes.memmove(vtx_addr + stride, points_mgr.ptr, stride)
+                        ctypes.memmove(vtx_addr + stride * 2, points_mgr.ptr, stride)
                         vtx_buf.commit(vtx_addr)
 
             elif req.semantic == omr.MGeometry.kColor:
@@ -272,7 +317,7 @@ class WeightGeometryOverride(omr.MPxGeometryOverride):
                     i_buf = data.createIndexBuffer(omr.MGeometry.kUnsignedInt32)
                     i_addr = i_buf.acquire(num_indices, True)
                     if i_addr:
-                        ctypes.memmove(i_addr, mgr.ptr_addr, num_indices * 4)
+                        ctypes.memmove(i_addr, mgr.ptr, num_indices * 4)
                         i_buf.commit(i_addr)
                         item.associateWithIndexBuffer(i_buf)
 
@@ -283,7 +328,7 @@ class WeightGeometryOverride(omr.MPxGeometryOverride):
                     i_buf = data.createIndexBuffer(omr.MGeometry.kUnsignedInt32)
                     i_addr = i_buf.acquire(num_indices, True)
                     if i_addr:
-                        cColor.offset_indices_direct(mgr.ptr_addr, int(i_addr), num_indices, N)
+                        cColor.offset_indices_direct(mgr.ptr, int(i_addr), num_indices, N)
                         i_buf.commit(i_addr)
                         item.associateWithIndexBuffer(i_buf)
 
@@ -293,7 +338,7 @@ class WeightGeometryOverride(omr.MPxGeometryOverride):
                     i_addr = i_buf.acquire(self._cached_brush_hit_count, True)
                     if i_addr:
                         cColor.offset_indices_direct(
-                            self._cached_brush_hit_indices.ptr_addr,
+                            self._cached_brush_hit_indices.ptr,
                             int(i_addr),
                             self._cached_brush_hit_count,
                             2 * N,
@@ -305,7 +350,10 @@ class WeightGeometryOverride(omr.MPxGeometryOverride):
 
     def _get_topology_index_buffers(self, mesh_ctx: MeshDisplayContext):
         N = mesh_ctx.vertex_count
-        if N == 0 or mesh_ctx.tri_indices_2D is None:
+        topo = mesh_ctx.topology  # ✅ 获取内部的拓扑缓存对象
+
+        # ✅ 从 topo 对象判断是否存在
+        if N == 0 or topo is None or topo.tri_indices_2D is None:
             return None
 
         if (self._cached_vertex_count == N) and (self._cached_solid_mgr is not None):
@@ -316,8 +364,9 @@ class WeightGeometryOverride(omr.MPxGeometryOverride):
                 self._cached_vertex_count,
             )
 
-        new_solid_mgr = mesh_ctx.tri_indices_2D
-        new_wire_mgr = mesh_ctx.base_edge_indices
+        # ✅ 正确地从 topo 中读取数据
+        new_solid_mgr = topo.tri_indices_2D
+        new_wire_mgr = topo.base_edge_indices
         new_point_mgr = CMemoryManager.from_list(list(range(N)), "i")
 
         return new_solid_mgr, new_wire_mgr, new_point_mgr, N
@@ -333,7 +382,11 @@ class WeightGeometryOverride(omr.MPxGeometryOverride):
         item.setDrawMode(omr.MGeometry.kAll)
         item.setShader(shader)
         if depth_priority is not None:
-            item.setDepthPriority(depth_priority)
+            # 兼容不同版本 API 的属性/方法差异
+            try:
+                item.depthPriority = depth_priority
+            except AttributeError:
+                item.setDepthPriority(depth_priority)
         item.enable(True)
 
     def updateRenderItems(self, objPath, renderItems):
@@ -381,6 +434,28 @@ class WeightPreviewShape(om.MPxSurfaceShape):
     aColorBrushRemapA = None
     aColorBrushRemapB = None
 
+    __slots__ = (
+        "mesh_context",
+        "brush_context",
+        "render_state",
+        "_boundingBox",
+        "_cached_cSkin",
+        "_mObj",
+        "_layer_plug",
+        "_mask_plug",
+        "_influence_plug",
+        "_deformMesh_plug",
+        "_renderMode_plug",
+        "_colorWire_plug",
+        "_colorPoint_plug",
+        "_colorMaskRemapA_plug",
+        "_colorMaskRemapB_plug",
+        "_colorWeightsRemapA_plug",
+        "_colorWeightsRemapB_plug",
+        "_colorBrushRemapA_plug",
+        "_colorBrushRemapB_plug",
+    )
+
     def __init__(self):
         super(WeightPreviewShape, self).__init__()
         self._boundingBox = om.MBoundingBox(om.MPoint((-10, -10, -10)), om.MPoint((10, 10, 10)))
@@ -397,30 +472,30 @@ class WeightPreviewShape(om.MPxSurfaceShape):
         self.render_state = RenderState()
 
     def postConstructor(self):
-        self.mObj = self.thisMObject()
+        self._mObj = self.thisMObject()
         # 预先获取所有需要用到的 Plug
-        self.layer_plug = om.MPlug(self.mObj, self.aLayer)
-        self.mask_plug = om.MPlug(self.mObj, self.aMask)
-        self.influence_plug = om.MPlug(self.mObj, self.aInfluence)
-        self.deformMesh_plug = om.MPlug(self.mObj, self.aInDeformMesh)
-        self.renderMode_plug = om.MPlug(self.mObj, self.aRenderMode)
-        self.colorWire_plug = om.MPlug(self.mObj, self.aColorWire)
-        self.colorPoint_plug = om.MPlug(self.mObj, self.aColorPoint)
-        self.colorMaskRemapA_plug = om.MPlug(self.mObj, self.aColorMaskRemapA)
-        self.colorMaskRemapB_plug = om.MPlug(self.mObj, self.aColorMaskRemapB)
-        self.colorWeightsRemapA_plug = om.MPlug(self.mObj, self.aColorWeightsRemapA)
-        self.colorWeightsRemapB_plug = om.MPlug(self.mObj, self.aColorWeightsRemapB)
-        self.colorBrushRemapA_plug = om.MPlug(self.mObj, self.aColorBrushRemapA)
-        self.colorBrushRemapB_plug = om.MPlug(self.mObj, self.aColorBrushRemapB)
-        return super().postConstructor()
+        self._layer_plug = om.MPlug(self._mObj, self.aLayer)
+        self._mask_plug = om.MPlug(self._mObj, self.aMask)
+        self._influence_plug = om.MPlug(self._mObj, self.aInfluence)
+        self._deformMesh_plug = om.MPlug(self._mObj, self.aInDeformMesh)
+        self._renderMode_plug = om.MPlug(self._mObj, self.aRenderMode)
+        self._colorWire_plug = om.MPlug(self._mObj, self.aColorWire)
+        self._colorPoint_plug = om.MPlug(self._mObj, self.aColorPoint)
+        self._colorMaskRemapA_plug = om.MPlug(self._mObj, self.aColorMaskRemapA)
+        self._colorMaskRemapB_plug = om.MPlug(self._mObj, self.aColorMaskRemapB)
+        self._colorWeightsRemapA_plug = om.MPlug(self._mObj, self.aColorWeightsRemapA)
+        self._colorWeightsRemapB_plug = om.MPlug(self._mObj, self.aColorWeightsRemapB)
+        self._colorBrushRemapA_plug = om.MPlug(self._mObj, self.aColorBrushRemapA)
+        self._colorBrushRemapB_plug = om.MPlug(self._mObj, self.aColorBrushRemapB)
+        super().postConstructor()
 
     @property
     def cSkin(self) -> "CythonSkinDeformer":
         """获取绑定的 cSkin 实例"""
         if self._cached_cSkin is None:
-            if not self.deformMesh_plug.isConnected:
+            if not self._deformMesh_plug.isConnected:
                 return None
-            connected_plugs = self.deformMesh_plug.connectedTo(True, False)
+            connected_plugs = self._deformMesh_plug.connectedTo(True, False)
             if not connected_plugs:
                 return None
             mObj_skin = connected_plugs[0].node()
@@ -453,7 +528,7 @@ class WeightPreviewShape(om.MPxSurfaceShape):
         零开销直接从 cSkin 中“白嫖”顶点的物理指针。不再经过 API 调用。
         """
         # 强制 DG 计算，确保上游的 deform 运行过了
-        _ = self.deformMesh_plug.asMObject()
+        _ = self._deformMesh_plug.asMObject()
 
         cSkin = self.cSkin
         if not cSkin:
@@ -468,7 +543,7 @@ class WeightPreviewShape(om.MPxSurfaceShape):
             # 拓扑不会每帧变，用 om2 重新捞一遍边和邻接表
             import maya.api.OpenMaya as om2
 
-            mFnMesh_om2 = om2.MFnMesh(self.deformMesh_plug.asMObject())
+            mFnMesh_om2 = om2.MFnMesh(self._deformMesh_plug.asMObject())
             self._build_topology_cache(mFnMesh_om2, vtx_count)
 
         # 写入 Mesh Context
@@ -479,7 +554,7 @@ class WeightPreviewShape(om.MPxSurfaceShape):
 
         # 将原始一维指针映射为 N*3 的二维视图供笔刷用
         if self.mesh_context.rawPoints_output:
-            ptr = self.mesh_context.rawPoints_output.ptr_addr
+            ptr = self.mesh_context.rawPoints_output.ptr
             self.mesh_context.rawPoints2D_output = CMemoryManager.from_ptr(ptr, "f", (vtx_count, 3))
 
     def _build_topology_cache(self, mFnMesh_om2, vtx_count: int):
@@ -487,16 +562,20 @@ class WeightPreviewShape(om.MPxSurfaceShape):
         [补全] 拓扑数据生成器
         使用 mFnMesh_om2 (OpenMaya 2.0) 生成三角形索引、邻接表等拓扑数据。
         """
-        # 1. 提取三角形索引与面映射 (用于渲染和笔刷射线检测)
+        # ✅ 1. 实例化一个专门的拓扑缓存对象
+        topo = TopologyCache()
+        topo.vertex_count = vtx_count
+
+        # 提取三角形索引与面映射
         tri_counts, tri_vtx_indices = mFnMesh_om2.getTriangles()
-        self.mesh_context.tri_indices_2D = CMemoryManager.from_list(list(tri_vtx_indices), "i")
+        topo.tri_indices_2D = CMemoryManager.from_list(list(tri_vtx_indices), "i")
 
         tri_to_face = []
         for face_idx, count in enumerate(tri_counts):
             tri_to_face.extend([face_idx] * count)
-        self.mesh_context.tri_to_face_map = CMemoryManager.from_list(tri_to_face, "i")
+        topo.tri_to_face_map = CMemoryManager.from_list(tri_to_face, "i")
 
-        # 2. 提取边索引 (用于线框显示) 并构建邻接关系
+        # 提取边索引并构建邻接关系
         num_edges = mFnMesh_om2.numEdges
         edge_indices = [0] * (num_edges * 2)
         adj_list = [set() for _ in range(vtx_count)]
@@ -509,9 +588,9 @@ class WeightPreviewShape(om.MPxSurfaceShape):
             adj_list[u].add(v)
             adj_list[v].add(u)
 
-        self.mesh_context.base_edge_indices = CMemoryManager.from_list(edge_indices, "i")
+        topo.base_edge_indices = CMemoryManager.from_list(edge_indices, "i")
 
-        # 3. 将邻接表转换为高性能的 CSR (Compressed Sparse Row) 格式
+        # 将邻接表转换为高性能的 CSR 格式
         flat_adj = []
         adj_offsets = [0] * (vtx_count + 1)
         for i in range(vtx_count):
@@ -519,8 +598,11 @@ class WeightPreviewShape(om.MPxSurfaceShape):
             flat_adj.extend(neighbors)
             adj_offsets[i + 1] = adj_offsets[i] + len(neighbors)
 
-        self.mesh_context.adj_offsets = CMemoryManager.from_list(adj_offsets, "i")
-        self.mesh_context.adj_indices = CMemoryManager.from_list(flat_adj, "i")
+        topo.adj_offsets = CMemoryManager.from_list(adj_offsets, "i")
+        topo.adj_indices = CMemoryManager.from_list(flat_adj, "i")
+
+        # ✅ 2. 将装满数据的 topo 实例，赋值给 mesh_context
+        self.mesh_context.topology = topo
 
         # 同时为笔刷分配对应顶点数量的缓存池
         self.brush_context.pool_node_epochs = CMemoryManager.allocate("i", (vtx_count,))
@@ -533,57 +615,70 @@ class WeightPreviewShape(om.MPxSurfaceShape):
         """将前端 Plug 属性同步到 Shape 的本地状态中"""
 
         def get_color(plug: om.MPlug, alpha=1.0):
-            vec = plug.asFloatVector()
-            return (vec.x, vec.y, vec.z, alpha)
+            return (
+                plug.child(0).asFloat(),
+                plug.child(1).asFloat(),
+                plug.child(2).asFloat(),
+                alpha,
+            )
 
-        # 构造新状态
+        # fmt:off
         new_state = RenderState(
-            paintLayerIndex      = self.layer_plug.asInt(),
-            paintInfluenceIndex  = self.influence_plug.asInt(),
-            paintMask            = self.mask_plug.asBool(),
-            render_mode          = self.renderMode_plug.asInt(),
-            color_wire           = get_color(self.colorWire_plug, 1.0),
-            color_point          = get_color(self.colorPoint_plug, 1.0),
-            color_mask_remapA    = get_color(self.colorMaskRemapA_plug, 0.0),
-            color_mask_remapB    = get_color(self.colorMaskRemapB_plug, 0.0),
-            color_weights_remapA = get_color(self.colorWeightsRemapA_plug, 0.0),
-            color_weights_remapB = get_color(self.colorWeightsRemapB_plug, 0.0),
-            color_brush_remapA   = get_color(self.colorBrushRemapA_plug, 1.0),
-            color_brush_remapB   = get_color(self.colorBrushRemapB_plug, 1.0),
+            paintLayerIndex      = self._layer_plug.asInt(),
+            paintInfluenceIndex  = self._influence_plug.asInt(),
+            paintMask            = self._mask_plug.asBool(),
+            render_mode          = self._renderMode_plug.asInt(),
+            color_wire           = get_color(self._colorWire_plug, 1.0),
+            color_point          = get_color(self._colorPoint_plug, 1.0),
+            color_mask_remapA    = get_color(self._colorMaskRemapA_plug, 0.0),
+            color_mask_remapB    = get_color(self._colorMaskRemapB_plug, 0.0),
+            color_weights_remapA = get_color(self._colorWeightsRemapA_plug, 0.0),
+            color_weights_remapB = get_color(self._colorWeightsRemapB_plug, 0.0),
+            color_brush_remapA   = get_color(self._colorBrushRemapA_plug, 1.0),
+            color_brush_remapB   = get_color(self._colorBrushRemapB_plug, 1.0),
         )
+        # fmt:on
 
         # 只有在状态真正改变时才替换，触发后续可能的重绘逻辑
         if self.render_state != new_state:
             self.render_state = new_state
 
     def connectionBroken(self, plug, otherPlug, asSrc):
-        if plug == self.deformMesh_plug:
+        if plug == self._deformMesh_plug:
             self._cached_cSkin = None
         return super().connectionBroken(plug, otherPlug, asSrc)
 
     def setDependentsDirty(self, plug, plugArray):
         attr = plug.attribute()
-        if attr in (self.aInDeformMesh, self.aLayer, self.aMask, self.aInfluence):
-            omr.MRenderer.setGeometryDrawDirty(self.mObj, True)
+        dirty_attrs = (
+            self.aInDeformMesh, self.aLayer, self.aMask, self.aInfluence, self.aRenderMode,
+            self.aColorWire, self.aColorPoint, self.aColorMaskRemapA, self.aColorMaskRemapB,
+            self.aColorWeightsRemapA, self.aColorWeightsRemapB, 
+            self.aColorBrushRemapA, self.aColorBrushRemapB,
+        )
+        if attr in dirty_attrs:
+            omr.MRenderer.setGeometryDrawDirty(self._mObj, True)
         return super().setDependentsDirty(plug, plugArray)
 
-    def postEvaluation(self, context, evaluationNode, evalType):
-        omr.MRenderer.setGeometryDrawDirty(self.mObj, True)
-        super().postEvaluation(context, evaluationNode, evalType)
-
     def preEvaluation(self, context, evaluationNode):
-        if evaluationNode.dirtyPlugExists(self.aInDeformMesh) or evaluationNode.dirtyPlugExists(self.aLayer) or evaluationNode.dirtyPlugExists(self.aInfluence) or evaluationNode.dirtyPlugExists(self.aMask):
-            omr.MRenderer.setGeometryDrawDirty(self.mObj, True)
+
+        dirty_attrs = (
+            self.aInDeformMesh, self.aLayer, self.aMask, self.aInfluence, self.aRenderMode,
+            self.aColorWire, self.aColorPoint, self.aColorMaskRemapA, self.aColorMaskRemapB,
+            self.aColorWeightsRemapA, self.aColorWeightsRemapB, 
+            self.aColorBrushRemapA, self.aColorBrushRemapB
+        )
+        if any(evaluationNode.dirtyPlugExists(a) for a in dirty_attrs):
+            omr.MRenderer.setGeometryDrawDirty(self._mObj, True)
 
         super().preEvaluation(context, evaluationNode)
 
     @staticmethod
     def initialize():
         nAttr = om.MFnNumericAttribute()
-        tAttr: om.MFnTypedAttribute = om.MFnTypedAttribute()
+        tAttr = om.MFnTypedAttribute()
         eAttr = om.MFnEnumAttribute()
 
-        tAttr: om.MFnTypedAttribute = om.MFnTypedAttribute()
         WeightPreviewShape.aInDeformMesh = tAttr.create("inDeformMesh", "idm", om.MFnData.kMesh)
         tAttr.hidden = True
         tAttr.storable = False
@@ -618,10 +713,10 @@ class WeightPreviewShape(om.MPxSurfaceShape):
             return attr
 
         # fmt:off
-        WeightPreviewShape.aColorWire          = add_color("colorWire"         , "cwir", (0.0, 1.0, 1.0)) 
-        WeightPreviewShape.aColorPoint         = add_color("colorPoint"        , "cpnt", (1.0, 0.0, 0.0))
-        WeightPreviewShape.aColorMaskRemapA    = add_color("colorMaskRemapA"   , "cmra", (0.1, 0.1, 0.1))
-        WeightPreviewShape.aColorMaskRemapB    = add_color("colorMaskRemapB"   , "cmrb", (0.1, 1.0, 0.1))
+        WeightPreviewShape.aColorWire          = add_color("colorWire"        , "cwir", (0.0, 1.0, 1.0)) 
+        WeightPreviewShape.aColorPoint         = add_color("colorPoint"       , "cpnt", (1.0, 0.0, 0.0))
+        WeightPreviewShape.aColorMaskRemapA    = add_color("colorMaskRemapA"  , "cmra", (0.1, 0.1, 0.1))
+        WeightPreviewShape.aColorMaskRemapB    = add_color("colorMaskRemapB"  , "cmrb", (0.1, 1.0, 0.1))
         WeightPreviewShape.aColorWeightsRemapA = add_color("colorWeightsRemapA", "cwra", (0.0, 0.0, 0.0))
         WeightPreviewShape.aColorWeightsRemapB = add_color("colorWeightsRemapB", "cwrb", (1.0, 1.0, 1.0))
         WeightPreviewShape.aColorBrushRemapA   = add_color("colorBrushRemapA"  , "cbra", (1.0, 0.0, 0.0))
