@@ -17,7 +17,7 @@ class MicroProfiler:
     def __enter__(self):
         if MicroProfiler._enabled:
             # 记录起始的纳秒时间戳
-            self.t_start = time.thread_time_ns()
+            self.t_start = time.perf_counter()
         return self
 
     def step(self, step_name):
@@ -25,14 +25,14 @@ class MicroProfiler:
         if not MicroProfiler._enabled:
             return
 
-        t_now = time.thread_time_ns()
+        t_now = time.perf_counter()
         elapsed = t_now - self.t_start
         self.t_start = t_now  # 重置起点
 
         # 累加时间 (转换为毫秒)
         if step_name not in MicroProfiler._records:
             MicroProfiler._records[step_name] = 0.0
-        MicroProfiler._records[step_name] += elapsed / 1_000_000.0
+        MicroProfiler._records[step_name] += elapsed*1000
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if not MicroProfiler._enabled:

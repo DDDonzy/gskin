@@ -9,7 +9,7 @@ from . import cBoundingBoxCython
 from . import cColorCython as cColor
 from .cMemoryView import CMemoryManager
 from ._cRegistry import SkinRegistry
-from ._profile import MicroProfiler, DeepProfiler, MayaNativeProfiler
+
 
 from typing import TYPE_CHECKING
 

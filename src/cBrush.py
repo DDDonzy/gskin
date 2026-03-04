@@ -6,7 +6,7 @@ import maya.api.OpenMayaRender as omr
 
 # 统一使用相对路径和模块导入
 from . import cDisplayNode
-from . import cBrushCore
+from . import cBrushManager
 from . import cRaycastCython
 
 # 这是一个外部模块，我们保持原样导入
@@ -25,7 +25,7 @@ class WeightBrushContext(omui.MPxContext):
 
     def __init__(self):
         super(WeightBrushContext, self).__init__()
-        self.core: "cBrushCore.WeightBrushCore" = None
+        self.core: "cBrushManager.WeightBrushCore" = None
         self.preview_shape: "cDisplayNode.WeightPreviewShape" = None
         self._shape_path: str = None
         self.fn_mesh: om.MFnMesh = None
@@ -60,7 +60,7 @@ class WeightBrushContext(omui.MPxContext):
             if not self.preview_shape: raise RuntimeError("在网格上找不到连接的 WeightPreviewShape 节点。")
 
             self._view = omui.M3dView.active3dView()
-            self.core = cBrushCore.WeightBrushCore(self.preview_shape, self.fn_mesh)
+            self.core = cBrushManager.WeightBrushCore(self.preview_shape, self.fn_mesh)
             print("[Brush] 引擎已启动。已连接到 WeightPreviewShape。")
 
         except Exception as e:
