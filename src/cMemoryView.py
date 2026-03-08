@@ -130,7 +130,7 @@ class CMemoryManager:
         new_instance.ptr = self.ptr
         new_instance.format_char = self.format_char
         new_instance.shape = new_shape
-        new_instance.view = self.view.cast(self.format_char, shape=new_shape)
+        new_instance.view = self.view.cast("B").cast(self.format_char, shape=new_shape)
         return new_instance
 
     def __repr__(self) -> str:

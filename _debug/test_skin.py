@@ -81,16 +81,11 @@ def convert_skin_to_cSkin(skin_cluster_name):
     return deformer
 
 
-
-
-
-
 maya_file = r"C:/Users/Donzy/Desktop/ng_test.ma"
 sk_node = "skinCluster1"
 
 gskinReload.reload_modules_in_path()
 gskinReload.reload_all_plugins()
-
 
 
 cmds.file(maya_file, o=1, f=1)
@@ -107,3 +102,17 @@ a.set_weights(list(w))
 cmds.createNode("WeightPreviewShape")
 cmds.connectAttr("cSkinDeformer1.outputGeometry[0]", "WeightPreviewShape1.inDeformMesh")
 cmds.setAttr("WeightPreviewShape1.layer", -1)
+
+
+cmds.setToolTo("selectSuperContext")
+if cmds.contextInfo("cBrush", exists=True):
+    cmds.deleteUI("cBrush", toolContext=True)
+
+
+cmds.select("pCube1")
+
+if not cmds.contextInfo("cBrush", exists=True):
+    cmds.cBrushCtx("cBrush")
+
+
+cmds.setToolTo("cBrush")

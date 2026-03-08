@@ -95,11 +95,10 @@ class WeightsHandle:
         if self.max_capacity == 0:
             return
 
-        # 💥 装配时，立刻初始化管家
         ptr_addr = int(self.fn_mesh.getRawPoints())
-        self.memory = CMemoryManager.from_ptr(ptr_addr, "f", (self.max_capacity,))
-
-        full_view = self.memory.view
+        # 临时创建一个全量视图来做尾部扫描
+        full_memory = CMemoryManager.from_ptr(ptr_addr, "f", (self.max_capacity,))
+        full_view = full_memory.view
 
         vl = self.max_capacity
         if vl > 0 and full_view[vl - 1] < -0.5:
@@ -108,6 +107,9 @@ class WeightsHandle:
             vl -= 1
         self.length = vl
 
+        # 💥 核心优化：对外暴露的 memory 严格截断到真实业务长度！
+        self.memory = CMemoryManager.from_ptr(ptr_addr, "f", (self.length,))
+
     @property
     def is_valid(self):
         return (self.fn_mesh is not None) and (self.max_capacity > 0) and (self.memory is not None)
@@ -115,9 +117,12 @@ class WeightsHandle:
     # =========================================================================
     # 3. 容器生命周期管理
     # =========================================================================
-    def _rebuild_mesh(self, target_length: int):
-        num_points = int(math.ceil(target_length / 3.0))
-        num_points = max(3, num_points)
+    # =========================================================================
+    # 3. 容器生命周期管理
+    # =========================================================================
+    def _rebuild_mesh(self, vtx_count: int):
+        """纯粹的底层物理网格生成器"""
+        vtx_count = max(3, vtx_count)
 
         v_count = om1.MIntArray()
         v_list = om1.MIntArray()
@@ -127,30 +132,33 @@ class WeightsHandle:
         v_list.append(2)
 
         base_pts = om1.MFloatPointArray()
-        base_pts.setLength(num_points)
+        base_pts.setLength(vtx_count)
 
         mesh_data_obj = om1.MFnMeshData().create()
         new_mesh_fn = om1.MFnMesh()
-        new_mesh_fn.create(num_points, 1, base_pts, v_count, v_list, mesh_data_obj)
+        new_mesh_fn.create(vtx_count, 1, base_pts, v_count, v_list, mesh_data_obj)
 
         self.mObj_mesh = mesh_data_obj
         self.fn_mesh = new_mesh_fn
-        self.max_capacity = num_points * 3
-        self.length = target_length
-
-        ptr_addr = int(self.fn_mesh.getRawPoints())
-        self.memory = CMemoryManager.from_ptr(ptr_addr, "f", (self.max_capacity,))
+        self.max_capacity = vtx_count * 3
 
         if self._is_plug_mode:
             self.plug.setMObject(mesh_data_obj)
         elif self.data_handle is not None:
             self.data_handle.setMObject(mesh_data_obj)
 
-    def resize(self, length: int):
-        if length > self.max_capacity:
-            self._rebuild_mesh(length)
-        else:
-            self.length = length
+    def resize(self, ary_length: int):
+        """业务层的容量管家"""
+        if ary_length > self.max_capacity:
+            vtx_count = int(math.ceil(ary_length / 3.0))
+            self._rebuild_mesh(vtx_count)
+
+        self.length = ary_length
+
+        # 💥 统一在这里绑定/更新 memory，确保它永远只包含有效数据
+        if self.fn_mesh:
+            ptr_addr = int(self.fn_mesh.getRawPoints())
+            self.memory = CMemoryManager.from_ptr(ptr_addr, "f", (self.length,))
 
     def commit(self):
         """通知 Maya 数据已更新"""
@@ -187,6 +195,56 @@ class WeightsHandle:
         if self.max_capacity > self.length:
             cWeightsCoreCython.fill_float_array(full_dest_view[self.length :], -1.0)
 
+        self.commit()
+
+    def set_sparse_weights(self, vtx_indices, bone_local_indices, sparse_weights_1d):
+        """
+        双重稀疏写入接口 (极致内存压缩版)
+        与笔刷引擎 end_stroke 返回的压缩数据完美对接！
+        专供 Undo/Redo 极速覆写物理内存使用。
+
+        Args:
+            vtx_indices: array.array('i') 或 list，修改的顶点 ID
+            bone_local_indices: array.array('i') 或 list，实际变动的骨骼局部列 ID
+            sparse_weights_1d: array.array('f') 或 memoryview，1D 极限压缩权重快照
+        """
+        if not self.is_valid or self.length == 0 or not vtx_indices or not bone_local_indices:
+            return
+
+        float_view = self.memory.view
+        int_view = float_view.cast("i")
+
+        # 1. 瞬间从 Header 读取骨骼数量，算出 Payload 的安全起始线
+        influence_count = int_view[1]
+        header_size = 2 + influence_count
+
+        # 2. 统一将输入转为 memoryview，确保底层的切片赋值速度
+        if isinstance(sparse_weights_1d, memoryview):
+            # 消除可能存在的格式限制
+            src_view = sparse_weights_1d.cast("B").cast("f")
+        else:
+            # array.array('f') 可以直接套用 memoryview 并强转为 float 视图，零拷贝！
+            src_view = memoryview(sparse_weights_1d).cast("B").cast("f")
+
+        num_modified_bones = len(bone_local_indices)
+
+        # 3. 💥 核心插秧逻辑：遍历修改的顶点和列，精准还原到物理内存
+        # 因为修改的点和列数量通常极少，这个纯 Python 循环在 1 毫秒内就能跑完
+        for i, vtx_id in enumerate(vtx_indices):
+            # 这个顶点在底层一维物理内存中的绝对起点（跨过 Header 区）
+            row_start = header_size + vtx_id * influence_count
+
+            for j, local_col_id in enumerate(bone_local_indices):
+                # 目标地址：跳过 Header -> 找到对应顶点行 -> 偏移到对应的骨骼列
+                dest_idx = row_start + local_col_id
+
+                # 源地址：在 1D 压缩数组里的顺序位置 (十字交叉展开)
+                src_idx = i * num_modified_bones + j
+
+                # 纯粹的 C 级别内存覆写
+                float_view[dest_idx] = src_view[src_idx]
+
+        # 4. 触发 Maya 的脏标记刷新
         self.commit()
 
     def fill_with_value(self, value: float):

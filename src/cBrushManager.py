@@ -1,203 +1,296 @@
 import typing
+import ctypes
 from dataclasses import dataclass
 
 # 统一使用相对路径和模块导入
 from . import cMemoryView
-from . import cBrushCoreCython  # 🟢 假设你的 Cython 文件现在叫 cBrushCore
+from . import cBrushCoreCython
+from .cSkinContext import MeshTopologyContext, BrushHitContext
 
 if typing.TYPE_CHECKING:
     from . import cDisplayNode
 
 
-# ==========================================#
-# 📦 数据结构定义
-# ==========================================#
+# ==============================================================================
+# 🎛️ 配置结构
+# ==============================================================================
 @dataclass
 class BrushSettings:
-    """存放笔刷半径、强度、模式等配置。"""
+    """存放笔刷半径、强度、模式等用户 UI 配置。"""
 
     radius: float = 0.5
     strength: float = 0.1
-    falloff_type: int = 1  # 默认为 Airbrush (1)
-    mode: int = 0  # 0:Add, 1:Sub, 2:Replace, 3:Multiply
+    iter: int = 10
+    falloff_type: int = 1  # 0:Linear, 1:Airbrush, 2:Solid, 3:Dome, 4:Spike
+    mode: int = 1  # 0:Add, 1:Sub, 2:Replace, 3:Multiply, 4:Smooth, 5:Sharp
     use_surface: bool = True
 
 
-class BrushTopology:
-    """存放从网格解析出的图论邻接表。"""
-
-    __slots__ = ("adjacency_offsets", "adjacency_indices")
-
-    def __init__(self):
-        self.adjacency_offsets: cMemoryView.CMemoryManager = None
-        self.adjacency_indices: cMemoryView.CMemoryManager = None
-
-
-class BrushGraphPools:
-    """管理算法所需的世代池（Epochs）。"""
-
-    __slots__ = ("vertices_epochs", "brush_epoch")
-
-    def __init__(self):
-        self.vertices_epochs: cMemoryView.CMemoryManager = None
-        self.brush_epoch: int = 0
-
-
-class BrushHitState:
-    """存放单次命中的结果缓冲区。"""
-
-    __slots__ = ("hit_count", "hit_indices_mgr", "hit_weights_mgr", "hit_center_position")
-
-    def __init__(self, vertex_count: int):
-        self.hit_count: int = 0
-        self.hit_indices_mgr: "cMemoryView.CMemoryManager" = cMemoryView.CMemoryManager.allocate("i", (vertex_count,))
-        self.hit_weights_mgr: "cMemoryView.CMemoryManager" = cMemoryView.CMemoryManager.allocate("f", (vertex_count,))
-        self.hit_center_position: tuple = (0.0, 0.0, 0.0)
-
-    def clear(self):
-        self.hit_count = 0
-        self.hit_center_position = (0.0, 0.0, 0.0)
-
-
-# ==========================================#
-# 🧠 笔刷管理器 (原 WeightBrushCore)
-# ==========================================#
+# ==============================================================================
+# 🧠 笔刷管理器 (纯算法装配车间，彻底无状态)
+# ==============================================================================
 class WeightBrushManager:
+    """
+    负责将 Maya Shape 中的网格数据与底层 Cython 计算引擎组装在一起。
+    管理完整的 Stroke (绘制行程) 生命周期，并接管 Undo/Redo 内存池。
+    """
+
     def __init__(self, preview_shape: "cDisplayNode.WeightPreviewShape"):
-        self.preview_shape = preview_shape
+        self.shape = preview_shape
+        self.cSkin = preview_shape.cSkin
         self.settings = BrushSettings()
 
-        self.topology: BrushTopology = None
-        self.pools: BrushGraphPools = None
-        self.hit_state: BrushHitState = None
+        # 1. 提取基础上下文
+        self.mesh_ctx = preview_shape.mesh_context
+        self.brush_ctx = preview_shape.brush_context
+        vtx_count = self.mesh_ctx.vertex_count
+        tri_count = len(self.mesh_ctx.triangle_indices.view) // 3
 
-        # 1. 核心步骤：直接从渲染节点的 Mesh 上下文构建邻接表，不经过 InDeformMesh
-        self._build_topology_from_cache()
+        # 2. 🟢 极限重构：调用 Cython 构建纯 C 级别的 CSR 邻接表
+        self.mesh_ctx = self._build_csr_topology(self.mesh_ctx)
 
-        # 2. 内存链接：将本地 Buffer 指针共享给渲染节点，实现渲染直读
-        self.preview_shape.brush_context.brush_hit_indices = self.hit_state.hit_indices_mgr
-        self.preview_shape.brush_context.brush_hit_weights = self.hit_state.hit_weights_mgr
+        # 3. 预分配：命中结果缓冲区
+        self.brush_ctx.hit_indices = cMemoryView.CMemoryManager.allocate("i", (vtx_count,))
+        self.brush_ctx.hit_weights = cMemoryView.CMemoryManager.allocate("f", (vtx_count,))
+        self.brush_ctx.hit_count = 0
 
-        # 3. 初始化骨骼锁 (如果存在蒙皮实例)
-        cskin = self.preview_shape.cSkin
-        if cskin:
-            influences_count = cskin.influences_count
-            if not cskin.influences_locks_mgr or len(cskin.influences_locks_mgr.view) != influences_count:
-                cskin.influences_locks_mgr = cMemoryView.CMemoryManager.allocate("B", (influences_count,))
-                cskin.influences_locks_mgr.view[:] = 0
+        # 4. 预分配：引擎广度优先搜索 (BFS) 所需的世代掩码
+        self.vertices_epochs = cMemoryView.CMemoryManager.allocate("i", (vtx_count,))
 
-    def _build_topology_from_cache(self):
+        # 5. 🚀 装载底盘：实例化 CoreBrushEngine
+        self.engine = cBrushCoreCython.CoreBrushEngine(
+            self.mesh_ctx.vertex_positions.reshape((vtx_count, 3)).view,
+            self.mesh_ctx.triangle_indices.reshape((tri_count, 3)).view,
+            self.mesh_ctx.adjacency_offsets.view,
+            self.mesh_ctx.adjacency_indices.view,
+            self.vertices_epochs.view,
+            self.brush_ctx.hit_indices.view,
+            self.brush_ctx.hit_weights.view,
+        )
+
+        # 6. 预分配：Undo/Redo 撤销系统内存池
+        inf_count = self.cSkin.influences_count if self.cSkin else 1
+        self.modified_vtx_bool_mgr = cMemoryView.CMemoryManager.allocate("B", (vtx_count,))
+        self.modified_indices_mgr = cMemoryView.CMemoryManager.allocate("i", (vtx_count,))
+        self.undo_buffer_mgr = cMemoryView.CMemoryManager.allocate("f", (vtx_count, inf_count))
+
+        # Stroke
+        self.active_processor: cBrushCoreCython.SkinWeightProcessor = None
+        self.active_handle = None
+        self.active_target_idx = 0
+
+    def refresh_mesh_positions(self):
+        """同步最新的网格顶点数据到引擎"""
+        # 假设这里你从 preview_shape 获取了最新的顶点上下文
+        vtx_count = self.mesh_ctx.vertex_count
+
+        # 重新 reshape 获取 2D 视图
+        new_view = self.mesh_ctx.vertex_positions.reshape((vtx_count, 3)).view
+
+        # 💥 告诉 Cython 引擎：指针换了，盯紧这块新内存！
+        self.engine.update_vertex_positions(new_view)
+
+    def _build_csr_topology(self, mesh_ctx: MeshTopologyContext) -> MeshTopologyContext:
         """
-        🟢 核心改造：利用渲染节点的 edge_indices 徒手构建邻接表。
+        [隐式修改，显式返回]
+        利用渲染节点的去重边索引，调用 Cython 算法极速构建 CSR 邻接表。
         """
-        mesh_ctx = self.preview_shape.mesh_context
         vtx_count = mesh_ctx.vertex_count
         edge_view = mesh_ctx.edge_indices.view
 
-        # 构建双向邻接集合
-        adj_list = [set() for _ in range(vtx_count)]
-        for i in range(len(edge_view) // 2):
-            v1 = edge_view[i * 2]
-            v2 = edge_view[i * 2 + 1]
-            adj_list[v1].add(v2)
-            adj_list[v2].add(v1)
+        # CSR 所需的三个核心连续内存
+        offsets_mgr = cMemoryView.CMemoryManager.allocate("i", (vtx_count + 1,))
+        indices_mgr = cMemoryView.CMemoryManager.allocate("i", (len(edge_view),))
+        temp_cursor = cMemoryView.CMemoryManager.allocate("i", (vtx_count,))
 
-        # 转换为 CSR (Compressed Sparse Row) 格式
-        offsets = [0] * (vtx_count + 1)
-        indices = []
-        for i in range(vtx_count):
-            offsets[i] = len(indices)
-            indices.extend(adj_list[i])
-        offsets[vtx_count] = len(indices)
+        # 💥 呼叫 Cython C 引擎进行降维打击 (毫秒级完成)
+        cBrushCoreCython.build_csr_topology(vtx_count, edge_view, offsets_mgr.view, indices_mgr.view, temp_cursor.view)
 
-        self.topology = BrushTopology()
-        self.topology.adjacency_offsets = cMemoryView.CMemoryManager.from_list(offsets, "i")
-        self.topology.adjacency_indices = cMemoryView.CMemoryManager.from_list(indices, "i")
-
-        # 初始化纪元池
-        self.pools = BrushGraphPools()
-        self.pools.vertices_epochs = cMemoryView.CMemoryManager.allocate("i", (vtx_count,))
-        self.pools.vertices_epochs.view[:] = 0
-
-        # 初始化结果缓冲区
-        self.hit_state = BrushHitState(vtx_count)
-
-    def teardown(self):
-        """清理资源。"""
-        if self.preview_shape and self.preview_shape.brush_context:
-            self.preview_shape.brush_context.brush_hit_count = 0
+        mesh_ctx.adjacency_offsets = offsets_mgr
+        mesh_ctx.adjacency_indices = indices_mgr
+        return mesh_ctx
 
     def clear_hit_state(self):
-        """清空命中状态（当笔刷离开模型时）。"""
-        if self.hit_state:
-            self.hit_state.clear()
-            self.preview_shape.brush_context.brush_hit_count = 0
+        """清空高亮状态 (光标离开模型时)。"""
+        if self.brush_ctx:
+            self.brush_ctx.clear()
 
-    def detect_range(self, center_xyz: tuple, hit_tri: int) -> int:
+    def teardown(self):
+        """彻底清理内存资源与引用。"""
+        self.clear_hit_state()
+        self.active_processor = None
+        self.active_handle = None
+
+    def process_stroke(self, ray_source: tuple, ray_dir: tuple, action: str) -> tuple:
         """
-        调用 Cython Core 进行范围检测。
+        封装射线投射、范围检测和笔刷涂抹的完整过程。
+
+        Args:
+            ray_source (tuple): 射线起点 (局部空间)
+            ray_dir (tuple): 射线方向 (局部空间)
+            action (str): 当前鼠标动作 ("hover", "press", "drag")
+        Returns:
+            tuple: (hit_pos, hit_normal) 供前端绘制光标。若未命中则返回 None。
         """
-        mesh_ctx = self.preview_shape.mesh_context
-        if not mesh_ctx or not mesh_ctx.vertex_positions:
-            return 0
+        if not self.engine:
+            return None
 
-        # 世代同步
-        self.pools.brush_epoch += 1
+        self.refresh_mesh_positions()
 
-        # 🟢 调用你最新的 calc_brush_weights 接口
-        hit_count = cBrushCoreCython.calc_brush_weights(
-            mesh_ctx.vertex_positions.view,
-            center_xyz,
-            hit_tri,
-            mesh_ctx.triangle_indices.view,
-            self.topology.adjacency_offsets.view,
-            self.topology.adjacency_indices.view,
-            self.settings.radius,
-            self.settings.falloff_type,
-            self.settings.use_surface,
-            self.pools.brush_epoch,
-            self.pools.vertices_epochs.view,
-            self.hit_state.hit_indices_mgr.view,
-            self.hit_state.hit_weights_mgr.view,
-        )
+        # 1. 底层射线检测
+        hit_success, hit_pos, hit_normal, hit_tri, _, _, _ = self.engine.raycast(ray_source, ray_dir)
 
-        self.hit_state.hit_count = hit_count
-        self.hit_state.hit_center_position = center_xyz
+        # 2. 未命中处理
+        if not hit_success:
+            if action == "hover":
+                self.clear_hit_state()
+            return None
 
-        # 🟢 通知渲染节点有 X 个点需要画出 Brush Color
-        self.preview_shape.brush_context.brush_hit_count = hit_count
+        # 3. 命中处理, 进行空间球体或拓扑扫描
+        if self.mesh_ctx and self.mesh_ctx.vertex_positions:
+            hit_count, _, _ = self.engine.calc_brush_weights(
+                hit_pos,
+                hit_tri,
+                self.settings.radius,
+                self.settings.falloff_type,
+                self.settings.use_surface,
+            )
+            self.brush_ctx.hit_count = hit_count
+            self.brush_ctx.hit_center_position = hit_pos
 
-        return hit_count
+        # 4. 动作分发：如果是按下或拖拽，执行核心涂抹运算
+        if action in ("press", "drag"):
+            self.update_stroke()
+            self.cSkin.setDirty()
 
-    def apply_weight_math(self) -> bool:
+        # 5. 返回局部坐标和法线，供 UI 层转换世界坐标画圈
+
+        return (hit_pos, hit_normal)
+
+    # ==============================================================================
+    # 🖌️ Stroke 生命周期管理 (按下 -> 拖拽 -> 松开)
+    # ==============================================================================
+    def begin_stroke(self):
         """
-        调用 Cython Core 应用权重修改。
+        [阶段 1: 鼠标按下]
+        解析 UI 目标 (Layer/Mask/Influence)，提取对应内存并装配 Processor。
         """
-        if self.hit_state.hit_count == 0:
-            return False
+        cSkin = self.cSkin
+        render_ctx = self.shape.render_context
 
-        cskin = self.preview_shape.cSkin
-        render_ctx = self.preview_shape.render_context
+        if not cSkin or render_ctx.paintLayerIndex not in cSkin.weightsLayer:
+            self.active_processor = None
+            return
 
-        if not cskin or render_ctx.paintLayerIndex not in cskin.weightsLayer:
-            return False
+        layer = cSkin.weightsLayer[render_ctx.paintLayerIndex]
+        influences_count = cSkin.influences_count
 
-        layer = cskin.weightsLayer[render_ctx.paintLayerIndex]
-
-        # 根据当前模式提取 2D 权重内存视图
+        # 1. 动态确定绘制目标视图并强转 2D
         if render_ctx.paintMask:
             if not layer.maskHandle:
-                return False
-            modify_view = layer.maskHandle.memory.view
-            target_idx = 0
-            locks_view = cMemoryView.CMemoryManager.allocate("B", (1,)).view  # 掩码模式无锁
+                return
+            weights2d_mgr = layer.maskHandle.memory.reshape((cSkin.vertex_count, 1))
+            locks_mgr = cMemoryView.CMemoryManager.allocate("B", (1,)).view  # Mask 无锁
+
+            self.active_target_idx = 0
+            self.active_handle = layer.maskHandle
         else:
             if not layer.weightsHandle:
-                return False
-            modify_view = layer.weightsHandle.memory.view
-            target_idx = render_ctx.paintInfluenceIndex
-            locks_view = cskin.influences_locks_mgr.view
+                return
+            weights2d_mgr = layer.weightsHandle.memory.reshape((cSkin.vertex_count, influences_count))
 
-        # 🟢 调用你最新的接口：完成计算并自动触发归一化
-        cBrushCoreCython.skin_weight_brush(self.settings.strength, self.settings.mode, target_idx, locks_view, self.hit_state.hit_indices_mgr.view, self.hit_state.hit_weights_mgr.view, self.hit_state.hit_count, modify_view)
+            # locks_view = cSkin.influences_locks_mgr.view
+            locks_mgr = cMemoryView.CMemoryManager.allocate("B", (influences_count,))
+
+            self.active_target_idx = render_ctx.paintInfluenceIndex
+            self.active_handle = layer.weightsHandle
+
+        # 2. 装载激活当前的 Processor
+        self.active_processor = cBrushCoreCython.SkinWeightProcessor(
+            self.engine,
+            weights2d_mgr.view,
+            self.modified_indices_mgr.view,
+            self.modified_vtx_bool_mgr.view,
+            locks_mgr.view,
+            self.undo_buffer_mgr.view,
+        )
+
+        # 通知 Processor 清空掩码，开始记录历史
+        self.active_processor.begin_stroke()
+
+    def update_stroke(self) -> bool:
+        """
+        鼠标拖拽，计算内存权重
+        """
+        if not self.active_processor or self.brush_ctx.hit_count == 0:
+            return False
+
+        # 底层内存极限狂飙
+        self.active_processor.apply_weight(self.settings.strength, self.settings.mode, self.active_target_idx,self.settings.iter)
         return True
+
+    def end_stroke(self):
+        """
+        鼠标松开
+        提取 Undo 历史，并向 Maya 正式提交这一笔的所有修改。
+        """
+        if not self.active_processor or not self.active_handle:
+            return
+
+        # 1. 结束行程，获取撤销恢复包
+        # undo_redo_pack = (count, indices_view, undo_view, redo_view)
+        undo_redo_pack = self.active_processor.end_stroke()
+        print(undo_redo_pack)
+
+        # if undo_redo_pack:
+        #     count, indices_view, undo_view, redo_view = undo_redo_pack
+        #     channels = 1 if self.shape.render_context.paintMask else self.cSkin.influences_count
+        #     vtx_count = self.cSkin.vertex_count
+            
+        #     # 脱水打包
+        #     indices_pack = tuple(indices_view[:count])
+        #     undo_pack = tuple(tuple(undo_view[i, j] for j in range(channels)) for i in range(count))
+        #     redo_pack = tuple(tuple(redo_view[i, j] for j in range(channels)) for i in range(count))
+            
+        #     # ==========================================
+        #     # 🚀 见证奇迹的时刻：用 partial 绑定参数！
+        #     # ==========================================
+        #     from functools import partial
+        #     undo_partial = partial(self.execute_sparse_update, 
+        #                            self.active_handle, vtx_count, channels, indices_pack, undo_pack)
+                                   
+        #     redo_partial = partial(self.execute_sparse_update, 
+        #                            self.active_handle, vtx_count, channels, indices_pack, redo_pack)
+            
+        #     # 塞进万能壳
+        #     from .cBrushCommand import CallbackCmd
+        #     import maya.cmds as cmds
+            
+        #     CallbackCmd._staging_data = {
+        #         'undo': undo_partial,
+        #         'redo': redo_partial
+        #     }
+            
+        #     cmds.cCallbackCmd()  # 搞定！入栈！
+
+
+
+
+
+        # 清除挂载状态
+        self.active_processor = None
+        self.active_handle = None
+
+    def execute_sparse_update(self, handle, vtx_count, channels, indices, weights_data):
+        """还原权重的干活函数"""
+        if not handle or not handle.is_valid:
+            return
+
+        target_view = handle.memory.reshape((vtx_count, channels)).view
+        for i, vtx_idx in enumerate(indices):
+            v_weights = weights_data[i]
+            for c in range(channels):
+                target_view[vtx_idx, c] = v_weights[c]
+
+        self.cSkin.setDirty()
+

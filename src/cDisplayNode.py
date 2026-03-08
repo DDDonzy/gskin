@@ -9,6 +9,7 @@ from . import cBoundingBoxCython
 from . import cColorCython as cColor
 from .cMemoryView import CMemoryManager
 from ._cRegistry import SkinRegistry
+from .cSkinContext import BrushHitContext, MeshTopologyContext, RenderContext
 
 
 from typing import TYPE_CHECKING
@@ -22,97 +23,6 @@ NODE_ID = om.MTypeId(0x80005)
 
 DRAW_CLASSIFICATION = "drawdb/geometry/WeightPreview"
 DRAW_REGISTRAR = "WeightPreviewShapeRegistrar"
-
-
-# ==============================================================================
-# 📦 数据结构：Shape 节点专属的网格与笔刷上下文
-# ==============================================================================
-# fmt:off
-class MeshTopologyContext:
-    """统一的数据结构，包含渲染所需的所有网格数据，包括动态的顶点位置和静态的拓扑。"""
-    __slots__ = (
-        "vertex_count",
-        "vertex_positions",
-        "triangle_indices",
-        "edge_indices",
-    )
-
-    def __init__(self):
-        self.vertex_count: int = 0
-        self.vertex_positions: CMemoryManager = None
-        self.triangle_indices: CMemoryManager = None
-        self.edge_indices: CMemoryManager = None
-
-
-class BrushDisplayContext:
-    """存放笔刷在当前 Shape 上的运行时状态"""
-
-    __slots__ = (
-        "brush_hit_count",
-        "brush_hit_indices",
-        "brush_hit_weights",
-    )
-
-    def __init__(self):
-        self.brush_hit_count  : int            = 0
-        self.brush_hit_indices: CMemoryManager = None
-        self.brush_hit_weights: CMemoryManager = None
-
-    @property
-    def is_valid(self) -> bool:
-        """检查笔刷命中数据是否完整且有效"""
-        return (
-            self.brush_hit_count > 0
-            and self.brush_hit_indices is not None
-            and self.brush_hit_weights is not None
-        )
-
-
-class RenderContext:
-    """存放 UI 颜色、渲染模式等显示配置的快照"""
-    __slots__ = (
-        "render_mode",
-        "paintLayerIndex",
-        "paintInfluenceIndex",
-        "paintMask",
-        "color_wire",
-        "color_point",
-        "color_mask_remapA",
-        "color_mask_remapB",
-        "color_weights_remapA",
-        "color_weights_remapB",
-        "color_brush_remapA",
-        "color_brush_remapB",
-    )
-
-    def __init__(
-        self,
-        render_mode         : int   = 0,
-        paintLayerIndex     : int   = -1,
-        paintInfluenceIndex : int   = 0,
-        paintMask           : bool  = False,
-        color_wire          : tuple = (0.0, 1.0, 1.0, 1.0),
-        color_point         : tuple = (1.0, 0.0, 0.0, 1.0),
-        color_mask_remapA   : tuple = (0.1, 0.1, 0.1, 0.0),
-        color_mask_remapB   : tuple = (0.1, 1.0, 0.1, 0.0),
-        color_weights_remapA: tuple = (0.0, 0.0, 0.0, 0.0),
-        color_weights_remapB: tuple = (1.0, 1.0, 1.0, 0.0),
-        color_brush_remapA  : tuple = (1.0, 0.0, 0.0, 1.0),
-        color_brush_remapB  : tuple = (1.0, 1.0, 0.0, 1.0),
-    ):
-        self.render_mode          = render_mode
-        self.paintLayerIndex      = paintLayerIndex
-        self.paintInfluenceIndex  = paintInfluenceIndex
-        self.paintMask            = paintMask
-        self.color_wire           = color_wire
-        self.color_point          = color_point
-        self.color_mask_remapA    = color_mask_remapA
-        self.color_mask_remapB    = color_mask_remapB
-        self.color_weights_remapA = color_weights_remapA
-        self.color_weights_remapB = color_weights_remapB
-        self.color_brush_remapA   = color_brush_remapA
-        self.color_brush_remapB   = color_brush_remapB
-# fmt:on
 
 
 # ==============================================================================
@@ -132,11 +42,11 @@ class WeightGeometryOverride(omr.MPxGeometryOverride):
         "_point_shader",
     )
     RENDER_POINTS = True
-    RENDER_LINE = True
+    RENDER_LINE = False
     RENDER_POLYGONS = True
 
-    points_size = 1.0
-    lines_width = 1.0
+    points_size = 6.0
+    lines_width = 1
 
     def __init__(self, mObjectShape):
         super(WeightGeometryOverride, self).__init__(mObjectShape)
@@ -224,9 +134,9 @@ class WeightGeometryOverride(omr.MPxGeometryOverride):
                     if brush_ctx.is_valid:
                         cColor.render_brush_gradient(
                             color_view[2 * vtx_count : 3 * vtx_count],
-                            brush_ctx.brush_hit_indices.view,
-                            brush_ctx.brush_hit_weights.view,
-                            brush_ctx.brush_hit_count,
+                            brush_ctx.hit_indices.view,
+                            brush_ctx.hit_weights.view,
+                            brush_ctx.hit_count,
                             self._render_ctx.color_brush_remapA,
                             self._render_ctx.color_brush_remapB,
                         )
@@ -260,9 +170,9 @@ class WeightGeometryOverride(omr.MPxGeometryOverride):
                 brush_ctx = self._class_shape.brush_context
                 if brush_ctx.is_valid:
                     i_buf = data.createIndexBuffer(omr.MGeometry.kUnsignedInt32)
-                    i_addr = i_buf.acquire(brush_ctx.brush_hit_count, True)
+                    i_addr = i_buf.acquire(brush_ctx.hit_count, True)
                     if i_addr:
-                        cColor.offset_indices_direct(brush_ctx.brush_hit_indices.ptr, int(i_addr), brush_ctx.brush_hit_count, 2 * vtx_count)
+                        cColor.offset_indices_direct(brush_ctx.hit_indices.ptr, int(i_addr), brush_ctx.hit_count, 2 * vtx_count)
                         i_buf.commit(i_addr)
                         item.associateWithIndexBuffer(i_buf)
 
@@ -362,7 +272,7 @@ class WeightPreviewShape(om.MPxSurfaceShape):
 
         # 初始化上下文 (代替以前的全局 DATA)
         self.mesh_context = MeshTopologyContext()
-        self.brush_context = BrushDisplayContext()
+        self.brush_context = BrushHitContext()
 
         # 占位：如果有需要在UI直接访问的笔刷设置，可以在这里实例化
         # 🎨 渲染显示数据

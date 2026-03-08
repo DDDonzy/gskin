@@ -11,9 +11,11 @@ NODE_NAME = "cSkinDeformer"
 # MTypeId 必须使用旧版 API 的对象
 NODE_ID = om1.MTypeId(0x00080033)
 
+
 def nodeCreator():
     # creator 必须返回一个由 asMPxPtr 包装的指针
     return ompx.asMPxPtr(cSkinDeform.CythonSkinDeformer())
+
 
 def initializePlugin(mObj):
     # 使用旧版的 MFnPlugin
@@ -30,6 +32,7 @@ def initializePlugin(mObj):
     except:
         om.MGlobal.displayError(f"Failed to register node: {NODE_NAME}")
         raise
+
 
 def uninitializePlugin(mObj):
     # 使用旧版的 MFnPlugin

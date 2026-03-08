@@ -27,6 +27,7 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         "hashCode",  # 节点唯一哈希
         "mObject",  # 变形器自身对象
         "mFnDep",  # 依赖图函数集
+        "plug_refresh",
         # ==========================================
         # 🔴 私有数据 (Private) - 仅供 deform 内部计算使用
         # ==========================================
@@ -51,6 +52,7 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
     aWeightsLayerCompound = om1.MObject()
     aInfluenceMatrix = om1.MObject()
     aBindPreMatrix = om1.MObject()
+    aRefresh = om1.MObject()
 
     def __init__(self):
         super(CythonSkinDeformer, self).__init__()
@@ -64,6 +66,7 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         self.hashCode: int = None
         self.mObject: om1.MObject = None
         self.mFnDep: om1.MFnDependencyNode = None
+        self.plug_refresh: om1.MPlug = None
 
         # --- 初始化私有数据 ---
         self._weights_is_dirty: bool = True
@@ -80,14 +83,23 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         self._rotateMatrix_mgr: "cMemoryView.CMemoryManager" = None
         self._translateVector_mgr: "cMemoryView.CMemoryManager" = None
 
+    def setDirty(self):
+        """
+        - 用于笔刷调用，提醒Deform，更新权重
+        """
+
+        self.plug_refresh.setInt((self.plug_refresh.asInt() + 1))
+        self._weights_is_dirty = True
+
     def postConstructor(self):
         self.mObject = self.thisMObject()
         self.mFnDep = om1.MFnDependencyNode(self.mObject)
         self.hashCode = om1.MObjectHandle(self.mObject).hashCode()
+        self.plug_refresh = om1.MPlug(self.mObject, self.aRefresh)
         _cRegistry.SkinRegistry.register(self.mObject, self)
 
     def setDependentsDirty(self, plug, dirtyPlugArray):
-        weights_plugs = (self.aWeights, self.aWeightsLayerCompound, self.aWeightsLayerMask, self.aWeightsLayer, self.aWeightsLayerEnabled)
+        weights_plugs = (self.aWeights, self.aWeightsLayerCompound, self.aWeightsLayerMask, self.aWeightsLayer, self.aWeightsLayerEnabled, self.aRefresh)
         if plug in weights_plugs:
             self._weights_is_dirty = True
         elif plug == self.aInfluenceMatrix:
@@ -106,7 +118,14 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
                 self._influencesMatrix_is_dirty = True
             if evaluationNode.dirtyPlugExists(self.aBindPreMatrix):
                 self._bindPreMatrix_is_dirty = True
-            if evaluationNode.dirtyPlugExists(self.aWeights) or evaluationNode.dirtyPlugExists(self.aWeightsLayerCompound) or evaluationNode.dirtyPlugExists(self.aWeightsLayerMask) or evaluationNode.dirtyPlugExists(self.aWeightsLayer) or evaluationNode.dirtyPlugExists(self.aWeightsLayerEnabled):
+            if (
+                evaluationNode.dirtyPlugExists(self.aWeights)
+                or evaluationNode.dirtyPlugExists(self.aWeightsLayerCompound)
+                or evaluationNode.dirtyPlugExists(self.aWeightsLayerMask)
+                or evaluationNode.dirtyPlugExists(self.aWeightsLayer)
+                or evaluationNode.dirtyPlugExists(self.aWeightsLayerEnabled)
+                or evaluationNode.dirtyPlugExists(self.aRefresh)
+            ):
                 self._weights_is_dirty = True
         return super(CythonSkinDeformer, self).preEvaluation(context, evaluationNode)
 
@@ -241,8 +260,13 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         cAttr.addChild(cls.aWeightsLayerEnabled)
         cAttr.addChild(cls.aWeightsLayer)
         cAttr.addChild(cls.aWeightsLayerMask)
-        for attr in [cls.aGeomMatrix, cls.aWeights, cls.aInfluenceMatrix, cls.aBindPreMatrix, cls.aWeightsLayerCompound]:
+
+        cls.aRefresh = nAttr.create("cRefresh", "cr", om1.MFnNumericData.kInt, False)
+        nAttr.setKeyable(False)      # 不要让它出现在通道盒里
+        nAttr.setStorable(False)     # 💥 告诉 Maya 这个属性不需要存进文件
+        nAttr.setCached(False)
+        for attr in [cls.aGeomMatrix, cls.aWeights, cls.aInfluenceMatrix, cls.aBindPreMatrix, cls.aWeightsLayerCompound, cls.aRefresh]:
             cls.addAttribute(attr)
         outputGeom = ompx.cvar.MPxGeometryFilter_outputGeom
-        for attr in [cls.aGeomMatrix, cls.aWeights, cls.aInfluenceMatrix, cls.aBindPreMatrix, cls.aWeightsLayerCompound]:
+        for attr in [cls.aGeomMatrix, cls.aWeights, cls.aInfluenceMatrix, cls.aBindPreMatrix, cls.aWeightsLayerCompound, cls.aRefresh]:
             cls.attributeAffects(attr, outputGeom)
