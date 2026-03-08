@@ -6,7 +6,7 @@ import maya.OpenMaya as om1  # type:ignore
 import maya.OpenMayaMPx as ompx  # type:ignore
 
 from . import cMemoryView
-from . import cWeightsHandle as CWH
+from . import cWeights as CWH
 from . import cSkinDeformCython
 from . import _cRegistry
 
@@ -208,10 +208,11 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
             self._geo_matrix_is_identity,
         )
 
+        weights, _, _, _ = self.weightsLayer[-1].weightsHandle.get_weights()
         cSkinDeformCython.run_skinning_core(
             rawPoints_original_mgr.view,
             self.rawPoints_output_mgr.view,
-            self.weightsLayer[-1].weightsHandle.memory.view,
+            weights,
             self._rotateMatrix_mgr.view,
             self._translateVector_mgr.view,
             envelope,
@@ -262,8 +263,8 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         cAttr.addChild(cls.aWeightsLayerMask)
 
         cls.aRefresh = nAttr.create("cRefresh", "cr", om1.MFnNumericData.kInt, False)
-        nAttr.setKeyable(False)      # 不要让它出现在通道盒里
-        nAttr.setStorable(False)     # 💥 告诉 Maya 这个属性不需要存进文件
+        nAttr.setKeyable(False)  # 不要让它出现在通道盒里
+        nAttr.setStorable(False)  # 💥 告诉 Maya 这个属性不需要存进文件
         nAttr.setCached(False)
         for attr in [cls.aGeomMatrix, cls.aWeights, cls.aInfluenceMatrix, cls.aBindPreMatrix, cls.aWeightsLayerCompound, cls.aRefresh]:
             cls.addAttribute(attr)
