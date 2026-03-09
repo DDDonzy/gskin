@@ -1,8 +1,8 @@
 import math
 import maya.OpenMaya as om1  # type: ignore
 
-from z_np.src.cMemoryView import CMemoryManager
-from z_np.src import cWeightsCoreCython
+from .cMemoryView import CMemoryManager
+from . import cWeightsCoreCython
 
 
 class WeightsHandle:
@@ -286,7 +286,6 @@ class WeightsHandle:
         # 4. 触发 Maya 的脏标记刷新
         self.commit()
 
-    
     # =========================================================================
     # 5. 🌐 Maya 原生 API 对接接口 (MDoubleArray 转换)
     # =========================================================================
@@ -296,14 +295,13 @@ class WeightsHandle:
         通常用于：第一次读取蒙皮权重时 (MFnSkinCluster.getWeights)
         """
         length = maya_double_array.length()
-        
+
         # 1. 将 Maya 的 MDoubleArray 提取为标准 Python 列表
         # (在 OpenMaya 1.0 中，如果直接 list() 报错，则使用列表推导式提取)
         try:
             py_list = list(maya_double_array)
         except TypeError:
             py_list = [maya_double_array[i] for i in range(length)]
-            
 
         self.set_weights(vtx_count, influence_indices, py_list)
 
@@ -313,26 +311,26 @@ class WeightsHandle:
         通常用于：图层合并完毕后，写回给 Maya (MFnSkinCluster.setWeights)
         """
         maya_array = om1.MDoubleArray()
-        
+
         # 1. 获取纯净的权重视图（自动去掉了 Header）
         pure_weights, v_count, inf_count, _ = self.get_weights()
-        
+
         if pure_weights is None or v_count == 0:
             return maya_array
-            
+
         payload_size = v_count * inf_count
         maya_array.setLength(payload_size)
-        
+
         # 2. 瞬间把 C 级 memoryview 拍平成纯 Python 列表 (极速零拷贝提取！)
         # 因为 pure_weights 是 memoryview('f')，tolist() 返回的是纯 Python float 列表
         py_list = pure_weights.tolist()
-        
+
         # 3. 将数据注入 Maya 原生结构
         # (注意：OpenMaya 1.0 没有批量设置接口，只能使用 for 循环 set。
         # 但因为提取 py_list 已经是极速，这个 set 循环在 C++ 底层依然很快)
         for i in range(payload_size):
             maya_array.set(py_list[i], i)
-            
+
         return maya_array
 
     def fill_with_value(self, value: float):
