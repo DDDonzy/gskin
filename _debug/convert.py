@@ -220,9 +220,6 @@ def convert_skin_to_cSkin(skin_cluster_name):
 
     mesh = cmds.skinCluster(skin_cluster_name, q=1, g=1)[0]
     deformer = cmds.deformer(mesh, type="cSkinDeformer")[0]
-    w, _ = get_skinWeights(skin_cluster_name)
-    xyz = weights_to_xyz(w)
-    set_xyz_to_mesh_attr(deformer, "cWeights", xyz)
 
     inf_list = cmds.skinCluster(skin_cluster_name, q=1, inf=1)
     bindMatrix_list = []
@@ -232,5 +229,5 @@ def convert_skin_to_cSkin(skin_cluster_name):
         cmds.connectAttr(f"{influence}.worldMatrix[0]", f"{deformer}.matrix[{idx}]")
 
     set_bindMatrixArray(deformer, "bindPreMatrixArray", bindMatrix_list)
-    cmds.setAttr(f"{deformer}.influencesCount", len(inf_list))
-
+    cmds.setAttr(f"{skin_cluster_name}.envelope", 0)
+    return deformer

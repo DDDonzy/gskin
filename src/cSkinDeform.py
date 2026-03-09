@@ -6,12 +6,9 @@ import maya.OpenMaya as om1  # type:ignore
 import maya.OpenMayaMPx as ompx  # type:ignore
 
 from . import cMemoryView
-from . import cWeights as CWH
+from .cWeightsManager import WeightsHandle
 from . import cSkinDeformCython
 from . import _cRegistry
-
-if typing.TYPE_CHECKING:
-    from . import cWeightsHandle
 
 
 class CythonSkinDeformer(ompx.MPxDeformerNode):
@@ -23,11 +20,12 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         "rawPoints_output_mgr",  # 变形后的顶点坐标物理内存块
         "influences_count",  # 骨骼/影响物总数
         "influences_locks_mgr",  # 骨骼锁定状态
-        "weightsLayer",  # 权重层级字典
         "hashCode",  # 节点唯一哈希
         "mObject",  # 变形器自身对象
         "mFnDep",  # 依赖图函数集
         "plug_refresh",
+        "weights",
+        "weights_handle"
         # ==========================================
         # 🔴 私有数据 (Private) - 仅供 deform 内部计算使用
         # ==========================================
@@ -62,7 +60,6 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         self.rawPoints_output_mgr: "cMemoryView.CMemoryManager" = None
         self.influences_count: int = 0
         self.influences_locks_mgr: "cMemoryView.CMemoryManager" = None
-        self.weightsLayer: typing.Dict[int, "cWeightsHandle.WeightsLayerData"] = {}
         self.hashCode: int = None
         self.mObject: om1.MObject = None
         self.mFnDep: om1.MFnDependencyNode = None
@@ -82,6 +79,9 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         self._bindPreMatrix_mgr: "cMemoryView.CMemoryManager" = None
         self._rotateMatrix_mgr: "cMemoryView.CMemoryManager" = None
         self._translateVector_mgr: "cMemoryView.CMemoryManager" = None
+
+        self.weights = None
+        self.weights_handle = None
 
     def setDirty(self):
         """
@@ -192,11 +192,13 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
             self._geoMatrix_is_dirty = False
 
         if self._weights_is_dirty:
-            self.weightsLayer = self._get_weights_layers_data(dataBlock)
+            print("wwwwww")
+            self.weights_handle = WeightsHandle.from_data_handle(dataBlock.inputValue(self.aWeights))
+            self.weights, _, _, _ = self.weights_handle.get_weights()
             self._weights_is_dirty = False
-
-        if not self.weightsLayer or not self.weightsLayer[-1].weightsHandle.is_valid:
-            return
+        
+        for x in range(8):
+            print(self.weights[x])
 
         cSkinDeformCython.compute_deform_matrices(
             int(self._geo_matrix.this),
@@ -208,31 +210,14 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
             self._geo_matrix_is_identity,
         )
 
-        weights, _, _, _ = self.weightsLayer[-1].weightsHandle.get_weights()
         cSkinDeformCython.run_skinning_core(
             rawPoints_original_mgr.view,
             self.rawPoints_output_mgr.view,
-            weights,
+            self.weights,
             self._rotateMatrix_mgr.view,
             self._translateVector_mgr.view,
             envelope,
         )
-
-    def _get_weights_layers_data(self, dataBlock: om1.MDataBlock) -> dict[int, CWH.WeightsLayerData]:
-        layer_data_dict = {}
-        base_weights_val = dataBlock.inputValue(self.aWeights)
-        base_weights_handle = CWH.WeightsHandle.from_data_handle(base_weights_val)
-        layer_data_dict[-1] = CWH.WeightsLayerData(-1, True, base_weights_handle, None)
-        layer_array_handle = dataBlock.inputArrayValue(self.aWeightsLayerCompound)
-        for i in range(layer_array_handle.elementCount()):
-            layer_array_handle.jumpToArrayElement(i)
-            logical_idx = layer_array_handle.elementIndex()
-            element_handle = layer_array_handle.inputValue()
-            weights_handle = CWH.WeightsHandle.from_data_handle(element_handle.child(self.aWeightsLayer))
-            mask_handle = CWH.WeightsHandle.from_data_handle(element_handle.child(self.aWeightsLayerMask))
-            enabled = element_handle.child(self.aWeightsLayerEnabled).asBool()
-            layer_data_dict[logical_idx] = CWH.WeightsLayerData(logical_idx, enabled, weights_handle, mask_handle)
-        return layer_data_dict
 
     @classmethod
     def nodeInitializer(cls):
