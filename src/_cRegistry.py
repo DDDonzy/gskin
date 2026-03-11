@@ -60,3 +60,16 @@ class SkinRegistry:
                 del cls._storage[hash_code]
 
         return None
+
+    @classmethod
+    def from_instance_by_string(cls, cSkinNodeName: str):
+        """通过字符串路径直接获取 Handle，严格遵循显式装配规范"""
+        sel: om2.MSelectionList = om2.MSelectionList()
+        try:
+            sel.add(cSkinNodeName)
+        except RuntimeError:
+            raise ValueError(f"找不到指定的物体: {cSkinNodeName}")
+
+        mObj = sel.getDependNode(0)
+
+        return cls.get_instance_by_api2(mObj)
