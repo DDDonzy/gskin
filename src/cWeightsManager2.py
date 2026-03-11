@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 
-import math
 import typing
+import array
 from dataclasses import dataclass, field
 
-import maya.OpenMaya as om1
+import maya.OpenMaya as om1  # type:ignore
 
 from . import cWeightsCoreCython
 from .cMemoryView import CMemoryManager
@@ -23,71 +23,57 @@ class WeightsHandle:
     严格贯彻显式赋值，所有隐式属性计算均通过 return 暴露给调用者。
     """
 
-    def __init__(self):
-        self.plug: om1.MPlug = None
-        self.data_handle: om1.MDataHandle = None
+    # fmt:off
+    mDataHandle  : om1.MDataHandle = None
+    mPlug        : om1.MPlug       = None
+    mObject_mesh : om1.MObject     = None
+    mFnMesh      : om1.MFnMesh     = None
 
-        # 核心数据：由外部显式装配
-        self.mObj_mesh: om1.MObject = None
-        self.fn_mesh: om1.MFnMesh = None
-        self._is_plug_mode = False
-        self.max_capacity = 0
-        """当前寄生 `MFnMesh` 的最大储存数据的长度(也可以理解为预分配数组大小)"""
-        self.length = 0
-        """
-        - 当前有效数据长度，对应 `self.memory:CMemoryManager` 的长度
-        - 数据结构 [vtx_count:int, influence_count:int, [influences_indices...], [weights...]]
-        """
-        self.memory: CMemoryManager = None
-        """权重数据的底层`CMemoryManager`对象"""
+    memory       : CMemoryManager  = None
+    """权重数据的底层`CMemoryManager`对象"""
+
+    max_capacity : int             = -1
+    """当前寄生 `MFnMesh` 的最大储存数据的长度(也可以理解为预分配数组大小)"""
+
+    length       : int             = -1
+    """
+    - 当前有效数据长度，对应 `self.memory:CMemoryManager` 的长度
+    - 数据结构 [vtx_count:int, influence_count:int, [influences_indices...], [weights...]]
+    """
+    # fmt:on
+
+    def __init__(self, source: om1.MDataHandle | om1.MPlug):
+        if isinstance(source, om1.MPlug):
+            self.mPlug = source
+            self.mDataHandle = self.mPlug.asMDataHandle()
+        elif isinstance(source, om1.MDataHandle):
+            self.mPlug = None
+            self.mDataHandle = source
+        else:
+            raise TypeError("Input not OpenMaya.MDataHandle or OpenMaya.MPlug")
+
+        self._setup_mesh_buffer(self.mDataHandle)
 
     @property
     def is_valid(self) -> bool:
-        """检查当前 Handle 是否持有有效的底层内存"""
-        return self.memory is not None
+        """检查当前 Handle 是否持有有效"""
+        if self.mDataHandle is None:
+            return False
+        if self.mObject_mesh is None or self.mObject_mesh.isNull():
+            return False
+        if self.mFnMesh is None:
+            return False
+        if self.memory is None:
+            return False
+        if self.memory.view is None:
+            return False
+        if self.length is None or self.length <= 0:
+            return
+        return True
 
     # -------------------------------------------------------------------------
     # 显式工厂方法
     # -------------------------------------------------------------------------
-    @classmethod
-    def from_plug(cls, plug: om1.MPlug):
-        instance = cls()
-        instance.plug = plug
-        instance._is_plug_mode = True
-        try:
-            instance.mObj_mesh = plug.asMObject()
-        except RuntimeError:
-            instance.mObj_mesh = om1.MObject()
-
-        # 💥 显式装配：将加工厂计算出的属性挂载到实例上
-        (
-            instance.mObj_mesh,
-            instance.fn_mesh,
-            instance.max_capacity,
-            instance.length,
-            instance.memory,
-        ) = instance._setup_mesh()
-        return instance
-
-    @classmethod
-    def from_data_handle(cls, data_handle: om1.MDataHandle):
-        instance = cls()
-        instance.data_handle = data_handle
-        instance._is_plug_mode = False
-        try:
-            instance.mObj_mesh = data_handle.asMesh()
-        except RuntimeError:
-            instance.mObj_mesh = om1.MObject()
-
-        # 💥 显式装配
-        (
-            instance.mObj_mesh,
-            instance.fn_mesh,
-            instance.max_capacity,
-            instance.length,
-            instance.memory,
-        ) = instance._setup_mesh()
-        return instance
 
     @classmethod
     def from_attr_string(cls, attr_path: str):
@@ -102,45 +88,8 @@ class WeightsHandle:
         sel.getPlug(0, plug)
 
         # 显式实例化与底层变量初始化
-        instance = cls()
-        instance.plug = plug
-        instance._is_plug_mode = True
-        try:
-            instance.mObj_mesh = plug.asMObject()
-        except RuntimeError:
-            instance.mObj_mesh = om1.MObject()
-
-        # 💥 显式装配：将加工厂计算出的属性挂载到实例上
-        (
-            instance.mObj_mesh,
-            instance.fn_mesh,
-            instance.max_capacity,
-            instance.length,
-            instance.memory,
-        ) = instance._setup_mesh()
-
+        instance = cls(plug)
         return instance
-
-    # -------------------------------------------------------------------------
-    # 数据加工厂 (纯函数模式，绝不修改 self)
-    # -------------------------------------------------------------------------
-    def _setup_mesh(self):
-        """初始化 mFnMesh，并显式返回所有计算好的核心数据"""
-        mObj_mesh = self.mObj_mesh
-        fn_mesh = self.fn_mesh
-
-        if (fn_mesh is None) and (mObj_mesh) and (not mObj_mesh.isNull()) and (mObj_mesh.hasFn(om1.MFn.kMesh)):
-            fn_mesh = om1.MFnMesh(mObj_mesh)
-
-        # 显式传递参数给下级加工厂，并接收返回
-        (
-            max_capacity,
-            length,
-            memory,
-        ) = self._init_lengths(fn_mesh)
-
-        # 统一打包返回，绝不在此函数内隐式赋值
-        return mObj_mesh, fn_mesh, max_capacity, length, memory
 
     def _setup_mesh_buffer(self, mDataHandle: om1.MDataHandle):
         """
@@ -156,44 +105,34 @@ class WeightsHandle:
             - self.memory
         """
         self.mObject_mesh: om1.MObject = mDataHandle.asMesh()
+        if self.mObject_mesh.isNull():
+            return
+
         self.mFnMesh = om1.MFnMesh(self.mObject_mesh)
         _vtx_count = self.mFnMesh.numVertices()
+        if _vtx_count <= 0:
+            return None
+
         self.max_capacity = _vtx_count * 3  # 预分配数组大小
-        _ptr = self.mFnMesh.getRawPoints()
+        _ptr = int(self.mFnMesh.getRawPoints())
         _full_memory = CMemoryManager.from_ptr(_ptr, "f", (self.max_capacity,))
-        _int_view = _full_memory.cast("B").cast("i")
+        _int_view = _full_memory.view.cast("B").cast("i")
 
         self.vtx_count = _int_view[0]  # 内存地址第一个数据是 权重vertex_count:int
         self.influence_count = _int_view[1]  # 内存地址第二个数据是 权重influence_count:int
+
         self.length = (2 + self.influence_count) + (self.vtx_count * self.influence_count)  # 内存有效长度
         self.memory = CMemoryManager.from_ptr(_ptr, "f", (self.length,))  # 生成 cMemoryManager
 
-    def _init_lengths(self, fn_mesh: om1.MFnMesh):
-        """计算并严格返回 (max_capacity, length, memory)"""
-        if fn_mesh is None or fn_mesh.numVertices() == 0:
-            return 0, 0, None
-
-        max_capacity = fn_mesh.numVertices() * 3
-        if max_capacity == 0:
-            return 0, 0, None
-
-        ptr_addr = int(fn_mesh.getRawPoints())
-        full_memory = CMemoryManager.from_ptr(ptr_addr, "f", (max_capacity,))
-        float_view = full_memory.view
-
-        # 强转指针读取 Header(vtx_count, influence_count)
-        int_view = float_view.cast("B").cast("i")
-        vtx_count = int_view[0]
-        influence_count = int_view[1]
-
-        length = (2 + influence_count) + (vtx_count * influence_count)
-
-        # 正常生成并返回
-        memory = CMemoryManager.from_ptr(ptr_addr, "f", (length,))
-        return max_capacity, length, memory
-
     def _build_mesh_buffer(self, vtx_count: int):
-        """负责构建全新的 Mesh 对象，显式返回给调度者"""
+        """
+        负责构建全新的 Mesh 对象，显式返回给调度者
+
+        Return:
+            - MObject (om1.MObject): New Meshes's MObject.
+            - MFnMesh (om1.MFnMesh): New MFnMesh instance.
+            - max_capacity (int): New MFnMesh's buffer max capacity.
+        """
         vtx_count = max(3, vtx_count)
         v_count = om1.MIntArray()
         v_list = om1.MIntArray()
@@ -205,77 +144,83 @@ class WeightsHandle:
         base_pts = om1.MFloatPointArray()
         base_pts.setLength(vtx_count)
 
-        mesh_data_obj = om1.MFnMeshData().create()
-        new_mesh_fn = om1.MFnMesh()
-        new_mesh_fn.create(vtx_count, 1, base_pts, v_count, v_list, mesh_data_obj)
+        mObject = om1.MFnMeshData().create()
+        mFnMesh = om1.MFnMesh()
+        mFnMesh.create(vtx_count, 1, base_pts, v_count, v_list, mObject)
 
         max_capacity = vtx_count * 3
-        return mesh_data_obj, new_mesh_fn, max_capacity
+        return mObject, mFnMesh, max_capacity
 
-    def resize(self, required_length: int):
+    def resize(self, length: int):
         """
         自动扩容底层物理内存空间。
 
         Side Effects :
-            - self.mObj_mesh
-            - self.fn_mesh
+            - self.mObject_mesh
+            - self.mFnMesh
             - self.max_capacity
             - self.length
             - self.memory
         """
+        resized = False
 
-        if required_length > self.max_capacity:
-            dummy_vtx_count = int(math.ceil(required_length / 3.0))
-            # 显式接收重新构建的 Mesh 数据
-            (
-                self.mObj_mesh,
-                self.fn_mesh,
-                self.max_capacity,
-            ) = self._build_mesh_buffer(dummy_vtx_count)
+        if length > self.max_capacity:
+            (self.mObject_mesh,
+             self.mFnMesh     ,
+             self.max_capacity) = self._build_mesh_buffer((length + 2) // 3)  # fmt:skip
 
-            self.length = required_length
+            self.length = length
+            resized = True
 
-        if self.fn_mesh:
-            ptr_addr = int(self.fn_mesh.getRawPoints())
-            self.memory = CMemoryManager.from_ptr(ptr_addr, "f", (self.length,))
+        if self.mFnMesh is not None:
+            print(int(self.mFnMesh.getRawPoints()))
+            print(self.length)
+            self.memory = CMemoryManager.from_ptr(int(self.mFnMesh.getRawPoints()), "f", (self.length,))
+
+        # self.commit()
+        # self.__init__(self.mDataHandle)
+        return resized
 
     def commit(self):
         """强制提交到 Maya，仅作为外部状态刷新接口"""
-        if self.mObj_mesh:
-            if self._is_plug_mode:
-                print("[commit]: update object --- plug Mode")
-                self.plug.setMObject(self.mObj_mesh)
-            else:
-                print("[commit]: update object --- dataHandle Mode")
-                self.data_handle.setMObject(self.mObj_mesh)
+        if (self.mObject_mesh is not None) and (self.mDataHandle is not None):
+            self.mDataHandle.setMObject(self.mObject_mesh)
+            if self.mPlug is not None:
+                self.mPlug.setMDataHandle(self.mDataHandle)
 
-    # -------------------------------------------------------------------------
-    # 核心读写接口 (全量 / 稀疏)
-    # -------------------------------------------------------------------------
-
-    def set_weights(self, vtx_count: int, influence_indices: tuple, raw_weights_1d):
+    def set_weights(
+        self,
+        vtx_count: int,
+        inf_count: int,
+        influence_indices: tuple,
+        weights_view1D,
+    ):
         """[全量写入] 传入顶点总数、骨骼映射表、完整的一维权重数组"""
         influence_count = len(influence_indices)
         header_size = 2 + influence_count
         total_size = header_size + (vtx_count * influence_count)
         # 重构数组大小(resize 会自行判断是否需要重构)
-        self.resize(total_size)
+        resized = self.resize(total_size)
 
-        float_view = self.memory.view
-        int_view = float_view.cast("B").cast("i")
+        _float_view = self.memory.view
+        _int_view = _float_view.cast("B").cast("i")
 
-        int_view[0] = vtx_count
-        int_view[1] = influence_count
-        for i, bone_id in enumerate(influence_indices):
-            int_view[2 + i] = bone_id
+        _int_view[0] = vtx_count
+        _int_view[1] = influence_count
 
-        if isinstance(raw_weights_1d, memoryview):
-            src_view = raw_weights_1d.cast("B").cast("f")
+        indices_mgr = CMemoryManager.from_list(list(influence_indices), "i")
+        _int_view[2 : 2 + influence_count] = indices_mgr.view
+
+        if isinstance(weights_view1D, memoryview):
+            src_view = weights_view1D.cast("B").cast("f")
         else:
-            temp_mgr = CMemoryManager.from_list(list(raw_weights_1d), "f")
+            temp_mgr = CMemoryManager.from_list(list(weights_view1D), "f")
             src_view = temp_mgr.view
 
-        float_view[header_size:total_size] = src_view
+        _float_view[header_size:total_size] = src_view
+
+        if resized:
+            self.commit()
 
     def get_weights(self):
         """极速解析底层连续内存，分离 Header (元数据) 与 Payload (纯权重)。
@@ -291,13 +236,13 @@ class WeightsHandle:
 
         Returns:
             tuple: 若当前句柄无效或内存数据为空，则返回 (None, 0, 0, ()), 否则返回包含以下元素的元组:
-                - pure_weights_view (memoryview): 去除 Header 后的纯权重 1D 数据视图 (float32)。
                 - vtx_count (int): 当前图层记录的网格顶点总数。
                 - influence_count (int): 当前图层包含的有效骨骼列数。
                 - influence_indices (tuple[int, ...]): 当前图层包含的骨骼逻辑索引列表 (只读的 Bone IDs)。
+                - weights_view (memoryview): 去除 Header 后的纯权重 1D 数据视图 (float32)。
         """
-        if not self.is_valid or self.length == 0:
-            return None, 0, 0, ()
+        if not self.is_valid:
+            return 0, 0, (), None
 
         float_view = self.memory.view
         int_view = float_view.cast("B").cast("i")
@@ -307,17 +252,17 @@ class WeightsHandle:
         header_size = 2 + influence_count
 
         influence_indices = tuple(int_view[2:header_size])
-        pure_weights_view = float_view[header_size : self.length]
+        weights_view = float_view[header_size : self.length]
 
-        return pure_weights_view, vtx_count, influence_count, influence_indices
+        return vtx_count, influence_count, influence_indices, weights_view
 
     def set_sparse_weights(self, vtx_indices, bone_local_indices, sparse_weights_1d):
         """[稀疏写入] 传入被修改的顶点ID列表、局部骨骼列索引列表、稀疏权重数组 (专供画刷 Undo/Redo)"""
-        if not self.is_valid or self.length == 0 or not vtx_indices or not bone_local_indices:
+        if not self.is_valid:
             return
 
-        float_view = self.memory.view
-        int_view = float_view.cast("B").cast("i")
+        _float_view = self.memory.view
+        int_view = _float_view.cast("B").cast("i")
 
         influence_count = int_view[1]
         header_size = 2 + influence_count
@@ -334,9 +279,8 @@ class WeightsHandle:
             for j, local_col_id in enumerate(bone_local_indices):
                 dest_idx = row_start + local_col_id
                 src_idx = i * num_modified_bones + j
-                float_view[dest_idx] = src_view[src_idx]
-
-        self.commit()
+                _float_view[dest_idx] = src_view[src_idx]
+        return True
 
 
 @dataclass
@@ -412,7 +356,7 @@ class WeightsManager:
         # weights
         weights_dataHandle = dataBlock.inputValue(self.cSkin.aWeights)
         self.handle = weights_dataHandle
-        self.weights = WeightsHandle.from_data_handle(weights_dataHandle)
+        self.weights = WeightsHandle(weights_dataHandle)
 
         # layer
         self.layers.clear()

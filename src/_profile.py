@@ -32,7 +32,7 @@ class MicroProfiler:
         # 累加时间 (转换为毫秒)
         if step_name not in MicroProfiler._records:
             MicroProfiler._records[step_name] = 0.0
-        MicroProfiler._records[step_name] += elapsed*1000
+        MicroProfiler._records[step_name] += elapsed * 1000
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if not MicroProfiler._enabled:
@@ -64,43 +64,73 @@ import pstats
 import io
 
 
+import cProfile
+import pstats
+import os
+
+
+
 class DeepProfiler:
-    """基于 cProfile 的深度函数调用分析器"""
+    """基于 cProfile 的深度函数调用分析器 (毫秒级高精度输出)"""
 
     _profiler = cProfile.Profile()
     _counter = 0
-    _target_runs = 30
+    
+    # 💡 在这里集中配置！
+    _target_runs = 30  # 累计抓取多少次后打印
+    _top_n = 100       # 报告显示前多少名 (-1 表示全部显示)
 
     def __enter__(self):
-        # 进入时开启抓取
         self._profiler.enable()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        # 退出时暂停抓取
         self._profiler.disable()
         DeepProfiler._counter += 1
 
-        # 达到指定帧数，打印报告
         if DeepProfiler._counter >= DeepProfiler._target_runs:
-            print(f"\n🔬 [DeepProfiler | 累计 {DeepProfiler._target_runs} 帧深度函数分析]")
-            print("-" * 80)
+            ps = pstats.Stats(self._profiler).sort_stats("tottime")
+            
+            # 💡 新增 1：计算整个剖析区块的单帧平均总耗时
+            total_time_ms = ps.total_tt * 1000.0
+            avg_frame_time = total_time_ms / DeepProfiler._target_runs
 
-            s = io.StringIO()
-            # 💡 核心：按 'tottime' (自身内部耗时) 排序
-            # 如果想看包含子函数的总耗时，可以改成 'cumtime'
-            sortby = "tottime"
-            ps = pstats.Stats(self._profiler, stream=s).sort_stats(sortby)
+            print(f"\n🔬 [DeepProfiler | 累计 {DeepProfiler._target_runs} 帧深度分析 | 显示 Top {DeepProfiler._top_n}]")
+            print(f"⏱️  全局单帧平均总耗时 (Avg per frame): {avg_frame_time:.4f} ms")
+            print("-" * 120)
+            
+            # 💡 新增 2：在表头中间插入 'avg/frm(ms)' 列
+            header = f"{'ncalls':>10} {'tottime(ms)':>12} {'avg/frm(ms)':>12} {'percall(ms)':>12} {'cumtime(ms)':>12} {'percall(ms)':>12}  {'filename:lineno(function)'}"
+            print(header)
 
-            # 去掉冗长的绝对路径，让界面清爽
-            ps.strip_dirs()
-            # 只打印排名前 20 的“性能刺客”
-            ps.print_stats(20)
+            func_list = ps.fcn_list if DeepProfiler._top_n == -1 else ps.fcn_list[:DeepProfiler._top_n]
 
-            print(s.getvalue())
-            print("=" * 80 + "\n")
+            for func in func_list:
+                cc, nc, tt, ct, callers = ps.stats[func]
 
-            # 清空缓存，准备下一轮
+                tt_ms = tt * 1000.0  
+                ct_ms = ct * 1000.0
+                
+                # 💡 新增 3：计算该函数平摊到单帧的平均耗时
+                pf_tt_ms = tt_ms / DeepProfiler._target_runs
+                
+                pc_tt_ms = (tt_ms / nc) if nc > 0 else 0.0
+                pc_ct_ms = (ct_ms / cc) if cc > 0 else 0.0
+
+                call_str = str(nc) if nc == cc else f"{nc}/{cc}"
+                file_path, line, func_name = func
+                file_name = os.path.basename(file_path)
+                
+                if file_name == "~":
+                    func_str = func_name
+                else:
+                    func_str = f"{file_name}:{line} ({func_name})"
+
+                # 💡 输出时将 pf_tt_ms 填入对应列
+                print(f"{call_str:>10} {tt_ms:>12.4f} {pf_tt_ms:>12.4f} {pc_tt_ms:>12.4f} {ct_ms:>12.4f} {pc_ct_ms:>12.4f}  {func_str}")
+
+            print("=" * 120 + "\n")
+
             DeepProfiler._counter = 0
             self._profiler.clear()
 
@@ -110,13 +140,14 @@ import maya.OpenMaya as om1  # 👈 切回 API 1.0
 # 注册类别
 MY_PLUGIN_CATEGORY = om1.MProfiler.addCategory("CythonSkinPlugin", "Cython Nodes")
 
+
 class MayaNativeProfiler:
     """基于 Maya API 1.0 的原生性能分析器"""
-    
+
     def __init__(self, event_name, color=5):
         self.event_name = event_name
         # 颜色 ID 推荐: 2(橘红), 5(蓝色), 6(红色), 7(绿色)
-        self.color = color 
+        self.color = color
         self.event_id = 0
 
     def __enter__(self):

@@ -9,7 +9,7 @@ from .cWeightsManager2 import WeightsHandle, WeightsManager
 from . import cSkinDeformCython
 from . import _cRegistry
 
-from ._profile import MicroProfiler
+from ._profile import MicroProfiler, DeepProfiler
 
 
 class CythonSkinDeformer(ompx.MPxDeformerNode):
@@ -25,8 +25,6 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         "mObject",  # 变形器自身对象
         "mFnDep",  # 依赖图函数集
         "plug_refresh",
-        "weights",
-        "weights_handle"
         "weights_manager"
         # ==========================================
         # 🔴 私有数据 (Private) - 仅供 deform 内部计算使用
@@ -42,6 +40,7 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         "_bindPreMatrix_mgr",
         "_rotateMatrix_mgr",
         "_translateVector_mgr",
+        "_skinWeights",
     )
 
     aGeomMatrix = om1.MObject()
@@ -82,8 +81,6 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         self._rotateMatrix_mgr: "cMemoryView.CMemoryManager" = None
         self._translateVector_mgr: "cMemoryView.CMemoryManager" = None
 
-        self.weights = None
-        self.weights_handle = None
         self.weights_manager = None
 
     def setDirty(self):
@@ -198,9 +195,15 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
 
         if self._weights_is_dirty:
             print("[Deform]: update weights")
-            self.weights_manager.update_data(dataBlock)
-            self.weights, _, _, _ = self.weights_manager.weights.get_weights()
-            self._weights_is_dirty = False
+            with DeepProfiler():
+                self.weights_manager.update_data(dataBlock)
+                # profile.step("[updateManager]")
+                _, _, _, self._skinWeights = self.weights_manager.weights.get_weights()
+
+                self._weights_is_dirty = True
+
+        if self._skinWeights is None:
+            return
 
         cSkinDeformCython.compute_deform_matrices(
             int(self._geo_matrix.this),
@@ -215,7 +218,7 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         cSkinDeformCython.run_skinning_core(
             rawPoints_original_mgr.view,
             self.rawPoints_output_mgr.view,
-            self.weights,
+            self._skinWeights,
             self._rotateMatrix_mgr.view,
             self._translateVector_mgr.view,
             envelope,
