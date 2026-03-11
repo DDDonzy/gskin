@@ -3,7 +3,7 @@ from importlib import reload
 import maya.cmds as cmds
 import maya.api.OpenMaya as om2
 import maya.api.OpenMayaAnim as oma2
-import gskin.src.cWeightsManager as WH
+from gskin.src import cWeightsManager as wm
 
 import gskin._debug.gskinReload as gskinReload
 from gskin._debug.convert import get_skinWeights, convert_skin_to_cSkin
@@ -24,16 +24,14 @@ shape = cmds.skinCluster(sk_node, q=1, g=1)[0]
 cSkin = convert_skin_to_cSkin(sk_node)
 
 
+
+
 # set weights
 maya_weights, _ = get_skinWeights(sk_node)
 vertex_count = cmds.polyEvaluate(shape, vertex=True)
 influence_indices = cmds.getAttr(f"{sk_node}.matrix", mi=1)
-w_handle = WH.WeightsHandle.from_attr_string(f"{'cSkinDeformer1'}.cWeights")
-w_handle.set_weights(vertex_count, influence_indices, list(maya_weights))
-
-
-
-
+manager = wm.WeightsManager.get_manager_from_cSkin(f"{'cSkinDeformer1'}")
+manager.weights.set_weights(vertex_count,2, influence_indices, maya_weights)
 
 
 

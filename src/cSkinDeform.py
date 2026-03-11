@@ -5,7 +5,7 @@ import maya.OpenMaya as om1  # type:ignore
 import maya.OpenMayaMPx as ompx  # type:ignore
 
 from . import cMemoryView
-from .cWeightsManager2 import WeightsHandle, WeightsManager
+from .cWeightsManager import WeightsHandle, WeightsManager
 from . import cSkinDeformCython
 from . import _cRegistry
 
@@ -194,13 +194,11 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
             self._geoMatrix_is_dirty = False
 
         if self._weights_is_dirty:
-            print("[Deform]: update weights")
-            with DeepProfiler():
-                self.weights_manager.update_data(dataBlock)
-                # profile.step("[updateManager]")
-                _, _, _, self._skinWeights = self.weights_manager.weights.get_weights()
+            # with DeepProfiler():
+            self.weights_manager.update_data(dataBlock)
+            _, _, _, self._skinWeights = self.weights_manager.weights.get_weights()
 
-                self._weights_is_dirty = True
+            self._weights_is_dirty = False
 
         if self._skinWeights is None:
             return

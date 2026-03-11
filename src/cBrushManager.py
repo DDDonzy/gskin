@@ -1,5 +1,6 @@
+from __future__ import annotations
+
 import typing
-import ctypes
 from dataclasses import dataclass
 
 # 统一使用相对路径和模块导入
@@ -18,12 +19,14 @@ if typing.TYPE_CHECKING:
 class BrushSettings:
     """存放笔刷半径、强度、模式等用户 UI 配置。"""
 
-    radius: float = 0.5
-    strength: float = 0.1
-    iter: int = 10
-    falloff_type: int = 1  # 0:Linear, 1:Airbrush, 2:Solid, 3:Dome, 4:Spike
-    mode: int = 1  # 0:Add, 1:Sub, 2:Replace, 3:Multiply, 4:Smooth, 5:Sharp
-    use_surface: bool = True
+    # fmt:off
+    radius      : float = 0.5
+    strength    : float = 0.1
+    iter        : int   = 10
+    falloff_type: int   = 1     # 0:Linear, 1:Airbrush, 2:Solid, 3:Dome, 4:Spike
+    mode        : int   = 1     # 0:Add, 1:Sub, 2:Replace, 3:Multiply, 4:Smooth, 5:Sharp
+    use_surface : bool  = True
+    # fmt:on
 
 
 # ==============================================================================
@@ -35,7 +38,7 @@ class WeightBrushManager:
     管理完整的 Stroke (绘制行程) 生命周期，并接管 Undo/Redo 内存池。
     """
 
-    def __init__(self, preview_shape: "cDisplayNode.WeightPreviewShape"):
+    def __init__(self, preview_shape: cDisplayNode.WeightPreviewShape):
         self.shape = preview_shape
         self.cSkin = preview_shape.cSkin
         self.settings = BrushSettings()
@@ -175,48 +178,42 @@ class WeightBrushManager:
         [阶段 1: 鼠标按下]
         解析 UI 目标 (Layer/Mask/Influence)，提取对应内存并装配 Processor。
         """
-        cSkin = self.cSkin
+        shape = self.shape
         render_ctx = self.shape.render_context
 
-        if not cSkin or render_ctx.paintLayerIndex not in cSkin.weightsLayer:
-            self.active_processor = None
+        handle, _ = shape.active_paint_weights
+        if handle is None or not handle.is_valid:
             return
 
-        layer = cSkin.weightsLayer[render_ctx.paintLayerIndex]
-        influences_count = cSkin.influences_count
+        self.active_handle = handle
 
-        # 1. 动态确定绘制目标视图并强转 2D
+        vtx_count, influences_count, _, weights_1d = handle.get_weights()
+        if vtx_count <= 0:
+            return
         if render_ctx.paintMask:
-            if not layer.maskHandle:
-                return
-            weights2d_mgr = layer.maskHandle.memory.reshape((cSkin.vertex_count, 1))
-            locks_mgr = cMemoryView.CMemoryManager.allocate("B", (1,)).view  # Mask 无锁
-
             self.active_target_idx = 0
-            self.active_handle = layer.maskHandle
+            weights_2d = weights_1d.cast("B").cast("f", (vtx_count, 1))
+            # 必须挂载到 self 上，防止被 Python 的垃圾回收器(GC)吃掉导致闪退
+            self._temp_locks_mgr = cMemoryView.CMemoryManager.allocate("B", (1,))
         else:
-            if not layer.weightsHandle:
-                return
-            weights2d_mgr = layer.weightsHandle.memory.reshape((cSkin.vertex_count, influences_count))
-
-            # locks_view = cSkin.influences_locks_mgr.view
-            locks_mgr = cMemoryView.CMemoryManager.allocate("B", (influences_count,))
-
             self.active_target_idx = render_ctx.paintInfluenceIndex
-            self.active_handle = layer.weightsHandle
+            weights_2d = weights_1d.cast("B").cast("f", (vtx_count, influences_count))
+            # 挂载到 self
+            self._temp_locks_mgr = cMemoryView.CMemoryManager.allocate("B", (influences_count,))
 
-        # 2. 装载激活当前的 Processor
+
         self.active_processor = cBrushCoreCython.SkinWeightProcessor(
             self.engine,
-            weights2d_mgr.view,
+            weights_2d,
             self.modified_indices_mgr.view,
             self.modified_vtx_bool_mgr.view,
-            locks_mgr.view,
+            self._temp_locks_mgr.view,
             self.undo_buffer_mgr.view,
         )
 
         # 通知 Processor 清空掩码，开始记录历史
         self.active_processor.begin_stroke()
+
 
     def update_stroke(self) -> bool:
         """
@@ -226,7 +223,7 @@ class WeightBrushManager:
             return False
 
         # 底层内存极限狂飙
-        self.active_processor.apply_weight(self.settings.strength, self.settings.mode, self.active_target_idx,self.settings.iter)
+        self.active_processor.apply_weight(self.settings.strength, self.settings.mode, self.active_target_idx, self.settings.iter)
         return True
 
     def end_stroke(self):
@@ -240,42 +237,38 @@ class WeightBrushManager:
         # 1. 结束行程，获取撤销恢复包
         # undo_redo_pack = (count, indices_view, undo_view, redo_view)
         undo_redo_pack = self.active_processor.end_stroke()
-        print(undo_redo_pack)
+        # print(undo_redo_pack)
 
         # if undo_redo_pack:
         #     count, indices_view, undo_view, redo_view = undo_redo_pack
         #     channels = 1 if self.shape.render_context.paintMask else self.cSkin.influences_count
         #     vtx_count = self.cSkin.vertex_count
-            
+
         #     # 脱水打包
         #     indices_pack = tuple(indices_view[:count])
         #     undo_pack = tuple(tuple(undo_view[i, j] for j in range(channels)) for i in range(count))
         #     redo_pack = tuple(tuple(redo_view[i, j] for j in range(channels)) for i in range(count))
-            
+
         #     # ==========================================
         #     # 🚀 见证奇迹的时刻：用 partial 绑定参数！
         #     # ==========================================
         #     from functools import partial
-        #     undo_partial = partial(self.execute_sparse_update, 
+        #     undo_partial = partial(self.execute_sparse_update,
         #                            self.active_handle, vtx_count, channels, indices_pack, undo_pack)
-                                   
-        #     redo_partial = partial(self.execute_sparse_update, 
+
+        #     redo_partial = partial(self.execute_sparse_update,
         #                            self.active_handle, vtx_count, channels, indices_pack, redo_pack)
-            
+
         #     # 塞进万能壳
         #     from .cBrushCommand import CallbackCmd
         #     import maya.cmds as cmds
-            
+
         #     CallbackCmd._staging_data = {
         #         'undo': undo_partial,
         #         'redo': redo_partial
         #     }
-            
+
         #     cmds.cCallbackCmd()  # 搞定！入栈！
-
-
-
-
 
         # 清除挂载状态
         self.active_processor = None
@@ -293,4 +286,3 @@ class WeightBrushManager:
                 target_view[vtx_idx, c] = v_weights[c]
 
         self.cSkin.setDirty()
-

@@ -24,10 +24,10 @@ class CMemoryManager:
     def __init__(self):
         """初始化一个空的内存管理器实例。"""
         self._cache = None
-        self.view = None
-        self.ptr = 0
-        self.format_char = ""
-        self.shape = ()
+        self.view: memoryview = None
+        self.ptr: int = 0
+        self.format_char: str = ""
+        self.shape: tuple = ()
 
     @staticmethod
     def allocate(format_char: str, shape: tuple):

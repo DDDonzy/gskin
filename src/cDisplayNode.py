@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+
 import ctypes
 
 import maya.api.OpenMaya as om
@@ -16,6 +19,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .cSkinDeform import CythonSkinDeformer
+    from .cWeightsManager import WeightsHandle
 
 
 NODE_NAME = "WeightPreviewShape"
@@ -95,6 +99,7 @@ class WeightGeometryOverride(omr.MPxGeometryOverride):
         self._render_ctx = shape._update_render_context()
 
     def populateGeometry(self, requirements, renderItems, data):
+
         render_mesh = self._class_shape.mesh_context
         vtx_count = render_mesh.vertex_count
         vtx_pos = render_mesh.vertex_positions
@@ -116,7 +121,7 @@ class WeightGeometryOverride(omr.MPxGeometryOverride):
                 color_addr = color_buf.acquire(vtx_count * 3, True)
                 if color_addr:
                     color_view = CMemoryManager.from_ptr(color_addr, "f", (vtx_count * 3, 4)).view
-                    weights = self._class_shape.active_paint_weights
+                    handle, weights = self._class_shape.active_paint_weights
 
                     if weights is not None:
                         if self._render_ctx.paintMask:
@@ -297,7 +302,7 @@ class WeightPreviewShape(om.MPxSurfaceShape):
         super().postConstructor()
 
     @property
-    def cSkin(self) -> "CythonSkinDeformer":
+    def cSkin(self) -> CythonSkinDeformer:
         """获取绑定的 cSkin 实例"""
         if self._last_cSkin is None:
             if not self._deformMesh_plug.isConnected:
@@ -310,36 +315,46 @@ class WeightPreviewShape(om.MPxSurfaceShape):
         return self._last_cSkin
 
     @property
-    def active_paint_weights(self) -> tuple["CMemoryManager", int, bool] | tuple[None, None, None]:
+    def active_paint_weights(self) -> tuple[WeightsHandle, memoryview]:
         """
-        直接提取当前需要渲染的 1D 权重视图 (Mask 或指定骨骼权重)。
+        直接提取当前需要渲染的 1D 权重视图 (Mask 或指定骨骼权重)，并附带目标 Handle。
+        Returns:
+            tuple[WeightsHandle | None, memoryview | None]: 返回 (目标句柄, 切片后的视图)
         """
+
         cSkin = self.cSkin
         ctx = self.render_context
 
-        # 1. 前置拦截：无数据或层级未激活
-        if not cSkin or ctx.paintLayerIndex not in cSkin.weightsLayer:
-            return None
+        if not cSkin or cSkin.weights_manager is None:
+            return None, None
 
-        layer = cSkin.weightsLayer[ctx.paintLayerIndex]
+        handle = None
+        is_mask = False
 
-        # 2. 遮罩模式 (Mask)
-        if ctx.paintMask:
-            handle = layer.maskHandle
-            if handle and handle.is_valid:
-                # Mask 本身就是单通道 1D 数据
-                return handle.memory.view.cast("B").cast("f")
-            return None
+        if ctx.paintLayerIndex == -1:
+            handle = cSkin.weights_manager.weights
+        else:
+            layerItem = cSkin.weights_manager.get_layer(ctx.paintLayerIndex)
+            if layerItem is None:
+                return None, None
+            if ctx.paintMask:
+                handle = layerItem.mask
+                is_mask = True
+            else:
+                handle = layerItem.weights
 
-        # 3. 权重模式 (Weights)
-        handle = layer.weightsHandle
-        if handle and handle.is_valid:
-            cols = cSkin.influences_count
-            safe_idx = max(0, min(ctx.paintInfluenceIndex, cols - 1))
-            # 直接利用 Python 内存视图的步长切片提取 1D 数据！
-            return handle.memory.view.cast("B").cast("f")[safe_idx::cols]
+        if handle is None or not handle.is_valid:
+            return None, None
 
-        return None
+        if is_mask:
+            _, _, _, weights = handle.get_weights()
+            return handle, weights
+        else:
+            _, inf_count, _, weights = handle.get_weights()
+            if inf_count <= 0:
+                return handle, None
+            safe_idx = max(0, min(ctx.paintInfluenceIndex, inf_count - 1))
+            return handle, weights[safe_idx::inf_count]
 
     def update_mesh(self):
         """
@@ -499,10 +514,10 @@ class WeightPreviewShape(om.MPxSurfaceShape):
             return attr
 
         # fmt:off
-        WeightPreviewShape.aColorWire          = add_color("colorWire"        , "cwir", (0.0, 1.0, 1.0)) 
-        WeightPreviewShape.aColorPoint         = add_color("colorPoint"       , "cpnt", (1.0, 0.0, 0.0))
-        WeightPreviewShape.aColorMaskRemapA    = add_color("colorMaskRemapA"  , "cmra", (0.1, 0.1, 0.1))
-        WeightPreviewShape.aColorMaskRemapB    = add_color("colorMaskRemapB"  , "cmrb", (0.1, 1.0, 0.1))
+        WeightPreviewShape.aColorWire          = add_color("colorWire"         , "cwir", (0.0, 1.0, 1.0)) 
+        WeightPreviewShape.aColorPoint         = add_color("colorPoint"        , "cpnt", (1.0, 0.0, 0.0))
+        WeightPreviewShape.aColorMaskRemapA    = add_color("colorMaskRemapA"   , "cmra", (0.1, 0.1, 0.1))
+        WeightPreviewShape.aColorMaskRemapB    = add_color("colorMaskRemapB"   , "cmrb", (0.1, 1.0, 0.1))
         WeightPreviewShape.aColorWeightsRemapA = add_color("colorWeightsRemapA", "cwra", (0.0, 0.0, 0.0))
         WeightPreviewShape.aColorWeightsRemapB = add_color("colorWeightsRemapB", "cwrb", (1.0, 1.0, 1.0))
         WeightPreviewShape.aColorBrushRemapA   = add_color("colorBrushRemapA"  , "cbra", (1.0, 0.0, 0.0))
