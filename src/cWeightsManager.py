@@ -9,6 +9,7 @@ import maya.OpenMaya as om1  # type:ignore
 from . import cWeightsCoreCython
 from .cMemoryView import CMemoryManager
 from ._cRegistry import SkinRegistry
+from . import apiundo
 
 
 if typing.TYPE_CHECKING:
@@ -30,10 +31,8 @@ class WeightsHandle:
 
     memory       : CMemoryManager  = None
     """权重数据的底层`CMemoryManager`对象"""
-
     max_capacity : int             = -1
     """当前寄生 `MFnMesh` 的最大储存数据的长度(也可以理解为预分配数组大小)"""
-
     length       : int             = -1
     """
     - 当前有效数据长度，对应 `self.memory:CMemoryManager` 的长度
@@ -41,15 +40,21 @@ class WeightsHandle:
     """
     # fmt:on
 
-    def __init__(self, source: om1.MDataHandle | om1.MPlug):
+    def __init__(self, source: om1.MDataHandle | om1.MPlug, cSkin: CythonSkinDeformer, layerIndex: int, isMask: bool):
         if isinstance(source, om1.MPlug):
             self.mPlug = source
+            # 提取短命的 MDataHandle
+            # 警告：这里会触发节点求值！
             self.mDataHandle = self.mPlug.asMDataHandle()
         elif isinstance(source, om1.MDataHandle):
             self.mPlug = None
             self.mDataHandle = source
         else:
             raise TypeError("Input not OpenMaya.MDataHandle or OpenMaya.MPlug")
+
+        self.cSkin = cSkin
+        self.layer_idx = layerIndex
+        self.isMask = isMask
 
         self._setup_mesh_buffer(self.mDataHandle)
 
@@ -185,42 +190,6 @@ class WeightsHandle:
             if self.mPlug is not None:
                 self.mPlug.setMDataHandle(self.mDataHandle)
 
-    def set_weights(
-        self,
-        vtx_count: int,
-        inf_count: int,
-        influence_indices: tuple,
-        weights_view1D,
-    ):
-        """[全量写入] 传入顶点总数、骨骼映射表、完整的一维权重数组"""
-        influence_count = len(influence_indices)
-        header_size = 2 + influence_count
-        total_size = header_size + (vtx_count * influence_count)
-        # 重构数组大小(resize 会自行判断是否需要重构)
-        resized = self.resize(total_size)
-
-        _float_view = self.memory.view
-        _int_view = _float_view.cast("B").cast("i")
-
-        _int_view[0] = vtx_count
-        _int_view[1] = influence_count
-
-        indices_mgr = CMemoryManager.from_list(list(influence_indices), "i")
-        _int_view[2 : 2 + influence_count] = indices_mgr.view
-
-        if isinstance(weights_view1D, memoryview):
-            src_view = weights_view1D.cast("B").cast("f")
-        else:
-            temp_mgr = CMemoryManager.from_list(list(weights_view1D), "f")
-            src_view = temp_mgr.view
-
-        _float_view[header_size:total_size] = src_view
-
-        if resized:
-            print("commit")
-            self.commit()
-
-
     def get_weights(self):
         """极速解析底层连续内存，分离 Header (元数据) 与 Payload (纯权重)。
 
@@ -255,7 +224,42 @@ class WeightsHandle:
 
         return vtx_count, influence_count, influence_indices, weights_view
 
-    def set_sparse_weights(self, vtx_indices, bone_local_indices, sparse_weights_1d):
+    def _set_weights(
+        self,
+        vtx_count: int,
+        inf_count: int,
+        influence_indices: tuple,
+        weights_view1D,
+    ):
+        """[全量写入] 传入顶点总数、骨骼映射表、完整的一维权重数组"""
+        influence_count = len(influence_indices)
+        header_size = 2 + influence_count
+        total_size = header_size + (vtx_count * influence_count)
+        # 重构数组大小(resize 会自行判断是否需要重构)
+        resized = self.resize(total_size)
+
+        _float_view = self.memory.view
+        _int_view = _float_view.cast("B").cast("i")
+
+        _int_view[0] = vtx_count
+        _int_view[1] = influence_count
+
+        indices_mgr = CMemoryManager.from_list(list(influence_indices), "i")
+        _int_view[2 : 2 + influence_count] = indices_mgr.view
+
+        if isinstance(weights_view1D, memoryview):
+            src_view = weights_view1D.cast("B").cast("f")
+        else:
+            temp_mgr = CMemoryManager.from_list(list(weights_view1D), "f")
+            src_view = temp_mgr.view
+
+        _float_view[header_size:total_size] = src_view
+
+        if resized:
+            self.commit()
+        return True
+
+    def _set_sparse_weights(self, vtx_indices, bone_local_indices, sparse_weights_1d):
         """[稀疏写入] 传入被修改的顶点ID列表、局部骨骼列索引列表、稀疏权重数组 (专供画刷 Undo/Redo)"""
         if not self.is_valid:
             return
@@ -282,51 +286,42 @@ class WeightsHandle:
         return True
 
 
-@dataclass
 class WeightsLayerItem:
-    logical_idx: int = -1
-
-    weights: WeightsHandle = None
-    mask: WeightsHandle = None
-    enabled: bool = None
-
-    mHandle_weights: om1.MDataHandle = field(default=None, repr=False)
-    mHandle_mask: om1.MDataHandle = field(default=None, repr=False)
-    mHandle_enabled: om1.MDataHandle = field(default=None, repr=False)
-
-    cSkin: CythonSkinDeformer = field(default=None, repr=False)
-
-    def __init__(self, cSkin: CythonSkinDeformer, mDataHandle: om1.MDataHandle, logical_idx=-1) -> None:
+    def __init__(self, cSkin: CythonSkinDeformer, mDataHandle: om1.MDataHandle, logical_idx: int = -1):
         self.cSkin = cSkin
         self.logical_idx = logical_idx
-        self.mHandle_mask = mDataHandle.child(cSkin.aLayerMask)
-        self.mHandle_weights = mDataHandle.child(cSkin.aLayerWeights)
-        self.mHandle_enabled = mDataHandle.child(cSkin.aLayerEnabled)
 
-        self.weights = WeightsHandle.from_data_handle(self.mHandle_weights)
-        self.mask = WeightsHandle.from_data_handle(self.mHandle_mask)
-        self.enabled = self.mHandle_enabled.asBool()
+        _handle_weights = mDataHandle.child(cSkin.aLayerWeights)
+        _handle_mask = mDataHandle.child(cSkin.aLayerMask)
+        _handle_enabled = mDataHandle.child(cSkin.aLayerEnabled)
 
+        self.enabled = _handle_enabled.asBool()
+        self.weights = WeightsHandle(_handle_weights, cSkin, logical_idx, isMask=False)
+        self.mask = WeightsHandle(_handle_mask, cSkin, logical_idx, isMask=True)
+
+    # ==========================================
+    # 安全的属性获取：直接找 cSkin 要 MObject，完全不碰短命的 MDataHandle
+    # ==========================================
     @property
     def mPlug_weights(self):
-        mPlug = om1.MPlug(self.cSkin.mObject, self.mHandle_weights.attribute())
+        # 直接使用 self.cSkin.aLayerWeights 这个永恒不变的属性指针
+        mPlug = om1.MPlug(self.cSkin.mObject, self.cSkin.aLayerWeights)
         mPlug.selectAncestorLogicalIndex(self.logical_idx, self.cSkin.aLayerCompound)
         return mPlug
 
     @property
     def mPlug_mask(self):
-        mPlug = om1.MPlug(self.cSkin.mObject, self.mHandle_mask.attribute())
+        mPlug = om1.MPlug(self.cSkin.mObject, self.cSkin.aLayerMask)
         mPlug.selectAncestorLogicalIndex(self.logical_idx, self.cSkin.aLayerCompound)
         return mPlug
 
     @property
     def mPlug_enabled(self):
-        mPlug = om1.MPlug(self.cSkin.mObject, self.mHandle_enabled.attribute())
+        mPlug = om1.MPlug(self.cSkin.mObject, self.cSkin.aLayerEnabled)
         mPlug.selectAncestorLogicalIndex(self.logical_idx, self.cSkin.aLayerCompound)
         return mPlug
 
 
-@dataclass
 class WeightsManager:
     weights: WeightsHandle = None
     layers: list[WeightsLayerItem] = None
@@ -355,7 +350,7 @@ class WeightsManager:
         # weights
         weights_dataHandle = dataBlock.inputValue(self.cSkin.aWeights)
         self.handle = weights_dataHandle
-        self.weights = WeightsHandle(weights_dataHandle)
+        self.weights = WeightsHandle(weights_dataHandle, self.cSkin, -1, False)
 
         # layer
         self.layers.clear()
@@ -388,6 +383,23 @@ class WeightsManager:
                 return list(self.layers.values())[index]
             except IndexError:
                 return None
+
+    def get_handle(self, layer_logical_idx, isMask: bool = False):
+        """
+        严格根据逻辑索引寻找对应的 Handle
+        """
+        # 基础权重
+        if layer_logical_idx == -1:
+            return self.weights
+        # layer 权重
+        if layer_logical_idx in self.layers:
+            layer_item = self.layers[layer_logical_idx]
+            if isMask:
+                return layer_item.mask
+            else:
+                return layer_item.weights
+
+        return None
 
     def bake_to_final_weights(self, vtx_indices: typing.Sequence[int] = None) -> None:
         """
@@ -478,11 +490,6 @@ class WeightsManager:
                 vtx_indices_view,
             )
 
-        # ==========================================
-        # 5. 💥 致命一击：提交写入
-        # ==========================================
-        # 这是之前漏掉的最关键一步！Cython 在后台算完并写满物理内存后，
-        # 必须通知 Maya，让这个合法的 MObject 挂载到节点管道上。
         self.weights.commit()
 
     def update(self):

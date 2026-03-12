@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 import typing
 from dataclasses import dataclass
 
@@ -24,7 +25,7 @@ class BrushSettings:
     strength    : float = 0.1
     iter        : int   = 10
     falloff_type: int   = 1     # 0:Linear, 1:Airbrush, 2:Solid, 3:Dome, 4:Spike
-    mode        : int   = 1     # 0:Add, 1:Sub, 2:Replace, 3:Multiply, 4:Smooth, 5:Sharp
+    mode        : int   = 5     # 0:Add, 1:Sub, 2:Replace, 3:Multiply, 4:Smooth, 5:Sharp
     use_surface : bool  = True
     # fmt:on
 
@@ -43,24 +44,24 @@ class WeightBrushManager:
         self.cSkin = preview_shape.cSkin
         self.settings = BrushSettings()
 
-        # 1. 提取基础上下文
+        # 提取基础上下文
         self.mesh_ctx = preview_shape.mesh_context
         self.brush_ctx = preview_shape.brush_context
         vtx_count = self.mesh_ctx.vertex_count
         tri_count = len(self.mesh_ctx.triangle_indices.view) // 3
 
-        # 2. 🟢 极限重构：调用 Cython 构建纯 C 级别的 CSR 邻接表
+        # 调用 Cython 构建纯 C 级别的 CSR 邻接表
         self.mesh_ctx = self._build_csr_topology(self.mesh_ctx)
 
-        # 3. 预分配：命中结果缓冲区
+        # 预分配缓冲区
         self.brush_ctx.hit_indices = cMemoryView.CMemoryManager.allocate("i", (vtx_count,))
         self.brush_ctx.hit_weights = cMemoryView.CMemoryManager.allocate("f", (vtx_count,))
         self.brush_ctx.hit_count = 0
 
-        # 4. 预分配：引擎广度优先搜索 (BFS) 所需的世代掩码
+        # 预分配世代掩码
         self.vertices_epochs = cMemoryView.CMemoryManager.allocate("i", (vtx_count,))
 
-        # 5. 🚀 装载底盘：实例化 CoreBrushEngine
+        # 实例化 CoreBrushEngine
         self.engine = cBrushCoreCython.CoreBrushEngine(
             self.mesh_ctx.vertex_positions.reshape((vtx_count, 3)).view,
             self.mesh_ctx.triangle_indices.reshape((tri_count, 3)).view,
@@ -71,7 +72,7 @@ class WeightBrushManager:
             self.brush_ctx.hit_weights.view,
         )
 
-        # 6. 预分配：Undo/Redo 撤销系统内存池
+        # 预分配Undo/Redo 撤销系统内存池
         inf_count = self.cSkin.influences_count if self.cSkin else 1
         self.modified_vtx_bool_mgr = cMemoryView.CMemoryManager.allocate("B", (vtx_count,))
         self.modified_indices_mgr = cMemoryView.CMemoryManager.allocate("i", (vtx_count,))
@@ -80,13 +81,10 @@ class WeightBrushManager:
         # Stroke
         self.active_processor: cBrushCoreCython.SkinWeightProcessor = None
         self.active_handle = None
-        self.active_target_idx = 0
-
-
+        self.active_influence_idx = 0
 
     def _build_csr_topology(self, mesh_ctx: MeshTopologyContext) -> MeshTopologyContext:
         """
-        [隐式修改，显式返回]
         利用渲染节点的去重边索引，调用 Cython 算法极速构建 CSR 邻接表。
         """
         vtx_count = mesh_ctx.vertex_count
@@ -115,9 +113,6 @@ class WeightBrushManager:
         self.active_processor = None
         self.active_handle = None
 
-
-
-
     def process_stroke(self, ray_source: tuple, ray_dir: tuple, action: str) -> tuple:
         """
         封装射线投射、范围检测和笔刷涂抹的完整过程。
@@ -131,7 +126,7 @@ class WeightBrushManager:
         """
         if not self.engine:
             return None
-        
+
         # ----------------------------------------------------------------------------------
         # deform 输出的 点位置信息不一定是同一个内存地址的，在并行模式下，可能多个内存地址切换
         # 所以每次tick的时候，要更新笔刷底层的点位置信息，直接传入内存地址即可。
@@ -149,7 +144,7 @@ class WeightBrushManager:
 
         # 命中处理
         if self.mesh_ctx and self.mesh_ctx.vertex_positions:
-            hit_count, _, _ = self.engine.calc_brush_weights(
+            hit_count, _, _ = self.engine.calc_brush_falloff(
                 hit_pos,
                 hit_tri,
                 self.settings.radius,
@@ -173,7 +168,7 @@ class WeightBrushManager:
     # ==============================================================================
     def begin_stroke(self):
         """
-        [阶段 1: 鼠标按下]
+        鼠标按下
         解析 UI 目标 (Layer/Mask/Influence)，提取对应内存并装配 Processor。
         """
         shape = self.shape
@@ -189,16 +184,15 @@ class WeightBrushManager:
         if vtx_count <= 0:
             return
         if render_ctx.paintMask:
-            self.active_target_idx = 0
+            self.active_influence_idx = 0
             weights_2d = weights_1d.cast("B").cast("f", (vtx_count, 1))
             # 必须挂载到 self 上，防止被 Python 的垃圾回收器(GC)吃掉导致闪退
             self._temp_locks_mgr = cMemoryView.CMemoryManager.allocate("B", (1,))
         else:
-            self.active_target_idx = render_ctx.paintInfluenceIndex
+            self.active_influence_idx = render_ctx.paintInfluenceIndex
             weights_2d = weights_1d.cast("B").cast("f", (vtx_count, influences_count))
             # 挂载到 self
             self._temp_locks_mgr = cMemoryView.CMemoryManager.allocate("B", (influences_count,))
-
 
         self.active_processor = cBrushCoreCython.SkinWeightProcessor(
             self.engine,
@@ -212,16 +206,20 @@ class WeightBrushManager:
         # 通知 Processor 清空掩码，开始记录历史
         self.active_processor.begin_stroke()
 
-
     def update_stroke(self) -> bool:
         """
-        鼠标拖拽，计算内存权重
+        按下鼠标持续拖拽Tick，计算内存权重
         """
         if not self.active_processor or self.brush_ctx.hit_count == 0:
             return False
 
-        # 底层内存极限狂飙
-        self.active_processor.apply_weight(self.settings.strength, self.settings.mode, self.active_target_idx, self.settings.iter)
+        # 执行cython绘制
+        self.active_processor.apply_weight_single(
+            brush_mode=self.settings.mode,
+            value=self.settings.strength,
+            channel_index=self.active_influence_idx,
+            iterations=self.settings.iter,
+        )
         return True
 
     def end_stroke(self):
@@ -232,55 +230,50 @@ class WeightBrushManager:
         if not self.active_processor or not self.active_handle:
             return
 
-        # 1. 结束行程，获取撤销恢复包
-        # undo_redo_pack = (count, indices_view, undo_view, redo_view)
+        # 返回值: (mod_vertex_indices, mod_channel_indices, old_sparse_ary, new_sparse_ary)
         undo_redo_pack = self.active_processor.end_stroke()
-        # print(undo_redo_pack)
 
-        # if undo_redo_pack:
-        #     count, indices_view, undo_view, redo_view = undo_redo_pack
-        #     channels = 1 if self.shape.render_context.paintMask else self.cSkin.influences_count
-        #     vtx_count = self.cSkin.vertex_count
+        if undo_redo_pack:
+            mod_vtx_idx, mod_ch_idx, old_sparse, new_sparse = undo_redo_pack
 
-        #     # 脱水打包
-        #     indices_pack = tuple(indices_view[:count])
-        #     undo_pack = tuple(tuple(undo_view[i, j] for j in range(channels)) for i in range(count))
-        #     redo_pack = tuple(tuple(redo_view[i, j] for j in range(channels)) for i in range(count))
+            channels = 1 if self.shape.render_context.paintMask else self.cSkin.influences_count
+            vtx_count = self.cSkin.vertex_count
 
-        #     # ==========================================
-        #     # 🚀 见证奇迹的时刻：用 partial 绑定参数！
-        #     # ==========================================
-        #     from functools import partial
-        #     undo_partial = partial(self.execute_sparse_update,
-        #                            self.active_handle, vtx_count, channels, indices_pack, undo_pack)
+            # ==========================================
+            # 🚀 见证奇迹的时刻：不需要任何 Python 循环转换，直接绑定 1D 数据！
+            # ==========================================
+            from functools import partial
 
-        #     redo_partial = partial(self.execute_sparse_update,
-        #                            self.active_handle, vtx_count, channels, indices_pack, redo_pack)
+            undo_partial = partial(self.execute_sparse_update, self.active_handle, vtx_count, channels, mod_vtx_idx, mod_ch_idx, old_sparse)
 
-        #     # 塞进万能壳
-        #     from .cBrushCommand import CallbackCmd
-        #     import maya.cmds as cmds
+            redo_partial = partial(self.execute_sparse_update, self.active_handle, vtx_count, channels, mod_vtx_idx, mod_ch_idx, new_sparse)
 
-        #     CallbackCmd._staging_data = {
-        #         'undo': undo_partial,
-        #         'redo': redo_partial
-        #     }
+            # 塞进万能壳 (取消注释以激活)
+            from .cBrushCommand import CallbackCmd
+            import maya.cmds as cmds
 
-        #     cmds.cCallbackCmd()  # 搞定！入栈！
+            CallbackCmd._staging_data = {
+                'undo': undo_partial,
+                'redo': redo_partial
+            }
+            cmds.cCallbackCmd()  # 搞定！入栈！
 
         # 清除挂载状态
         self.active_processor = None
         self.active_handle = None
 
-    def execute_sparse_update(self, handle, vtx_count, channels, indices, weights_data):
-        """还原权重的干活函数"""
+    def execute_sparse_update(self, handle, vtx_count, channels, mod_vtx_idx, mod_ch_idx, sparse_data):
+        """还原权重的干活函数 (💥 适配全新的双向 1D 稀疏极速展开)"""
         if not handle or not handle.is_valid:
             return
 
         target_view = handle.memory.reshape((vtx_count, channels)).view
-        for i, vtx_idx in enumerate(indices):
-            v_weights = weights_data[i]
-            for c in range(channels):
-                target_view[vtx_idx, c] = v_weights[c]
+
+        # 用极其干净的 O(N) 循环将 1D 数组写回 2D 内存
+        write_idx = 0
+        for vtx in mod_vtx_idx:
+            for ch in mod_ch_idx:
+                target_view[vtx, ch] = sparse_data[write_idx]
+                write_idx += 1
 
         self.cSkin.setDirty()

@@ -31,7 +31,7 @@ maya_weights, _ = get_skinWeights(sk_node)
 vertex_count = cmds.polyEvaluate(shape, vertex=True)
 influence_indices = cmds.getAttr(f"{sk_node}.matrix", mi=1)
 manager = wm.WeightsManager.get_manager_from_cSkin(f"{'cSkinDeformer1'}")
-manager.weights.set_weights(vertex_count,2, influence_indices, maya_weights)
+manager.weights._set_weights(vertex_count,2, influence_indices, maya_weights)
 
 
 
