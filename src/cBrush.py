@@ -101,6 +101,7 @@ class WeightBrushContext(omui.MPxContext):
 
     def toolOffCleanup(self):
         """工具退出：通知管理器清理内存"""
+        print("off")
         if self.manager:
             self.manager.teardown()
         self.__init__()
@@ -110,18 +111,18 @@ class WeightBrushContext(omui.MPxContext):
     # ==============================================================================
     def doPtrMoved(self, event, drawMgr, context):
         """悬停阶段：仅范围检测与高亮"""
-        self._process_mouse_event(event, stroke_action="hover")
+        self._process_mouse_event(event, drawMgr, stroke_action="hover")
 
     def doPress(self, event, drawMgr, context):
         """按下阶段：锁定内存，开始第一笔运算"""
         self._isPressed = True
         if self.manager:
             self.manager.begin_stroke()
-        self._process_mouse_event(event, stroke_action="press")
+        self._process_mouse_event(event, drawMgr, stroke_action="press")
 
     def doDrag(self, event, drawMgr, context):
         """拖拽阶段：疯狂涂抹"""
-        self._process_mouse_event(event, stroke_action="drag")
+        self._process_mouse_event(event, drawMgr, stroke_action="drag")
 
     def doRelease(self, event, drawMgr, context):
         """松开阶段：结束行程，打包 Undo 并提交 Maya DG"""
@@ -131,12 +132,11 @@ class WeightBrushContext(omui.MPxContext):
             self.manager.clear_hit_state()
 
         self._cursor_pos = None
-        self._refresh_viewport()
 
     # ==============================================================================
     # 🧠 核心事件分发处理器 (极致纯粹版)
     # ==============================================================================
-    def _process_mouse_event(self, event, stroke_action: str):
+    def _process_mouse_event(self, event, drawMgr, stroke_action: str):
         """将射线计算交给 Manager 的流水线，完全与核心逻辑解耦。"""
         if not self.manager:
             return
@@ -155,6 +155,7 @@ class WeightBrushContext(omui.MPxContext):
         # 3. 接收结果，准备 UI 光标数据
         if result is None:
             self._cursor_pos = None
+
         else:
             hit_pos_obj, hit_normal_obj = result
             # 将局部命中点转回世界空间，供 doDraw 绘制圈圈使用
@@ -163,8 +164,8 @@ class WeightBrushContext(omui.MPxContext):
             self._cursor_normal = om.MVector(hit_normal_obj) * inv_transpose_matrix
 
         # 4. 通知视口重绘
-
         self._refresh_viewport()
+        self._draw_brush_cursor(drawMgr)
 
     def _refresh_viewport(self):
         """触发 Shape 和 3D 视口刷新"""
@@ -176,7 +177,7 @@ class WeightBrushContext(omui.MPxContext):
     # ==============================================================================
     # 🎨 VP2 光标绘制 (画出跟随模型的笔刷圆圈)
     # ==============================================================================
-    def doDraw(self, event, drawMgr, context):
+    def _draw_brush_cursor(self, drawMgr):
         if not self.manager or not self._cursor_pos or not self._cursor_normal:
             return
 

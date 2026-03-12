@@ -82,16 +82,7 @@ class WeightBrushManager:
         self.active_handle = None
         self.active_target_idx = 0
 
-    def refresh_mesh_positions(self):
-        """同步最新的网格顶点数据到引擎"""
-        # 假设这里你从 preview_shape 获取了最新的顶点上下文
-        vtx_count = self.mesh_ctx.vertex_count
 
-        # 重新 reshape 获取 2D 视图
-        new_view = self.mesh_ctx.vertex_positions.reshape((vtx_count, 3)).view
-
-        # 💥 告诉 Cython 引擎：指针换了，盯紧这块新内存！
-        self.engine.update_vertex_positions(new_view)
 
     def _build_csr_topology(self, mesh_ctx: MeshTopologyContext) -> MeshTopologyContext:
         """
@@ -124,6 +115,9 @@ class WeightBrushManager:
         self.active_processor = None
         self.active_handle = None
 
+
+
+
     def process_stroke(self, ray_source: tuple, ray_dir: tuple, action: str) -> tuple:
         """
         封装射线投射、范围检测和笔刷涂抹的完整过程。
@@ -137,19 +131,23 @@ class WeightBrushManager:
         """
         if not self.engine:
             return None
-
-        self.refresh_mesh_positions()
-
-        # 1. 底层射线检测
+        
+        # ----------------------------------------------------------------------------------
+        # deform 输出的 点位置信息不一定是同一个内存地址的，在并行模式下，可能多个内存地址切换
+        # 所以每次tick的时候，要更新笔刷底层的点位置信息，直接传入内存地址即可。
+        vtx_count = self.mesh_ctx.vertex_count
+        new_view = self.mesh_ctx.vertex_positions.reshape((vtx_count, 3)).view
+        self.engine.update_vertex_positions(new_view)
+        # ----------------------------------------------------------------------------------
+        # ray cast
         hit_success, hit_pos, hit_normal, hit_tri, _, _, _ = self.engine.raycast(ray_source, ray_dir)
-
-        # 2. 未命中处理
+        # 未命中处理
         if not hit_success:
-            if action == "hover":
-                self.clear_hit_state()
+            # if action == "hover":
+            self.clear_hit_state()
             return None
 
-        # 3. 命中处理, 进行空间球体或拓扑扫描
+        # 命中处理
         if self.mesh_ctx and self.mesh_ctx.vertex_positions:
             hit_count, _, _ = self.engine.calc_brush_weights(
                 hit_pos,
