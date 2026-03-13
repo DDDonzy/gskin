@@ -2,12 +2,13 @@ from __future__ import annotations
 
 
 import typing
-from dataclasses import dataclass, field
+import array
+import functools
 
 import maya.OpenMaya as om1  # type:ignore
 
 from . import cWeightsCoreCython
-from .cMemoryView import CMemoryManager
+from .cMemoryView import CMemoryManager, ensure_memoryview
 from ._cRegistry import SkinRegistry
 from . import apiundo
 
@@ -18,9 +19,14 @@ if typing.TYPE_CHECKING:
 
 class WeightsHandle:
     """
-    [底层核心] 权重数据装配器
+    权重数据装配器
     采用 Header (int32) + Payload (float32) 混合内存布局。
-    严格贯彻显式赋值，所有隐式属性计算均通过 return 暴露给调用者。
+        ```
+        ----------------------------------------------------------------------------------
+        | vtx_count (int) | inf_count (int) | bone_indices... (int) | Weights... (float) |
+        | <------------------ Header -----------------------------> | <--- Payload ----> |
+        ----------------------------------------------------------------------------------
+        ```
     """
 
     # fmt:off
@@ -40,7 +46,7 @@ class WeightsHandle:
     """
     # fmt:on
 
-    def __init__(self, source: om1.MDataHandle | om1.MPlug, cSkin: CythonSkinDeformer, layerIndex: int, isMask: bool):
+    def __init__(self, source: om1.MDataHandle | om1.MPlug):
         if isinstance(source, om1.MPlug):
             self.mPlug = source
             # 提取短命的 MDataHandle
@@ -51,10 +57,6 @@ class WeightsHandle:
             self.mDataHandle = source
         else:
             raise TypeError("Input not OpenMaya.MDataHandle or OpenMaya.MPlug")
-
-        self.cSkin = cSkin
-        self.layer_idx = layerIndex
-        self.isMask = isMask
 
         self._setup_mesh_buffer(self.mDataHandle)
 
@@ -72,7 +74,7 @@ class WeightsHandle:
         if self.memory.view is None:
             return False
         if self.length is None or self.length <= 0:
-            return
+            return False
         return True
 
     # -------------------------------------------------------------------------
@@ -179,9 +181,17 @@ class WeightsHandle:
         if self.mFnMesh is not None:
             self.memory = CMemoryManager.from_ptr(int(self.mFnMesh.getRawPoints()), "f", (self.length,))
 
-        # self.commit()
-        # self.__init__(self.mDataHandle)
         return resized
+
+    def clear(self):
+
+        self.mObject_mesh = om1.MFnMeshData().create()
+        self.mFnMesh = None
+        self.memory = None
+        self.length = -1
+        self.max_capacity = -1
+
+        return True
 
     def commit(self):
         """强制提交到 Maya，仅作为外部状态刷新接口"""
@@ -189,101 +199,6 @@ class WeightsHandle:
             self.mDataHandle.setMObject(self.mObject_mesh)
             if self.mPlug is not None:
                 self.mPlug.setMDataHandle(self.mDataHandle)
-
-    def get_weights(self):
-        """极速解析底层连续内存，分离 Header (元数据) 与 Payload (纯权重)。
-
-        底层的物理内存是一块连续的 32 位数据块，通过 C 指针强转进行零拷贝读取。
-        其物理内存布局如下：
-        ```
-        ----------------------------------------------------------------------------------
-        | vtx_count (int) | inf_count (int) | bone_indices... (int) | Weights... (float) |
-        | <------------------ Header -----------------------------> | <--- Payload ----> |
-        ----------------------------------------------------------------------------------
-        ```
-
-        Returns:
-            tuple: 若当前句柄无效或内存数据为空，则返回 (None, 0, 0, ()), 否则返回包含以下元素的元组:
-                - vtx_count (int): 当前图层记录的网格顶点总数。
-                - influence_count (int): 当前图层包含的有效骨骼列数。
-                - influence_indices (tuple[int, ...]): 当前图层包含的骨骼逻辑索引列表 (只读的 Bone IDs)。
-                - weights_view (memoryview): 去除 Header 后的纯权重 1D 数据视图 (float32)。
-        """
-        if not self.is_valid:
-            return 0, 0, (), None
-
-        float_view = self.memory.view
-        int_view = float_view.cast("B").cast("i")
-
-        vtx_count = int_view[0]
-        influence_count = int_view[1]
-        header_size = 2 + influence_count
-
-        influence_indices = tuple(int_view[2:header_size])
-        weights_view = float_view[header_size : self.length]
-
-        return vtx_count, influence_count, influence_indices, weights_view
-
-    def _set_weights(
-        self,
-        vtx_count: int,
-        inf_count: int,
-        influence_indices: tuple,
-        weights_view1D,
-    ):
-        """[全量写入] 传入顶点总数、骨骼映射表、完整的一维权重数组"""
-        influence_count = len(influence_indices)
-        header_size = 2 + influence_count
-        total_size = header_size + (vtx_count * influence_count)
-        # 重构数组大小(resize 会自行判断是否需要重构)
-        resized = self.resize(total_size)
-
-        _float_view = self.memory.view
-        _int_view = _float_view.cast("B").cast("i")
-
-        _int_view[0] = vtx_count
-        _int_view[1] = influence_count
-
-        indices_mgr = CMemoryManager.from_list(list(influence_indices), "i")
-        _int_view[2 : 2 + influence_count] = indices_mgr.view
-
-        if isinstance(weights_view1D, memoryview):
-            src_view = weights_view1D.cast("B").cast("f")
-        else:
-            temp_mgr = CMemoryManager.from_list(list(weights_view1D), "f")
-            src_view = temp_mgr.view
-
-        _float_view[header_size:total_size] = src_view
-
-        if resized:
-            self.commit()
-        return True
-
-    def _set_sparse_weights(self, vtx_indices, bone_local_indices, sparse_weights_1d):
-        """[稀疏写入] 传入被修改的顶点ID列表、局部骨骼列索引列表、稀疏权重数组 (专供画刷 Undo/Redo)"""
-        if not self.is_valid:
-            return
-
-        _float_view = self.memory.view
-        int_view = _float_view.cast("B").cast("i")
-
-        influence_count = int_view[1]
-        header_size = 2 + influence_count
-
-        if isinstance(sparse_weights_1d, memoryview):
-            src_view = sparse_weights_1d.cast("B").cast("f")
-        else:
-            src_view = memoryview(sparse_weights_1d).cast("B").cast("f")
-
-        num_modified_bones = len(bone_local_indices)
-
-        for i, vtx_id in enumerate(vtx_indices):
-            row_start = header_size + vtx_id * influence_count
-            for j, local_col_id in enumerate(bone_local_indices):
-                dest_idx = row_start + local_col_id
-                src_idx = i * num_modified_bones + j
-                _float_view[dest_idx] = src_view[src_idx]
-        return True
 
 
 class WeightsLayerItem:
@@ -296,8 +211,8 @@ class WeightsLayerItem:
         _handle_enabled = mDataHandle.child(cSkin.aLayerEnabled)
 
         self.enabled = _handle_enabled.asBool()
-        self.weights = WeightsHandle(_handle_weights, cSkin, logical_idx, isMask=False)
-        self.mask = WeightsHandle(_handle_mask, cSkin, logical_idx, isMask=True)
+        self.weights = WeightsHandle(_handle_weights)
+        self.mask = WeightsHandle(_handle_mask)
 
     # ==========================================
     # 安全的属性获取：直接找 cSkin 要 MObject，完全不碰短命的 MDataHandle
@@ -320,6 +235,23 @@ class WeightsLayerItem:
         mPlug = om1.MPlug(self.cSkin.mObject, self.cSkin.aLayerEnabled)
         mPlug.selectAncestorLogicalIndex(self.logical_idx, self.cSkin.aLayerCompound)
         return mPlug
+
+
+def updateDG(func):
+    """
+    [装饰器] 方法执行完毕后，强制调用实例的 self.update() 刷新 Maya 视口。
+    无论函数是正常 return 还是引发异常，都能保证 100% 触发。
+    """
+
+    @functools.wraps(func)
+    def wrapper(self: WeightsManager, *args, **kwargs):
+        try:
+            return func(self, *args, **kwargs)
+        finally:
+            # 这里的 self 就是 WeightsManager 实例
+            self.updateDG()
+
+    return wrapper
 
 
 class WeightsManager:
@@ -350,7 +282,7 @@ class WeightsManager:
         # weights
         weights_dataHandle = dataBlock.inputValue(self.cSkin.aWeights)
         self.handle = weights_dataHandle
-        self.weights = WeightsHandle(weights_dataHandle, self.cSkin, -1, False)
+        self.weights = WeightsHandle(weights_dataHandle)
 
         # layer
         self.layers.clear()
@@ -384,7 +316,7 @@ class WeightsManager:
             except IndexError:
                 return None
 
-    def get_handle(self, layer_logical_idx, isMask: bool = False):
+    def get_handle(self, layer_logical_idx, isMask: bool = False) -> WeightsHandle:
         """
         严格根据逻辑索引寻找对应的 Handle
         """
@@ -400,6 +332,169 @@ class WeightsManager:
                 return layer_item.weights
 
         return None
+
+    @updateDG
+    def set_weights(self, layer_idx, is_mask, vtx_indices, bone_local_indices, weights_1d, backup=True):
+        handle = self.get_handle(layer_idx, is_mask)
+        if handle is None or handle.is_valid is not True:
+            raise RuntimeError(f"{handle} is not valid")
+
+        # --- [入口：统一转为视图] ---
+        v_indices = ensure_memoryview(vtx_indices, "i")
+        b_indices = ensure_memoryview(bone_local_indices, "i")
+        src_view = ensure_memoryview(weights_1d, "f")
+
+        weights = handle.memory.view
+        _int_view = weights.cast("B").cast("i")
+        inf_count = _int_view[1]
+        header_size = 2 + inf_count
+
+        # --- [备份：精准转为独立内存] ---
+        if backup:
+            # 只有开启备份时，才付出转换 array 的开销
+            safe_vtx = array.array("i", v_indices)
+            safe_bone = array.array("i", b_indices)
+            safe_new_weights = array.array("f", src_view)
+
+            # 记录旧数据
+            num_vtx = len(v_indices)
+            num_bones = len(b_indices)
+            backup_values = array.array("f", [0.0] * (num_vtx * num_bones))
+
+            # 写入的同时提取备份
+            for i in range(num_vtx):
+                vtx_id = v_indices[i]
+                row_offset = header_size + vtx_id * inf_count
+                for j in range(num_bones):
+                    dest_idx = row_offset + b_indices[j]
+                    src_idx = i * num_bones + j
+                    backup_values[src_idx] = weights[dest_idx]
+                    weights[dest_idx] = src_view[src_idx]
+
+            # 提交 Undo 闭包 (使用刚才“转”好的安全 array)
+            def redo():
+                self.set_weights(layer_idx, is_mask, safe_vtx, safe_bone, safe_new_weights, backup=False)
+
+            def undo():
+                self.set_weights(layer_idx, is_mask, safe_vtx, safe_bone, backup_values, backup=False)
+
+            apiundo.commit(redo, undo, execute=False)
+            return v_indices, b_indices, backup_values
+
+        else:
+            # --- [快速路径：不备份直接刷] ---
+            for i in range(len(v_indices)):
+                vtx_id = v_indices[i]
+                row_offset = header_size + vtx_id * inf_count
+                for j in range(len(b_indices)):
+                    weights[row_offset + b_indices[j]] = src_view[i * len(b_indices) + j]
+
+        return None, None, None
+
+    @updateDG
+    def set_weights_all(self, layer_idx, is_mask, vtx_count, inf_count, influence_indices, weights_1d, backup=True):
+        handle = self.get_handle(layer_idx, is_mask)
+        if handle is None:
+            return False
+
+        # --- [备份：利用解析好的 safe 视图进行转换] ---
+        if backup:
+            # 1. 获取旧状态 (get_weights 内部已经做好了深拷贝，返回的是绝对安全的 memoryview)
+            old_v, old_i, safe_old_indices_view, safe_old_weights_view = self.get_weights(layer_idx, is_mask)
+
+            safe_new_indices = array.array("i", influence_indices)
+            safe_new_weights = array.array("f", ensure_memoryview(weights_1d, "f"))
+
+            # 3. 注册闭包
+            def redo():
+                self.set_weights_all(layer_idx, is_mask, vtx_count, inf_count, safe_new_indices, safe_new_weights, backup=False)
+
+            def undo():
+                self.set_weights_all(layer_idx, is_mask, old_v, old_i, safe_old_indices_view, safe_old_weights_view, backup=False)
+
+            apiundo.commit(redo, undo, execute=False)
+
+        # 如果传进来的 vtx_count 为 0，说明这是一个“清空图层”或“撤销回到建图层前”的动作！
+        if vtx_count == 0:
+            handle.clear()
+            handle.commit()
+            return True
+
+        # --- [执行：直接利用原始输入写入] ---
+        src_view = ensure_memoryview(weights_1d, "f")
+        total_size = (2 + len(influence_indices)) + (vtx_count * len(influence_indices))
+
+        resized = handle.resize(total_size)
+        if not handle.is_valid:
+            return False
+
+        _view = handle.memory.view
+        _int = _view.cast("B").cast("i")
+
+        _int[0], _int[1] = vtx_count, len(influence_indices)
+        if influence_indices:
+            _int[2 : 2 + len(influence_indices)] = ensure_memoryview(influence_indices, "i")
+
+        _view[2 + len(influence_indices) : total_size] = src_view
+
+        if resized:
+            handle.commit()
+        return True
+
+    @staticmethod
+    def parse_raw_weights(raw_view):
+        """
+        将连续内存拆解为逻辑视图。
+        """
+        if raw_view is None or len(raw_view) < 2:
+            return 0, 0, None, None
+
+        int_view = raw_view.cast("B").cast("i")
+
+        vtx_count = int_view[0]
+        influence_count = int_view[1]
+        header_size = 2 + influence_count
+
+        influence_indices_view = int_view[2:header_size]
+        weights_view = raw_view[header_size:]
+
+        return vtx_count, influence_count, influence_indices_view, weights_view
+
+    def get_raw_weights(self, layer_idx: int, is_mask: bool):
+        """
+        直接索要底层的物理内存地址视图，不做任何解析。
+        """
+        handle = self.get_handle(layer_idx, is_mask)
+        if handle is None or not handle.is_valid:
+            return None
+        return handle.memory.view[: handle.length]
+
+    def get_weights(self, layer_idx: int, is_mask: bool):
+        """
+        获取全部数据的,并统一重新包装为 memoryview 返回。
+        Returns:
+            tuple: (vtx_count: int, influence_count: int,
+                    safe_indices_view: memoryview,
+                    safe_weights_view: memoryview)
+        """
+        raw_view = self.get_raw_weights(layer_idx, is_mask)
+        if raw_view is None:
+            # 如果是空图层，返回安全的、空的 memoryview
+            return 0, 0, memoryview(array.array("i")), memoryview(array.array("f"))
+
+        vtx_count, inf_count, inf_indices_view, weights_view = self.parse_raw_weights(raw_view)
+
+        if inf_indices_view is not None and len(inf_indices_view) > 0:
+            safe_indices_view = memoryview(array.array("i", inf_indices_view))
+        else:
+            safe_indices_view = memoryview(array.array("i"))
+
+        if weights_view is not None and len(weights_view) > 0:
+            safe_weights_view = memoryview(array.array("f", weights_view))
+        else:
+            safe_weights_view = memoryview(array.array("f"))
+
+        return vtx_count, inf_count, safe_indices_view, safe_weights_view
 
     def bake_to_final_weights(self, vtx_indices: typing.Sequence[int] = None) -> None:
         """
@@ -492,5 +587,5 @@ class WeightsManager:
 
         self.weights.commit()
 
-    def update(self):
+    def updateDG(self):
         self.cSkin.setDirty()

@@ -41,7 +41,6 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         "_rotateMatrix_mgr",
         "_translateVector_mgr",
         "_skinWeights",
-        "_memory_task_queue",
     )
 
     aGeomMatrix = om1.MObject()
@@ -90,7 +89,7 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         self._translateVector_mgr: "cMemoryView.CMemoryManager" = None
 
         self.weights_manager = None
-        self._memory_task_queue = []  # 外部修改权重队列
+        self._skinWeights = None
         """"""
 
     def setDirty(self):
@@ -140,29 +139,6 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
             ):
                 self._weights_is_dirty = True
         return super(CythonSkinDeformer, self).preEvaluation(context, evaluationNode)
-
-    def dispatch_memory_task(
-        self,
-        layer_logical_idx: int,
-        isMask: bool,
-        action_name: str,
-        *args,
-    ):
-        """
-        接收来自 外部非实时内存修改请求（设置权重/undo/redo...）
-        强制节点触发deform，将任务推迟到极其安全的 deform 周期内执行。
-        """
-        self._memory_task_queue.append(
-            {
-                "layer_logical_idx": layer_logical_idx,
-                "isMask": isMask,
-                "function_name": action_name,
-                "args": args,
-            },
-        )
-
-        # 脏标记！让Maya调用 deform
-        self.setDirty()
 
     def deform(self, dataBlock: om1.MDataBlock, geoIter, localToWorldMatrix, multiIndex):
         envelope = dataBlock.inputValue(ompx.cvar.MPxGeometryFilter_envelope).asFloat()
@@ -229,21 +205,12 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         if self._weights_is_dirty:
             # 刷新数据池
             self.weights_manager.update_data(dataBlock)
-            # 任务拦截器：趁着指针最新鲜，立刻处理外部投递的 Undo 任务！
-            if self._memory_task_queue:
-                for task in self._memory_task_queue:
-                    # [精准寻址] 按坐标，找 Manager 要对应的 Handle
-                    target_handle = self.weights_manager.get_handle(task["layer_logical_idx"], task["isMask"])
-                    if target_handle and target_handle.is_valid:
-                        # 通过字符串反射获取真实的写入方法
-                        action_func = getattr(target_handle, task["action_name"])
-                        # 执行函数
-                        action_func(*task["args"])
-                self._memory_task_queue.clear()
-
-            _, _, _, self._skinWeights = self.weights_manager.weights.get_weights()
-
             self._weights_is_dirty = False
+
+        _weightsView = self.weights_manager.get_raw_weights(-1, 0)
+        if _weightsView is None:
+            return
+        _, _, _, self._skinWeights = self.weights_manager.parse_raw_weights(_weightsView)
 
         cSkinDeformCython.compute_deform_matrices(
             int(self._geo_matrix.this),

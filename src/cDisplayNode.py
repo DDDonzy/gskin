@@ -315,46 +315,32 @@ class WeightPreviewShape(om.MPxSurfaceShape):
         return self._last_cSkin
 
     @property
-    def active_paint_weights(self) -> tuple[WeightsHandle, memoryview]:
+    def active_paint_weights(self) -> tuple[WeightsHandle | None, memoryview | None]:
         """
         直接提取当前需要渲染的 1D 权重视图 (Mask 或指定骨骼权重)，并附带目标 Handle。
         Returns:
             tuple[WeightsHandle | None, memoryview | None]: 返回 (目标句柄, 切片后的视图)
         """
-
         cSkin = self.cSkin
         ctx = self.render_context
 
         if not cSkin or cSkin.weights_manager is None:
             return None, None
 
-        handle = None
-        is_mask = False
+        handle = cSkin.weights_manager.get_handle(ctx.paintLayerIndex, ctx.paintMask)
+        _, inf_count, _, flat_array = cSkin.weights_manager.get_weights(ctx.paintLayerIndex, ctx.paintMask)
 
-        if ctx.paintLayerIndex == -1:
-            handle = cSkin.weights_manager.weights
-        else:
-            layerItem = cSkin.weights_manager.get_layer(ctx.paintLayerIndex)
-            if layerItem is None:
-                return None, None
-            if ctx.paintMask:
-                handle = layerItem.mask
-                is_mask = True
-            else:
-                handle = layerItem.weights
-
-        if handle is None or not handle.is_valid:
+        if (handle is None) or (not handle.is_valid):
             return None, None
 
-        if is_mask:
-            _, _, _, weights = handle.get_weights()
-            return handle, weights
-        else:
-            _, inf_count, _, weights = handle.get_weights()
-            if inf_count <= 0:
-                return handle, None
-            safe_idx = max(0, min(ctx.paintInfluenceIndex, inf_count - 1))
-            return handle, weights[safe_idx::inf_count]
+        if inf_count <= 0:
+            return handle, None
+        
+        # 计算安全偏移量并切片
+        safe_idx = max(0, min(ctx.paintInfluenceIndex, inf_count - 1))
+        
+        # 强制转换为 memoryview 视图，保证零拷贝和类型绝对安全
+        return handle, memoryview(flat_array)[safe_idx::inf_count]
 
     def update_mesh(self):
         """
@@ -388,7 +374,6 @@ class WeightPreviewShape(om.MPxSurfaceShape):
 
     def _update_topology(self, mFnMesh: om.MFnMesh):
         """
-        [补全] 拓扑数据生成器
         使用 mFnMesh (OpenMaya) 生成三角形和边索引数据用于渲染。
         Update:
             mesh_context.vertex_count

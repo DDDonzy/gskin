@@ -2,6 +2,58 @@ import ctypes
 import array
 
 
+def ensure_memoryview(data, typecode="f"):
+    """
+    将输入对象转换为 memoryview。
+
+    Args:
+        data: 输入对象 (list, tuple, memoryview, array.array, bytes 等)
+        typecode (str): 如果输入是 list/tuple，转换时使用的 C 类型码。
+                        'f' 为 float (32-bit), 'd' 为 double (64-bit), 'i' 为 int (32-bit)
+
+    Returns:
+        memoryview: 对象的内存视图
+    """
+    # 1. 尝试直接获取视图 (针对已支持 buffer 协议的对象: memoryview, array, numpy, bytes)
+    try:
+        return memoryview(data)
+    except TypeError:
+        pass
+
+    # 2. 如果是 list 或 tuple，先转为连续内存的 array.array
+    if isinstance(data, (list, tuple)):
+        # 注意：这里会发生一次 $O(N)$ 的内存拷贝和类型转换
+        return memoryview(array.array(typecode, data))
+
+    # 3. 抛出不支持的异常
+    raise TypeError(f"无法将类型 {type(data).__name__} 转换为 memoryview。支持的类型包括: list, tuple, memoryview, array.array, bytes, bytearray 等。")
+
+
+def ensure_bytes(data, typecode="f") -> bytes:
+    """
+    [终极数据洗白器]
+    将任何输入 (list, tuple, memoryview, array) 强制转化为不可变的 C 字节流。
+    专供 Undo 队列做只读备份使用，彻底阻断 Maya 内存崩溃。
+    """
+    # 1. 已经是 bytes 了，直接放行 (比如 Redo 再次推入队列时)
+    if isinstance(data, bytes):
+        return data
+
+    # 2. 如果是 memoryview，瞬间 C 级别内存快照
+    if isinstance(data, memoryview):
+        return data.tobytes()
+
+    # 3. 如果是 array.array，同样瞬间快照
+    if isinstance(data, array.array):
+        return data.tobytes()
+
+    # 4. 如果是 list 或 tuple，必须先转为连续内存，再抽成 bytes
+    if isinstance(data, (list, tuple)):
+        return array.array(typecode, data).tobytes()
+
+    raise TypeError(f"无法将 {type(data)} 转换为安全的 bytes 备份。")
+
+
 class CMemoryManager:
     """
     一个高效的、零拷贝的内存管理器。
