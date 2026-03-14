@@ -1,3 +1,5 @@
+# encoding=utf-8
+
 from __future__ import annotations
 import ctypes
 
@@ -9,7 +11,8 @@ from .cWeightsManager import WeightsManager
 from . import cSkinDeformCython
 from . import _cRegistry
 
-from ._profile import MicroProfiler, DeepProfiler
+# from ._profile import MicroProfiler, DeepProfiler, maya_profile, MayaNativeProfiler
+from ._cProfilerCython import MayaNativeProfiler, maya_profile
 
 
 class CythonSkinDeformer(ompx.MPxDeformerNode):
@@ -140,96 +143,107 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
                 self._weights_is_dirty = True
         return super(CythonSkinDeformer, self).preEvaluation(context, evaluationNode)
 
+    @maya_profile(0, "Deform")
     def deform(self, dataBlock: om1.MDataBlock, geoIter, localToWorldMatrix, multiIndex):
-        envelope = dataBlock.inputValue(ompx.cvar.MPxGeometryFilter_envelope).asFloat()
-        if envelope == 0.0:
-            return
+        with MayaNativeProfiler("Envelop", 1):
+            envelope = dataBlock.inputValue(ompx.cvar.MPxGeometryFilter_envelope).asFloat()
+            if envelope == 0.0:
+                return
 
-        input_handle = dataBlock.inputArrayValue(ompx.cvar.MPxGeometryFilter_input)
-        input_handle.jumpToElement(multiIndex)
-        input_geom_obj = input_handle.inputValue().child(ompx.cvar.MPxGeometryFilter_inputGeom).asMesh()
+        with MayaNativeProfiler("in/out geo", 2):
+            input_handle = dataBlock.inputArrayValue(ompx.cvar.MPxGeometryFilter_input)
+            input_handle.jumpToElement(multiIndex)
+            input_geom_obj = input_handle.inputValue().child(ompx.cvar.MPxGeometryFilter_inputGeom).asMesh()
 
-        output_handle = dataBlock.outputArrayValue(ompx.cvar.MPxGeometryFilter_outputGeom)
-        output_handle.jumpToElement(multiIndex)
-        output_geom_obj = output_handle.outputValue().asMesh()
+            output_handle = dataBlock.outputArrayValue(ompx.cvar.MPxGeometryFilter_outputGeom)
+            output_handle.jumpToElement(multiIndex)
+            output_geom_obj = output_handle.outputValue().asMesh()
 
-        if input_geom_obj.isNull() or output_geom_obj.isNull():
-            return
+            if input_geom_obj.isNull() or output_geom_obj.isNull():
+                return
 
-        mFnMesh_in = om1.MFnMesh(input_geom_obj)
-        self.vertex_count = mFnMesh_in.numVertices()
-        rawPoints_original_mgr = cMemoryView.CMemoryManager.from_ptr(int(mFnMesh_in.getRawPoints()), "f", (self.vertex_count * 3,))
+        with MayaNativeProfiler("fnMesh", 3):
+            mFnMesh_in = om1.MFnMesh(input_geom_obj)
+            self.vertex_count = mFnMesh_in.numVertices()
+            rawPoints_original_mgr = cMemoryView.CMemoryManager.from_ptr(int(mFnMesh_in.getRawPoints()), "f", (self.vertex_count * 3,))
 
-        mFnMesh_out = om1.MFnMesh(output_geom_obj)
-        self.rawPoints_output_mgr = cMemoryView.CMemoryManager.from_ptr(int(mFnMesh_out.getRawPoints()), "f", (self.vertex_count * 3,))
+            mFnMesh_out = om1.MFnMesh(output_geom_obj)
+            self.rawPoints_output_mgr = cMemoryView.CMemoryManager.from_ptr(int(mFnMesh_out.getRawPoints()), "f", (self.vertex_count * 3,))
 
-        influences_handle = dataBlock.inputArrayValue(self.aInfluenceMatrix)
-        influences_count = influences_handle.elementCount()
+            influences_handle = dataBlock.inputArrayValue(self.aInfluenceMatrix)
+            influences_count = influences_handle.elementCount()
 
-        if self.influences_count != influences_count:
-            self.influences_count = influences_count
-            self._influencesMatrix_mgr = cMemoryView.CMemoryManager.allocate("d", (influences_count, 16))
-            self._rotateMatrix_mgr = cMemoryView.CMemoryManager.allocate("f", (influences_count, 9))
-            self._translateVector_mgr = cMemoryView.CMemoryManager.allocate("f", (influences_count, 3))
-            for b in range(influences_count):
-                for i in range(16):
-                    self._influencesMatrix_mgr.view[b, i] = 1.0 if (i % 5 == 0) else 0.0
+        with MayaNativeProfiler("influences allocate", 4):
+            if self.influences_count != influences_count:
+                self.influences_count = influences_count
+                self._influencesMatrix_mgr = cMemoryView.CMemoryManager.allocate("d", (influences_count, 16))
+                self._rotateMatrix_mgr = cMemoryView.CMemoryManager.allocate("f", (influences_count, 9))
+                self._translateVector_mgr = cMemoryView.CMemoryManager.allocate("f", (influences_count, 3))
+                for b in range(influences_count):
+                    for i in range(16):
+                        self._influencesMatrix_mgr.view[b, i] = 1.0 if (i % 5 == 0) else 0.0
 
-        if self._influencesMatrix_is_dirty:
-            if influences_count > 0:
-                dest_base_addr = self._influencesMatrix_mgr.ptr
-                for i in range(influences_count):
-                    influences_handle.jumpToArrayElement(i)
-                    influence_idx = influences_handle.elementIndex()
-                    src_addr = int(influences_handle.inputValue().asMatrix().this)
-                    dest_addr = dest_base_addr + (influence_idx * 128)
-                    ctypes.memmove(dest_addr, src_addr, 128)
-                self._influencesMatrix_is_dirty = False
+        with MayaNativeProfiler("influences matrix", 5):
+            if self._influencesMatrix_is_dirty:
+                if influences_count > 0:
+                    dest_base_addr = self._influencesMatrix_mgr.ptr
+                    for i in range(influences_count):
+                        influences_handle.jumpToArrayElement(i)
+                        influence_idx = influences_handle.elementIndex()
+                        src_addr = int(influences_handle.inputValue().asMatrix().this)
+                        dest_addr = dest_base_addr + (influence_idx * 128)
+                        ctypes.memmove(dest_addr, src_addr, 128)
+                    self._influencesMatrix_is_dirty = False
 
-        if self._bindPreMatrix_is_dirty:
-            bind_data_obj = dataBlock.inputValue(self.aBindPreMatrix).data()
-            if not bind_data_obj.isNull():
-                fn_bind_array = om1.MFnMatrixArrayData(bind_data_obj)
-                bind_m_array = fn_bind_array.array()
-                if bind_m_array.length() > 0:
-                    addr_base = int(bind_m_array[0].this)
-                    self._bindPreMatrix_mgr = cMemoryView.CMemoryManager.from_ptr(addr_base, "d", (bind_m_array.length(), 16))
-                self._bindPreMatrix_is_dirty = False
+        with MayaNativeProfiler("influences bind matrix", 6):
+            if self._bindPreMatrix_is_dirty:
+                bind_data_obj = dataBlock.inputValue(self.aBindPreMatrix).data()
+                if not bind_data_obj.isNull():
+                    fn_bind_array = om1.MFnMatrixArrayData(bind_data_obj)
+                    bind_m_array = fn_bind_array.array()
+                    if bind_m_array.length() > 0:
+                        addr_base = int(bind_m_array[0].this)
+                        self._bindPreMatrix_mgr = cMemoryView.CMemoryManager.from_ptr(addr_base, "d", (bind_m_array.length(), 16))
+                    self._bindPreMatrix_is_dirty = False
 
-        if self._geoMatrix_is_dirty:
-            self._geo_matrix = dataBlock.inputValue(self.aGeomMatrix).asMatrix()
-            self._get_matrix_i = self._geo_matrix.inverse()
-            self._geo_matrix_is_identity = self._geo_matrix.isEquivalent(om1.MMatrix.identity)
-            self._geoMatrix_is_dirty = False
+        with MayaNativeProfiler("geo matrix", 7):
+            if self._geoMatrix_is_dirty:
+                self._geo_matrix = dataBlock.inputValue(self.aGeomMatrix).asMatrix()
+                self._get_matrix_i = self._geo_matrix.inverse()
+                self._geo_matrix_is_identity = self._geo_matrix.isEquivalent(om1.MMatrix.identity)
+                self._geoMatrix_is_dirty = False
 
-        if self._weights_is_dirty:
-            # 刷新数据池
-            self.weights_manager.update_data(dataBlock)
-            self._weights_is_dirty = False
+        with MayaNativeProfiler("Update Weights", 2):
+            if self._weights_is_dirty:
+                # 刷新数据池
+                self.weights_manager.update_data(dataBlock)
+                self._weights_is_dirty = False
 
-        _weightsView = self.weights_manager.get_raw_weights(-1, 0)
-        if _weightsView is None:
-            return
-        _, _, _, self._skinWeights = self.weights_manager.parse_raw_weights(_weightsView)
+            _weightsView = self.weights_manager.get_raw_weights(-1, 0)
+            if _weightsView is None:
+                return
+            _, _, _, self._skinWeights = self.weights_manager.parse_raw_weights(_weightsView)
 
-        cSkinDeformCython.compute_deform_matrices(
-            int(self._geo_matrix.this),
-            int(self._get_matrix_i.this),
-            self._bindPreMatrix_mgr.view,
-            self._influencesMatrix_mgr.view,
-            self._rotateMatrix_mgr.view,
-            self._translateVector_mgr.view,
-            self._geo_matrix_is_identity,
-        )
+        with MayaNativeProfiler("Cython Cal matrix", 1):
+            cSkinDeformCython.compute_deform_matrices(
+                int(self._geo_matrix.this),
+                int(self._get_matrix_i.this),
+                self._bindPreMatrix_mgr.view,
+                self._influencesMatrix_mgr.view,
+                self._rotateMatrix_mgr.view,
+                self._translateVector_mgr.view,
+                self._geo_matrix_is_identity,
+            )
 
-        cSkinDeformCython.run_skinning_core(
-            rawPoints_original_mgr.view,
-            self.rawPoints_output_mgr.view,
-            self._skinWeights,
-            self._rotateMatrix_mgr.view,
-            self._translateVector_mgr.view,
-            envelope,
-        )
+        with MayaNativeProfiler("Cython Cal skin", 3):
+            cSkinDeformCython.run_skinning_core(
+                rawPoints_original_mgr.view,
+                self.rawPoints_output_mgr.view,
+                self._skinWeights,
+                self._rotateMatrix_mgr.view,
+                self._translateVector_mgr.view,
+                envelope,
+            )
 
     @classmethod
     def nodeInitializer(cls):

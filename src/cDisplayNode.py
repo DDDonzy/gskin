@@ -14,6 +14,8 @@ from .cMemoryView import CMemoryManager
 from ._cRegistry import SkinRegistry
 from .cSkinContext import BrushHitContext, MeshTopologyContext, RenderContext
 
+from ._cProfilerCython import MayaNativeProfiler, maya_profile
+
 
 from typing import TYPE_CHECKING
 
@@ -39,6 +41,7 @@ class WeightGeometryOverride(omr.MPxGeometryOverride):
         "_class_shape",
         #
         "_topology_dirty",
+        "_weights_dirty",
         "_last_render_vtx_count",
         "_render_ctx",
         "_cpv_shader",
@@ -49,7 +52,7 @@ class WeightGeometryOverride(omr.MPxGeometryOverride):
     RENDER_LINE = False
     RENDER_POLYGONS = True
 
-    points_size = 6.0
+    points_size = 8
     lines_width = 1
 
     def __init__(self, mObjectShape):
@@ -59,8 +62,8 @@ class WeightGeometryOverride(omr.MPxGeometryOverride):
         self._mFnDep_shape: om.MFnDependencyNode = om.MFnDependencyNode(mObjectShape)
         self._class_shape: WeightPreviewShape = self._mFnDep_shape.userNode()
 
-        # 拓扑快照 (仅拓扑改变时更新)
         self._topology_dirty: bool = True
+        self._weights_dirty: bool = True
         self._last_render_vtx_count = 0
 
         # 🎨 render context
@@ -76,28 +79,32 @@ class WeightGeometryOverride(omr.MPxGeometryOverride):
         self._point_shader = shader_mgr.getStockShader(omr.MShaderManager.k3dCPVFatPointShader)
         self._point_shader.setParameter("pointSize", [WeightGeometryOverride.points_size, WeightGeometryOverride.points_size])
 
+    @maya_profile(0, "update DG")
     def updateDG(self):
-        shape = self._class_shape
-        cSkin = shape.cSkin
+        with MayaNativeProfiler("update DG - Pre", 1):
+            shape = self._class_shape
+            cSkin = shape.cSkin
 
-        if (not cSkin) or (not shape._deformMesh_plug.isConnected):
-            return
+            if (not cSkin) or (not shape._deformMesh_plug.isConnected):
+                return
 
-        # 更新模型信息
-        render_mesh = shape.update_mesh()
+        with MayaNativeProfiler("update DG - updateMesh", 3):
+            # 更新模型信息
+            render_mesh = shape.update_mesh()
 
-        # 拦截无效模型
-        if (render_mesh.vertex_count == 0) or (render_mesh.triangle_indices is None):
-            return
+            # 拦截无效模型
+            if (render_mesh.vertex_count == 0) or (render_mesh.triangle_indices is None):
+                return
+        with MayaNativeProfiler("update DG - updateRender", 3):
+            # 直接比较顶点数。如果不等，说明拓扑变了，重置显存拷贝开关
+            if self._last_render_vtx_count != render_mesh.vertex_count:
+                self._last_render_vtx_count = render_mesh.vertex_count
+                self._topology_dirty = True
 
-        # 直接比较顶点数。如果不等，说明拓扑变了，重置显存拷贝开关
-        if self._last_render_vtx_count != render_mesh.vertex_count:
-            self._last_render_vtx_count = render_mesh.vertex_count
-            self._topology_dirty = True
+            # 同步渲染配置(权重层,配色等)
+            self._render_ctx = shape._update_render_context()
 
-        # 同步渲染配置(权重层,配色等)
-        self._render_ctx = shape._update_render_context()
-
+    @maya_profile(2, "populateGeometry")
     def populateGeometry(self, requirements, renderItems, data):
 
         render_mesh = self._class_shape.mesh_context
@@ -107,81 +114,89 @@ class WeightGeometryOverride(omr.MPxGeometryOverride):
         for req in requirements.vertexRequirements():
             if req.semantic == omr.MGeometry.kPosition:
                 if vtx_pos and vtx_pos.ptr:
-                    vtx_buf = data.createVertexBuffer(req)
-                    vtx_addr = vtx_buf.acquire(vtx_count * 3, True)
-                    if vtx_addr:
-                        step = vtx_count * 12
-                        ctypes.memmove(vtx_addr, vtx_pos.ptr, step)
-                        ctypes.memmove(vtx_addr + step, vtx_pos.ptr, step)
-                        ctypes.memmove(vtx_addr + step * 2, vtx_pos.ptr, step)
-                        vtx_buf.commit(vtx_addr)
+                    with MayaNativeProfiler("populateGeometry-vtx_pos", 1):
+                        vtx_buf = data.createVertexBuffer(req)
+                        vtx_addr = vtx_buf.acquire(vtx_count * 3, True)
+                        if vtx_addr:
+                            step = vtx_count * 12
+                            ctypes.memmove(vtx_addr, vtx_pos.ptr, step)
+                            ctypes.memmove(vtx_addr + step, vtx_pos.ptr, step)
+                            ctypes.memmove(vtx_addr + step * 2, vtx_pos.ptr, step)
+                            vtx_buf.commit(vtx_addr)
 
             elif req.semantic == omr.MGeometry.kColor:
-                color_buf = data.createVertexBuffer(req)
-                color_addr = color_buf.acquire(vtx_count * 3, True)
-                if color_addr:
-                    color_view = CMemoryManager.from_ptr(color_addr, "f", (vtx_count * 3, 4)).view
-                    handle, weights = self._class_shape.active_paint_weights
+                with MayaNativeProfiler("populateGeometry-vtx_color", 3):
+                    if self._weights_dirty:
+                        color_buf = data.createVertexBuffer(req)
+                        color_addr = color_buf.acquire(vtx_count * 3, True)
+                        if color_addr:
+                            color_view = CMemoryManager.from_ptr(color_addr, "f", (vtx_count * 3, 4)).view
+                            weights = self._class_shape.active_paint_weights
 
-                    if weights is not None:
-                        if self._render_ctx.paintMask:
-                            cColor.render_gradient(weights, color_view[0:vtx_count], self._render_ctx.color_mask_remapA, self._render_ctx.color_mask_remapB)
-                        elif self._render_ctx.render_mode == 1:
-                            cColor.render_gradient(weights, color_view[0:vtx_count], self._render_ctx.color_weights_remapA, self._render_ctx.color_weights_remapB)
-                        else:
-                            cColor.render_heatmap(weights, color_view[0:vtx_count])
-                    else:
-                        cColor.render_fill(color_view[0:vtx_count], (0.0, 0.0, 1.0, 1.0))
+                            if weights is not None:
+                                if self._render_ctx.paintMask:
+                                    cColor.render_gradient(weights, color_view[0:vtx_count], self._render_ctx.color_mask_remapA, self._render_ctx.color_mask_remapB)
+                                elif self._render_ctx.render_mode == 1:
+                                    cColor.render_gradient(weights, color_view[0:vtx_count], self._render_ctx.color_weights_remapA, self._render_ctx.color_weights_remapB)
+                                else:
+                                    cColor.render_heatmap(weights, color_view[0:vtx_count])
+                            else:
+                                cColor.render_fill(color_view[0:vtx_count], (0.0, 0.0, 1.0, 1.0))
 
-                    cColor.render_fill(color_view[vtx_count : 2 * vtx_count], self._render_ctx.color_wire)
+                            cColor.render_fill(color_view[vtx_count : 2 * vtx_count], self._render_ctx.color_wire)
 
-                    brush_ctx = self._class_shape.brush_context
-                    if brush_ctx.is_valid:
-                        cColor.render_brush_gradient(
-                            color_view[2 * vtx_count : 3 * vtx_count],
-                            brush_ctx.hit_indices.view,
-                            brush_ctx.hit_weights.view,
-                            brush_ctx.hit_count,
-                            self._render_ctx.color_brush_remapA,
-                            self._render_ctx.color_brush_remapB,
-                        )
+                            brush_ctx = self._class_shape.brush_context
+                            if brush_ctx.is_valid:
+                                cColor.render_brush_gradient(
+                                    color_view[2 * vtx_count : 3 * vtx_count],
+                                    brush_ctx.hit_indices,
+                                    brush_ctx.hit_weights,
+                                    brush_ctx.hit_count,
+                                    self._render_ctx.color_brush_remapA,
+                                    self._render_ctx.color_brush_remapB,
+                                )
 
-                    color_buf.commit(color_addr)
+                            color_buf.commit(color_addr)
 
         for item in renderItems:
             item_name = item.name()
 
             if (item_name == "WeightSolidItem") and (render_mesh.triangle_indices):
-                if self._topology_dirty:
-                    num_indices = render_mesh.triangle_indices.view.nbytes // 4
-                    i_buf = data.createIndexBuffer(omr.MGeometry.kUnsignedInt32)
-                    i_addr = i_buf.acquire(num_indices, True)
-                    if i_addr:
-                        ctypes.memmove(i_addr, render_mesh.triangle_indices.ptr, num_indices * 4)
-                        i_buf.commit(i_addr)
-                        item.associateWithIndexBuffer(i_buf)
+                with MayaNativeProfiler("populateGeometry-vtx_Solid", 4):
+                    if self._topology_dirty:
+                        num_indices = render_mesh.triangle_indices.view.nbytes // 4
+                        i_buf = data.createIndexBuffer(omr.MGeometry.kUnsignedInt32)
+                        i_addr = i_buf.acquire(num_indices, True)
+                        if i_addr:
+                            ctypes.memmove(i_addr, render_mesh.triangle_indices.ptr, num_indices * 4)
+                            i_buf.commit(i_addr)
+                            item.associateWithIndexBuffer(i_buf)
 
             elif (item_name == "WeightWireItem") and (render_mesh.edge_indices):
-                if self._topology_dirty:
-                    num_indices = render_mesh.edge_indices.view.nbytes // 4
-                    i_buf = data.createIndexBuffer(omr.MGeometry.kUnsignedInt32)
-                    i_addr = i_buf.acquire(num_indices, True)
-                    if i_addr:
-                        cColor.offset_indices_direct(render_mesh.edge_indices.ptr, int(i_addr), num_indices, vtx_count)
-                        i_buf.commit(i_addr)
-                        item.associateWithIndexBuffer(i_buf)
+                with MayaNativeProfiler("populateGeometry-vtx_wire", 5):
+                    if self._topology_dirty:
+                        num_indices = render_mesh.edge_indices.view.nbytes // 4
+                        i_buf = data.createIndexBuffer(omr.MGeometry.kUnsignedInt32)
+                        i_addr = i_buf.acquire(num_indices, True)
+                        if i_addr:
+                            cColor.offset_indices_direct(render_mesh.edge_indices.ptr, int(i_addr), num_indices, vtx_count)
+                            i_buf.commit(i_addr)
+                            item.associateWithIndexBuffer(i_buf)
 
             elif item_name == "BrushDebugPoints":
-                brush_ctx = self._class_shape.brush_context
-                if brush_ctx.is_valid:
-                    i_buf = data.createIndexBuffer(omr.MGeometry.kUnsignedInt32)
-                    i_addr = i_buf.acquire(brush_ctx.hit_count, True)
-                    if i_addr:
-                        cColor.offset_indices_direct(brush_ctx.hit_indices.ptr, int(i_addr), brush_ctx.hit_count, 2 * vtx_count)
-                        i_buf.commit(i_addr)
-                        item.associateWithIndexBuffer(i_buf)
+                with MayaNativeProfiler("populateGeometry-vtx_falloff", 6):
+                    if self._topology_dirty:
+                        brush_ctx = self._class_shape.brush_context
+                        if brush_ctx.is_valid:
+                            i_buf = data.createIndexBuffer(omr.MGeometry.kUnsignedInt32)
+                            i_addr = i_buf.acquire(brush_ctx.hit_count, True)
+                            if i_addr:
+                                cColor.offset_indices_direct(brush_ctx.hit_indices.ptr, int(i_addr), brush_ctx.hit_count, 2 * vtx_count)
+                                i_buf.commit(i_addr)
+                                item.associateWithIndexBuffer(i_buf)
 
         self._topology_dirty = False
+        # self._weights_dirty = False
 
     def _setup_render_item(self, renderItems, name, geom_type, shader, depth_priority=None):
         idx = renderItems.indexOf(name)
@@ -194,11 +209,7 @@ class WeightGeometryOverride(omr.MPxGeometryOverride):
         item.setDrawMode(omr.MGeometry.kAll)
         item.setShader(shader)
         if depth_priority is not None:
-            # 兼容不同版本 API 的属性/方法差异
-            try:
-                item.depthPriority = depth_priority
-            except AttributeError:
-                item.setDepthPriority(depth_priority)
+            item.setDepthPriority(depth_priority)
         item.enable(True)
 
     def updateRenderItems(self, objPath, renderItems):
@@ -271,7 +282,9 @@ class WeightPreviewShape(om.MPxSurfaceShape):
     def __init__(self):
         super(WeightPreviewShape, self).__init__()
         self._boundingBox = om.MBoundingBox(om.MPoint((-10, -10, -10)), om.MPoint((10, 10, 10)))
+        self._userDataInit()
 
+    def _userDataInit(self):
         # 💥 实例缓存池：再也不用每次去注册表捞了
         self._last_cSkin = None
 
@@ -279,7 +292,6 @@ class WeightPreviewShape(om.MPxSurfaceShape):
         self.mesh_context = MeshTopologyContext()
         self.brush_context = BrushHitContext()
 
-        # 占位：如果有需要在UI直接访问的笔刷设置，可以在这里实例化
         # 🎨 渲染显示数据
         self.render_context = RenderContext()
 
@@ -315,32 +327,53 @@ class WeightPreviewShape(om.MPxSurfaceShape):
         return self._last_cSkin
 
     @property
-    def active_paint_weights(self) -> tuple[WeightsHandle | None, memoryview | None]:
+    def active_handle(self) -> WeightsHandle | None:
         """
-        直接提取当前需要渲染的 1D 权重视图 (Mask 或指定骨骼权重)，并附带目标 Handle。
+        直接从 manager 提取当前上下文激活的图层/Mask 的目标句柄。
+
         Returns:
-            tuple[WeightsHandle | None, memoryview | None]: 返回 (目标句柄, 切片后的视图)
+            handle (WeightsHandle | None): 返回当前激活的句柄，如果无效则返回 None。
         """
         cSkin = self.cSkin
         ctx = self.render_context
 
         if not cSkin or cSkin.weights_manager is None:
-            return None, None
+            return None
 
         handle = cSkin.weights_manager.get_handle(ctx.paintLayerIndex, ctx.paintMask)
-        _, inf_count, _, flat_array = cSkin.weights_manager.get_weights(ctx.paintLayerIndex, ctx.paintMask)
 
         if (handle is None) or (not handle.is_valid):
-            return None, None
+            return None
 
-        if inf_count <= 0:
-            return handle, None
-        
-        # 计算安全偏移量并切片
+        return handle
+
+    @property
+    def active_paint_weights(self) -> memoryview | None:
+        """
+        直接从 manager 提取当前需要绘制的【单根骨骼】的权重视图。
+
+        Returns:
+            weightsView (memoryview | None): 返回针对特定骨骼切片后的视图。
+        """
+        cSkin = self.cSkin
+        ctx = self.render_context
+
+        if not cSkin or cSkin.weights_manager is None:
+            return None
+
+        # 1. 越过 handle，直接向 manager 索取解析好的全量数据
+        _, inf_count, _, safe_weights_view = cSkin.weights_manager.parse_raw_weights(
+            cSkin.weights_manager.get_raw_weights(ctx.paintLayerIndex, ctx.paintMask),
+        )
+
+        # 如果没有骨骼或者视图为空，直接退出
+        if inf_count <= 0 or not safe_weights_view:
+            return None
+
+        # 2. 计算安全偏移量
         safe_idx = max(0, min(ctx.paintInfluenceIndex, inf_count - 1))
-        
-        # 强制转换为 memoryview 视图，保证零拷贝和类型绝对安全
-        return handle, memoryview(flat_array)[safe_idx::inf_count]
+
+        return safe_weights_view[safe_idx::inf_count]
 
     def update_mesh(self):
         """
@@ -351,8 +384,14 @@ class WeightPreviewShape(om.MPxSurfaceShape):
             mesh_context.edge_indices
             mesh_context.triangle_indices
         """
-        # 强制 DG 计算，确保上游的 deform 运行过了
-        self._deformMesh_plug.asMObject()
+        with MayaNativeProfiler("updateMesh-triggerDG", 7):
+            # 找到连接在上游的 Deformer 的输出插头 (output geometry)
+            src_plug = self._deformMesh_plug.source()
+            # 直接强制拉取 Deformer 的输出！
+            # 因为拉取的是 Deformer 端，数据永远留在 Deformer 里，拷贝耗时直接归零！
+            # 如果拉取 Shape Plug 端，maya会自行复制一份数据，消耗1ms。
+            if not src_plug.isNull:
+                src_plug.asMDataHandle()
 
         cSkin = self.cSkin
         if not cSkin:
@@ -362,11 +401,12 @@ class WeightPreviewShape(om.MPxSurfaceShape):
         if not vtx_count:
             return
 
-        # 如果顶点数变了，触发拓扑缓存重建
-        if self.mesh_context.vertex_count != vtx_count:
-            # 拓扑不会每帧变，用 om 重新捞一遍边和邻接表
-            mFnMesh = om.MFnMesh(self._deformMesh_plug.asMObject())
-            self._update_topology(mFnMesh)
+        with MayaNativeProfiler("updateMesh-topology", 6):
+            # 如果顶点数变了，触发拓扑缓存重建
+            if self.mesh_context.vertex_count != vtx_count:
+                # 拓扑不会每帧变，用 om 重新捞一遍边和邻接表
+                mFnMesh = om.MFnMesh(self._deformMesh_plug.asMObject())
+                self._update_topology(mFnMesh)
 
         # 跨域读取！
         self.mesh_context.vertex_positions = cSkin.rawPoints_output_mgr
@@ -428,6 +468,7 @@ class WeightPreviewShape(om.MPxSurfaceShape):
     def connectionBroken(self, plug, otherPlug, asSrc):
         if plug == self._deformMesh_plug:
             self._last_cSkin = None
+            self._userDataInit()
         return super().connectionBroken(plug, otherPlug, asSrc)
 
     def setDependentsDirty(self, plug, plugArray):

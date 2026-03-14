@@ -1,4 +1,12 @@
+# encoding=utf-8
+
 import time
+
+import cProfile
+import pstats
+import os
+
+import maya.OpenMaya as om1
 
 
 class MicroProfiler:
@@ -59,26 +67,15 @@ class MicroProfiler:
             MicroProfiler._records.clear()
 
 
-import cProfile
-import pstats
-import io
-
-
-import cProfile
-import pstats
-import os
-
-
-
 class DeepProfiler:
     """基于 cProfile 的深度函数调用分析器 (毫秒级高精度输出)"""
 
     _profiler = cProfile.Profile()
     _counter = 0
-    
+
     # 💡 在这里集中配置！
     _target_runs = 30  # 累计抓取多少次后打印
-    _top_n = 100       # 报告显示前多少名 (-1 表示全部显示)
+    _top_n = 100  # 报告显示前多少名 (-1 表示全部显示)
 
     def __enter__(self):
         self._profiler.enable()
@@ -90,7 +87,7 @@ class DeepProfiler:
 
         if DeepProfiler._counter >= DeepProfiler._target_runs:
             ps = pstats.Stats(self._profiler).sort_stats("tottime")
-            
+
             # 💡 新增 1：计算整个剖析区块的单帧平均总耗时
             total_time_ms = ps.total_tt * 1000.0
             avg_frame_time = total_time_ms / DeepProfiler._target_runs
@@ -98,29 +95,29 @@ class DeepProfiler:
             print(f"\n🔬 [DeepProfiler | 累计 {DeepProfiler._target_runs} 帧深度分析 | 显示 Top {DeepProfiler._top_n}]")
             print(f"⏱️  全局单帧平均总耗时 (Avg per frame): {avg_frame_time:.4f} ms")
             print("-" * 120)
-            
+
             # 💡 新增 2：在表头中间插入 'avg/frm(ms)' 列
             header = f"{'ncalls':>10} {'tottime(ms)':>12} {'avg/frm(ms)':>12} {'percall(ms)':>12} {'cumtime(ms)':>12} {'percall(ms)':>12}  {'filename:lineno(function)'}"
             print(header)
 
-            func_list = ps.fcn_list if DeepProfiler._top_n == -1 else ps.fcn_list[:DeepProfiler._top_n]
+            func_list = ps.fcn_list if DeepProfiler._top_n == -1 else ps.fcn_list[: DeepProfiler._top_n]
 
             for func in func_list:
                 cc, nc, tt, ct, callers = ps.stats[func]
 
-                tt_ms = tt * 1000.0  
+                tt_ms = tt * 1000.0
                 ct_ms = ct * 1000.0
-                
+
                 # 💡 新增 3：计算该函数平摊到单帧的平均耗时
                 pf_tt_ms = tt_ms / DeepProfiler._target_runs
-                
+
                 pc_tt_ms = (tt_ms / nc) if nc > 0 else 0.0
                 pc_ct_ms = (ct_ms / cc) if cc > 0 else 0.0
 
                 call_str = str(nc) if nc == cc else f"{nc}/{cc}"
                 file_path, line, func_name = func
                 file_name = os.path.basename(file_path)
-                
+
                 if file_name == "~":
                     func_str = func_name
                 else:
@@ -135,23 +132,37 @@ class DeepProfiler:
             self._profiler.clear()
 
 
-import maya.OpenMaya as om1  # 👈 切回 API 1.0
-
 # 注册类别
 MY_PLUGIN_CATEGORY = om1.MProfiler.addCategory("CythonSkinPlugin", "Cython Nodes")
+
+# ==============================================================================
+# 💡 核心修复：全局字符串保活池
+# 只要字符串被丢进这个 set 里，它的引用计数永远大于 0，绝对不会被 GC 回收。
+# 这样底层 C++ 拿到的指针就永远是有效且清晰的！
+# ==============================================================================
+_ALIVE_STRINGS = set()
+
+def get_safe_string(text):
+    """确保传入的是 str，并强制全局续命"""
+    if not isinstance(text, str):
+        text = str(text)
+    _ALIVE_STRINGS.add(text)
+    return text
 
 
 class MayaNativeProfiler:
     """基于 Maya API 1.0 的原生性能分析器"""
 
     def __init__(self, event_name, color=5):
-        self.event_name = event_name
+        # 1. 把名字丢进保活池，拿到拥有不死之身的 str
+        self.event_name = get_safe_string(event_name)
+        
         # 颜色 ID 推荐: 2(橘红), 5(蓝色), 6(红色), 7(绿色)
         self.color = color
         self.event_id = 0
 
     def __enter__(self):
-        # API 1.0 的调用方式
+        # 2. 直接传原汁原味的 Python str (绝不传 bytes)
         self.event_id = om1.MProfiler.eventBegin(MY_PLUGIN_CATEGORY, self.color, self.event_name)
         return self
 

@@ -7,14 +7,42 @@ import functools
 
 import maya.OpenMaya as om1  # type:ignore
 
-from . import cWeightsCoreCython
-from .cMemoryView import CMemoryManager, ensure_memoryview
-from ._cRegistry import SkinRegistry
 from . import apiundo
+from . import cBrushCoreCython
+from ._cRegistry import SkinRegistry
+from .cMemoryView import CMemoryManager, ensure_memoryview
 
 
 if typing.TYPE_CHECKING:
     from .cSkinDeform import CythonSkinDeformer  # type: ignore
+
+
+def updateDG(func):
+    """
+    触发唯一次 Maya 视口刷新。
+    """
+
+    @functools.wraps(func)
+    def wrapper(self: WeightsManager, *args, **kwargs):
+        # 检查当前是否已经处于某一个 updateDG 的执行周期内
+        is_top_level = not getattr(self, "_is_dg_updating", False)
+
+        # 如果是最外层调用，把门锁死
+        if is_top_level:
+            self._is_dg_updating = True
+
+        try:
+            return func(self, *args, **kwargs)
+        finally:
+            # 只有最外层函数运行完毕，才允许刷新视口
+            if is_top_level:
+                self._is_dg_updating = False  # 先解锁
+
+                # 触发你原本的强制刷新逻辑
+                if hasattr(self, "updateDG") and callable(getattr(self, "updateDG")):
+                    self.updateDG()
+
+    return wrapper
 
 
 class WeightsHandle:
@@ -237,23 +265,6 @@ class WeightsLayerItem:
         return mPlug
 
 
-def updateDG(func):
-    """
-    [装饰器] 方法执行完毕后，强制调用实例的 self.update() 刷新 Maya 视口。
-    无论函数是正常 return 还是引发异常，都能保证 100% 触发。
-    """
-
-    @functools.wraps(func)
-    def wrapper(self: WeightsManager, *args, **kwargs):
-        try:
-            return func(self, *args, **kwargs)
-        finally:
-            # 这里的 self 就是 WeightsManager 实例
-            self.updateDG()
-
-    return wrapper
-
-
 class WeightsManager:
     weights: WeightsHandle = None
     layers: list[WeightsLayerItem] = None
@@ -281,7 +292,6 @@ class WeightsManager:
         """
         # weights
         weights_dataHandle = dataBlock.inputValue(self.cSkin.aWeights)
-        self.handle = weights_dataHandle
         self.weights = WeightsHandle(weights_dataHandle)
 
         # layer
@@ -333,114 +343,6 @@ class WeightsManager:
 
         return None
 
-    @updateDG
-    def set_weights(self, layer_idx, is_mask, vtx_indices, bone_local_indices, weights_1d, backup=True):
-        handle = self.get_handle(layer_idx, is_mask)
-        if handle is None or handle.is_valid is not True:
-            raise RuntimeError(f"{handle} is not valid")
-
-        # --- [入口：统一转为视图] ---
-        v_indices = ensure_memoryview(vtx_indices, "i")
-        b_indices = ensure_memoryview(bone_local_indices, "i")
-        src_view = ensure_memoryview(weights_1d, "f")
-
-        weights = handle.memory.view
-        _int_view = weights.cast("B").cast("i")
-        inf_count = _int_view[1]
-        header_size = 2 + inf_count
-
-        # --- [备份：精准转为独立内存] ---
-        if backup:
-            # 只有开启备份时，才付出转换 array 的开销
-            safe_vtx = array.array("i", v_indices)
-            safe_bone = array.array("i", b_indices)
-            safe_new_weights = array.array("f", src_view)
-
-            # 记录旧数据
-            num_vtx = len(v_indices)
-            num_bones = len(b_indices)
-            backup_values = array.array("f", [0.0] * (num_vtx * num_bones))
-
-            # 写入的同时提取备份
-            for i in range(num_vtx):
-                vtx_id = v_indices[i]
-                row_offset = header_size + vtx_id * inf_count
-                for j in range(num_bones):
-                    dest_idx = row_offset + b_indices[j]
-                    src_idx = i * num_bones + j
-                    backup_values[src_idx] = weights[dest_idx]
-                    weights[dest_idx] = src_view[src_idx]
-
-            # 提交 Undo 闭包 (使用刚才“转”好的安全 array)
-            def redo():
-                self.set_weights(layer_idx, is_mask, safe_vtx, safe_bone, safe_new_weights, backup=False)
-
-            def undo():
-                self.set_weights(layer_idx, is_mask, safe_vtx, safe_bone, backup_values, backup=False)
-
-            apiundo.commit(redo, undo, execute=False)
-            return v_indices, b_indices, backup_values
-
-        else:
-            # --- [快速路径：不备份直接刷] ---
-            for i in range(len(v_indices)):
-                vtx_id = v_indices[i]
-                row_offset = header_size + vtx_id * inf_count
-                for j in range(len(b_indices)):
-                    weights[row_offset + b_indices[j]] = src_view[i * len(b_indices) + j]
-
-        return None, None, None
-
-    @updateDG
-    def set_weights_all(self, layer_idx, is_mask, vtx_count, inf_count, influence_indices, weights_1d, backup=True):
-        handle = self.get_handle(layer_idx, is_mask)
-        if handle is None:
-            return False
-
-        # --- [备份：利用解析好的 safe 视图进行转换] ---
-        if backup:
-            # 1. 获取旧状态 (get_weights 内部已经做好了深拷贝，返回的是绝对安全的 memoryview)
-            old_v, old_i, safe_old_indices_view, safe_old_weights_view = self.get_weights(layer_idx, is_mask)
-
-            safe_new_indices = array.array("i", influence_indices)
-            safe_new_weights = array.array("f", ensure_memoryview(weights_1d, "f"))
-
-            # 3. 注册闭包
-            def redo():
-                self.set_weights_all(layer_idx, is_mask, vtx_count, inf_count, safe_new_indices, safe_new_weights, backup=False)
-
-            def undo():
-                self.set_weights_all(layer_idx, is_mask, old_v, old_i, safe_old_indices_view, safe_old_weights_view, backup=False)
-
-            apiundo.commit(redo, undo, execute=False)
-
-        # 如果传进来的 vtx_count 为 0，说明这是一个“清空图层”或“撤销回到建图层前”的动作！
-        if vtx_count == 0:
-            handle.clear()
-            handle.commit()
-            return True
-
-        # --- [执行：直接利用原始输入写入] ---
-        src_view = ensure_memoryview(weights_1d, "f")
-        total_size = (2 + len(influence_indices)) + (vtx_count * len(influence_indices))
-
-        resized = handle.resize(total_size)
-        if not handle.is_valid:
-            return False
-
-        _view = handle.memory.view
-        _int = _view.cast("B").cast("i")
-
-        _int[0], _int[1] = vtx_count, len(influence_indices)
-        if influence_indices:
-            _int[2 : 2 + len(influence_indices)] = ensure_memoryview(influence_indices, "i")
-
-        _view[2 + len(influence_indices) : total_size] = src_view
-
-        if resized:
-            handle.commit()
-        return True
-
     @staticmethod
     def parse_raw_weights(raw_view):
         """
@@ -467,125 +369,205 @@ class WeightsManager:
         handle = self.get_handle(layer_idx, is_mask)
         if handle is None or not handle.is_valid:
             return None
-        return handle.memory.view[: handle.length]
+        return handle.memory.view
 
-    def get_weights(self, layer_idx: int, is_mask: bool):
+    def _create_processor(self, layer_idx: int, is_mask: bool):
         """
-        获取全部数据的,并统一重新包装为 memoryview 返回。
-        Returns:
-            tuple: (vtx_count: int, influence_count: int,
-                    safe_indices_view: memoryview,
-                    safe_weights_view: memoryview)
+        提取指定图层的物理内存，并为其实例 `SkinWeightProcessor`。
         """
-        raw_view = self.get_raw_weights(layer_idx, is_mask)
-        if raw_view is None:
-            # 如果是空图层，返回安全的、空的 memoryview
-            return 0, 0, memoryview(array.array("i")), memoryview(array.array("f"))
+        _raw_view = self.get_raw_weights(layer_idx, is_mask)
+        if _raw_view is None:
+            return None
 
-        vtx_count, inf_count, inf_indices_view, weights_view = self.parse_raw_weights(raw_view)
+        vtx_count, inf_count, _, weights_1d = self.parse_raw_weights(_raw_view)
 
-        if inf_indices_view is not None and len(inf_indices_view) > 0:
-            safe_indices_view = memoryview(array.array("i", inf_indices_view))
-        else:
-            safe_indices_view = memoryview(array.array("i"))
+        weights_2d = weights_1d.cast("B").cast("f", (vtx_count, inf_count))
 
-        if weights_view is not None and len(weights_view) > 0:
-            safe_weights_view = memoryview(array.array("f", weights_view))
-        else:
-            safe_weights_view = memoryview(array.array("f"))
+        tmp_idx = array.array("i", [0]) * vtx_count
+        tmp_bool = array.array("B", [0]) * vtx_count
+        tmp_locks = array.array("B", [0]) * inf_count
 
-        return vtx_count, inf_count, safe_indices_view, safe_weights_view
+        # 分配 Undo 内存 (先拉平为 1D，再利用 memoryview 强转为 2D)
+        _undo_buffer = array.array("f", [0.0]) * (vtx_count * inf_count)
+        tmp_undo_view = memoryview(_undo_buffer).cast("B").cast("f", shape=(vtx_count, inf_count))
 
-    def bake_to_final_weights(self, vtx_indices: typing.Sequence[int] = None) -> None:
+        processor = cBrushCoreCython.SkinWeightProcessor(
+            weights_2d,
+            memoryview(tmp_idx),
+            memoryview(tmp_bool),
+            memoryview(tmp_locks),
+            tmp_undo_view,
+        )
+        return processor
+
+    @updateDG
+    def set_sparse_data(self, layer_idx: int, is_mask: bool, vtx_indices, channel_indices, sparse_values):
         """
-        [终极调度引擎] 全封闭的图层合并与渲染核心。
+        专供 Undo / Redo 闭包调用。
+        直接使用 C 级覆盖能力还原快照，彻底告别 Python 循环！
         """
-        active_layers: list[WeightsLayerItem] = []
-        combined_bone_set: set[int] = set()
-        vtx_count: int = 0
-
-        # ==========================================
-        # 1. 骨骼并集提取 (Union)
-        # ==========================================
-        for idx, item in self.layers.items():
-            if item.enabled:
-                # 💥 修复 1：去掉了 item.weights 后面的括号，它是一个属性实例！
-                w_handle: WeightsHandle = item.weights
-
-                if w_handle and w_handle.is_valid:
-                    # 💥 修复 2：正确匹配 get_weights 的 4 个返回值！
-                    _vtx_count, _inf_count, inf_indices, _weights_view = w_handle.get_weights()
-
-                    if _vtx_count > 0:
-                        vtx_count = max(vtx_count, _vtx_count)  # 保险起见，取所有图层里最大的顶点数
-                        combined_bone_set.update(inf_indices)
-                        active_layers.append(item)
-
-        if not active_layers or vtx_count == 0:
+        processor = self._create_processor(layer_idx, is_mask)
+        if not processor:
             return
 
-        out_influence_indices = tuple(sorted(list(combined_bone_set)))
-        out_inf_count = len(out_influence_indices)
+        # 撤销时不需要记录新的 Undo 快照，也不需要复杂的模式，直接暴力 Replace (blend_mode=2)
+        processor.set_custom_array(source_values=sparse_values, blend_mode=2, vertex_indices=vtx_indices, channel_indices=channel_indices)
 
-        # ==========================================
-        # 2. 原地重塑 Output Canvas
-        # ==========================================
-        header_size = 2 + out_inf_count
-        weights_size = vtx_count * out_inf_count
-        required_length = header_size + weights_size
+    @updateDG
+    def set_weights(
+        self,
+        layer_idx: int,
+        is_mask: bool,
+        vtx_indices,
+        weights_1d,
+        locked_influence_indices=None,
+        blend_mode: int = 2,  # 0:Add, 1:Sub, 2:Replace, 3:Multiply
+        alpha: float = 1.0,
+        falloff_weights=None,
+        normalize=True,
+        backup: bool = True,
+    ):
+        """
+        将所有输入丢给 Cython 无头引擎，
+        支持加减乘除、透明度混合、蒙版衰减、自动归一化与稀疏撤销。
+        """
+        processor = self._create_processor(layer_idx, is_mask)
+        if not processor:
+            return False
 
-        # 💥 修复 3：resize 现在只返回一个 bool，绝对不能强行解包给多个变量！
-        # 它已经在内部自动更新了 self.weights 的物理指针
-        self.weights.resize(required_length)
+        # 转为 Cython 认识的 memoryview
+        v_view = ensure_memoryview(vtx_indices, "i") if vtx_indices is not None else None
+        b_view = ensure_memoryview(locked_influence_indices, "i") if locked_influence_indices is not None else None
+        src_view = ensure_memoryview(weights_1d, "f")
+        fal_view = ensure_memoryview(falloff_weights, "f") if falloff_weights is not None else None
 
-        _float_view = self.weights.memory.view
-        _int_view = _float_view.cast("B").cast("i")
+        # 开启快照录制
+        if backup:
+            processor.begin_stroke()
 
-        _int_view[0] = vtx_count
-        _int_view[1] = out_inf_count
+        # Cython 执行带混合模式的覆写
+        processor.set_custom_array(source_values=src_view, blend_mode=blend_mode, vertex_indices=v_view, channel_indices=b_view, alpha=alpha, falloff_weights=fal_view)
 
-        # 💥 优化：摒弃 for 循环，直接用你写好的管理器做内存级拷贝
-        if out_inf_count > 0:
-            indices_mgr = CMemoryManager.from_list(list(out_influence_indices), "i")
-            _int_view[2:header_size] = indices_mgr.view
+        # 如果不是mask，覆写后必须进行权重归一化！
+        if not is_mask and normalize:
+            priority = b_view[0] if (b_view is not None and len(b_view) > 0) else -1
+            processor._normalize_weights(v_view, priority)
 
-        # ==========================================
-        # 3. 底漆重置 (Zeroing) - 极速清理幽灵数据
-        # ==========================================
-        if weights_size > 0:
-            # 💥 优化：放弃调用 CMemoryManager.fill，直接用最暴力的底层字节覆写！
-            # 速度远超 Python 循环，且 100% 免疫结构冲突
-            _byte_view = _float_view.cast("B")
-            start_byte = header_size * 4
-            end_byte = required_length * 4
+        #  从快照 提取Undo/Redo 数据
+        if backup:
+            undo_data = processor.end_stroke()
+            if undo_data:
+                mod_vtx, mod_ch, old_sparse, new_sparse = undo_data
 
-            # 用纯二进制的 0 瞬间填满整个 Payload 区
-            _byte_view[start_byte:end_byte] = b"\x00" * (weights_size * 4)
+                def redo():
+                    self.set_sparse_data(layer_idx, is_mask, mod_vtx, mod_ch, new_sparse)
 
-        # ==========================================
-        # 4. Cython 黑盒混合
-        # ==========================================
-        vtx_indices_view = None
-        if vtx_indices is not None and len(vtx_indices) > 0:
-            vtx_indices_view = CMemoryManager.from_list(list(vtx_indices), "i").view
+                def undo():
+                    self.set_sparse_data(layer_idx, is_mask, mod_vtx, mod_ch, old_sparse)
 
-        for item in active_layers:
-            layer_view = item.weights.memory.view
+                apiundo.commit(redo, undo, execute=False)
 
-            m_handle = item.mask
-            mask_view = None
-            if m_handle and m_handle.is_valid and m_handle.length > 0:
-                mask_view = m_handle.memory.view
+        return True
 
-            cWeightsCoreCython.blend_layer_raw_view(
-                _float_view,
-                layer_view,
-                mask_view,
-                1.0,
-                vtx_indices_view,
+    @updateDG
+    def rebuild_layer(self, layer_idx, is_mask, vtx_count, inf_count, influence_indices, weights_1d, backup=True):
+        """
+        [全量重建/覆盖图层]
+        Python 负责重建 Maya 的底层物理内存和结构，然后移交 Cython 引擎进行纯数据的光速覆写。
+        """
+        handle = self.get_handle(layer_idx, is_mask)
+        if handle is None:
+            return False
+
+        # --- [1. 记录图层全量结构快照] ---
+        if backup:
+            old_v_cnt, old_i_cnt, old_g_bones, _, _, old_w_1d = self.get_weights(layer_idx, is_mask)
+
+            safe_new_idx = array.array("i", influence_indices)
+            safe_new_w = array.array("f", ensure_memoryview(weights_1d, "f"))
+
+            def redo():
+                self.rebuild_layer(layer_idx, is_mask, vtx_count, inf_count, safe_new_idx, safe_new_w, backup=False)
+
+            def undo():
+                self.rebuild_layer(layer_idx, is_mask, old_v_cnt, old_i_cnt, old_g_bones, old_w_1d, backup=False)
+
+            apiundo.commit(redo, undo, execute=False)
+
+        if vtx_count == 0:
+            handle.clear()
+            handle.commit()
+            return True
+
+        # --- [2. Python 负责重建底层物理内存与骨骼 Header (搭地基)] ---
+        total_size = (2 + len(influence_indices)) + (vtx_count * len(influence_indices))
+        resized = handle.resize(total_size)
+        if not handle.is_valid:
+            return False
+
+        _view = handle.memory.view
+        _int = _view.cast("B").cast("i")
+        _int[0], _int[1] = vtx_count, len(influence_indices)
+        if influence_indices:
+            _int[2 : 2 + len(influence_indices)] = ensure_memoryview(influence_indices, "i")
+
+        # --- [3. 召唤 Cython 引擎接管纯数据写入 (填数据)] ---
+        processor = self._create_processor(layer_idx, is_mask)
+        if processor:
+            processor.set_custom_array(source_values=ensure_memoryview(weights_1d, "f"), blend_mode=2, vertex_indices=None, channel_indices=None)
+
+        if resized:
+            handle.commit()
+        return True
+
+    def get_weights(self, layer_idx: int, is_mask: bool, vtx_indices=None, bone_local_indices=None):
+        """
+        [提取/复制权重] (统一高级接口)
+        利用底层 Cython 引擎极速抠出指定范围的权重数据，并返回完整的上下文。
+        如果不传索引，默认提取全量数据。
+
+        Returns:
+            tuple: (
+                vtx_count: int,                # 1. 图层总顶点数
+                inf_count: int,                # 2. 图层总骨骼数
+                global_bone_ids: array.array,  # 3. 图层的全局骨骼ID (Header数据)
+                out_vtx_indices: array.array,  # 4. 本次提取对应的顶点局部索引
+                out_bone_indices: array.array, # 5. 本次提取对应的骨骼局部索引
+                weights_1d: array.array        # 6. 本次提取的 1D 纯净权重数据
             )
+        """
+        # 1. 解析基础 Header 结构信息 (顺便获取全局骨骼ID，供 set_weights_all 备份使用)
+        raw_view = self.get_raw_weights(layer_idx, is_mask)
+        if not raw_view:
+            return 0, 0, array.array("i"), array.array("i"), array.array("i"), array.array("f")
 
-        self.weights.commit()
+        v_count, i_count, g_bones_view, _ = self.parse_raw_weights(raw_view)
+        global_bone_ids = array.array("i", g_bones_view) if g_bones_view else array.array("i")
+
+        # 2. 装配无头引擎，利用 C 语言极速提取 1D 权重数据
+        processor = self._create_processor(layer_idx, is_mask)
+        if not processor:
+            return v_count, i_count, global_bone_ids, array.array("i"), array.array("i"), array.array("f")
+
+        v_view = ensure_memoryview(vtx_indices, "i") if vtx_indices is not None else None
+        b_view = ensure_memoryview(bone_local_indices, "i") if bone_local_indices is not None else None
+
+        # Cython 极速返回 1D 纯净数据
+        weights_1d = processor.get_custom_array(v_view, b_view)
+
+        # 3. 智能补全提取范围的上下文索引 (这是最贴心的一步)
+        # 如果你传了 None (要求全量提取)，系统自动帮你生成完整的物理索引数组
+        if vtx_indices is None:
+            out_vtx = array.array("i", range(v_count))
+        else:
+            out_vtx = array.array("i", v_view)
+
+        if bone_local_indices is None:
+            out_bone = array.array("i", range(i_count))
+        else:
+            out_bone = array.array("i", b_view)
+
+        return v_count, i_count, global_bone_ids, out_vtx, out_bone, weights_1d
 
     def updateDG(self):
         self.cSkin.setDirty()

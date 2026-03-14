@@ -45,6 +45,11 @@ class WeightBrushContext(omui.MPxContext):
         self._cursor_normal: om.MVector = None
         self._isPressed = False
 
+        # 笔刷连续性插值状态
+        self._last_mouse_x = None
+        self._last_mouse_y = None
+        self.brush_spacing_pixels = 1.0  # 插值阈值(像素)：越小越连贯，建议 3~5
+
     def toolOnSetup(self, event):
         """工具启动：硬编码测试版，直接抓取 WeightPreview1"""
         try:
@@ -106,71 +111,118 @@ class WeightBrushContext(omui.MPxContext):
             self.manager.teardown()
         self.__init__()
 
+    def _update_ui_cursor_and_refresh(self, result, drawMgr):
+        """专门负责解析结果，更新光标位置，并通知 Maya 刷新画面"""
+        if result is None:
+            self._cursor_pos = None
+        else:
+            hit_pos_obj, hit_normal_obj = result
+            # 将局部命中点转回世界空间，供 doDraw 画圈使用
+            self._cursor_pos = om.MPoint(hit_pos_obj) * self.mesh_dag_path.inclusiveMatrix()
+            inv_transpose_matrix = self.mesh_dag_path.inclusiveMatrixInverse().transpose()
+            self._cursor_normal = om.MVector(hit_normal_obj) * inv_transpose_matrix
+
+        self._refresh_viewport()
+        self._draw_brush_cursor(drawMgr)
+
     # ==============================================================================
     # 🖱️ 鼠标事件路由 (VP2 签名规范)
     # ==============================================================================
     def doPtrMoved(self, event, drawMgr, context):
-        """悬停阶段：仅范围检测与高亮"""
-        self._process_mouse_event(event, drawMgr, stroke_action="hover")
+        """悬停阶段：单次检测与高亮"""
+        x, y = event.position
+        result = self._fire_ray_and_process(x, y, "hover")
+        self._update_ui_cursor_and_refresh(result, drawMgr)
 
     def doPress(self, event, drawMgr, context):
-        """按下阶段：锁定内存，开始第一笔运算"""
+        """按下阶段：锁定内存，记录初始坐标"""
         self._isPressed = True
+        x, y = event.position
+        self._last_mouse_x = x
+        self._last_mouse_y = y
+
         if self.manager:
             self.manager.begin_stroke()
-        self._process_mouse_event(event, drawMgr, stroke_action="press")
+            
+        result = self._fire_ray_and_process(x, y, "press")
+        self._update_ui_cursor_and_refresh(result, drawMgr)
 
     def doDrag(self, event, drawMgr, context):
-        """拖拽阶段：疯狂涂抹"""
-        self._process_mouse_event(event, drawMgr, stroke_action="drag")
+        """拖拽阶段：疯狂涂抹 + 极速补点插值"""
+        curr_x, curr_y = event.position
+
+        # 防御性代码：防止还没按下就触发拖拽
+        if self._last_mouse_x is None or self._last_mouse_y is None:
+            self._last_mouse_x, self._last_mouse_y = curr_x, curr_y
+
+        import math
+        dist_2d = math.hypot(curr_x - self._last_mouse_x, curr_y - self._last_mouse_y)
+
+        last_result = None
+
+        # 🌟 1. 判断是否需要插值补点
+        if dist_2d >= self.brush_spacing_pixels:
+            steps = int(dist_2d / self.brush_spacing_pixels)
+            
+            # 开始补点循环：沿着鼠标轨迹密集开火
+            for i in range(1, steps + 1):
+                t = i / steps
+                interp_x = self._last_mouse_x + (curr_x - self._last_mouse_x) * t
+                interp_y = self._last_mouse_y + (curr_y - self._last_mouse_y) * t
+
+                # 狂暴计算，不刷新UI
+                last_result = self._fire_ray_and_process(interp_x, interp_y, "drag")
+
+            # 更新记忆坐标
+            self._last_mouse_x = curr_x
+            self._last_mouse_y = curr_y
+            
+            # 🌟 2. 循环结束后，统一拿最后一个点的结果去刷新视口 1 次
+            self._update_ui_cursor_and_refresh(last_result, drawMgr)
+
+        else:
+            # 距离太小 (比如只移动了 1 个像素) -> 触发“物理防抖”
+            # 直接无视这次事件，不产生任何开销，拯救 GC！
+            pass
 
     def doRelease(self, event, drawMgr, context):
-        """松开阶段：结束行程，打包 Undo 并提交 Maya DG"""
+        """松开阶段：结束行程"""
         self._isPressed = False
+        self._last_mouse_x = None
+        self._last_mouse_y = None
+        
         if self.manager:
             self.manager.end_stroke()
             self.manager.clear_hit_state()
 
         self._cursor_pos = None
+        self._refresh_viewport() # 离开时最后刷新一次
 
     # ==============================================================================
-    # 🧠 核心事件分发处理器 (极致纯粹版)
+    # 🧠 核心计算分发 (纯数学版，无 UI 刷新开销)
     # ==============================================================================
-    def _process_mouse_event(self, event, drawMgr, stroke_action: str):
-        """将射线计算交给 Manager 的流水线，完全与核心逻辑解耦。"""
+    def _fire_ray_and_process(self, screen_x: float, screen_y: float, stroke_action: str):
+        """只负责发射射线和运算底层权重，返回击中结果，绝对不触发视口重绘"""
         if not self.manager:
-            return
+            return None
 
-        # 1. 视口坐标转局部空间射线
-        x, y = event.position
-        self._view.viewToWorld(x, y, self._ray_source, self._ray_direction)
+        # viewToWorld 严格要求 int 类型的像素坐标
+        ix, iy = int(screen_x), int(screen_y)
+        self._view.viewToWorld(ix, iy, self._ray_source, self._ray_direction)
 
         inv_matrix = self.mesh_dag_path.inclusiveMatrixInverse()
         ray_source_obj = self._ray_source * inv_matrix
         ray_dir_obj = self._ray_direction * inv_matrix
 
-        # 2. 💥 直接呼叫 Manager 的一站式流水线！
-        result = self.manager.process_stroke(tuple(ray_source_obj)[0:3], tuple(ray_dir_obj), stroke_action)
-
-        # 3. 接收结果，准备 UI 光标数据
-        if result is None:
-            self._cursor_pos = None
-
-        else:
-            hit_pos_obj, hit_normal_obj = result
-            # 将局部命中点转回世界空间，供 doDraw 绘制圈圈使用
-            self._cursor_pos = om.MPoint(hit_pos_obj) * self.mesh_dag_path.inclusiveMatrix()
-            inv_transpose_matrix = self.mesh_dag_path.inclusiveMatrixInverse().transpose()
-            self._cursor_normal = om.MVector(hit_normal_obj) * inv_transpose_matrix
-
-        # 4. 通知视口重绘
-        self._refresh_viewport()
-        self._draw_brush_cursor(drawMgr)
+        # 直接呼叫 Manager 的一站式流水线！
+        return self.manager.process_stroke(tuple(ray_source_obj)[0:3], tuple(ray_dir_obj), stroke_action)
+    
 
     def _refresh_viewport(self):
         """触发 Shape 和 3D 视口刷新"""
         if self.preview_shape and not self.preview_shape._mObj.isNull():
             omr.MRenderer.setGeometryDrawDirty(self.preview_shape._mObj, True)
+            pass
         if self._view:
             self._view.refresh(False, False)
 

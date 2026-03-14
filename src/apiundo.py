@@ -11,7 +11,7 @@ Features:
   - 对外仅暴露 `commit` 唯一接口
   - 自带 `execute` 开关，兼容 `立刻执行` 与 `提交但不执行` 双模式。
   - 单文件导入即用，自动完成 Maya Plugin 的静默注册与跨域共享。
-  
+
 Reference:
   - Marcus Ottosson (GitHub: mottosso)开源项目 `apiundo`.
 

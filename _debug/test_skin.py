@@ -17,7 +17,7 @@ gskinReload.reload_all_plugins()
 
 # test file
 cmds.file(maya_file, o=1, f=1)
-
+    
 # convert
 sk_node = "skinCluster1"
 shape = cmds.skinCluster(sk_node, q=1, g=1)[0]
@@ -31,7 +31,8 @@ maya_weights, _ = get_skinWeights(sk_node)
 vertex_count = cmds.polyEvaluate(shape, vertex=True)
 influence_indices = cmds.getAttr(f"{sk_node}.matrix", mi=1)
 manager = wm.WeightsManager.get_manager_from_cSkin(f"{'cSkinDeformer1'}")
-manager.weights._set_weights(vertex_count,2, influence_indices, maya_weights)
+manager.rebuild_layer(-1,0,vertex_count,2, influence_indices, list(maya_weights))
+
 
 
 

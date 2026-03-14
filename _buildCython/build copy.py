@@ -92,7 +92,7 @@ if __name__ == "__main__":
     # 状态 A：正式编译阶段
     if "build_ext" in sys.argv:
         pyx_files = get_relative_files(Path("."), "*.pyx")
-        py_files = get_relative_files(Path("."), "*Cython.py", exclude_list=[CURRENT_SCRIPT.name])
+        py_files = get_relative_files(Path("."), "*ProfilerCython.py", exclude_list=[CURRENT_SCRIPT.name])
 
         # 这里的 shared_config 中的 language="c++" 会被完美传递给 Extension
         all_exts = create_extensions(pyx_files + py_files, **shared_config)
