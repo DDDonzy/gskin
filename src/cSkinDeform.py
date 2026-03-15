@@ -150,30 +150,38 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
             if envelope == 0.0:
                 return
 
-        with MayaNativeProfiler("in/out geo", 2):
-            input_handle = dataBlock.inputArrayValue(ompx.cvar.MPxGeometryFilter_input)
-            input_handle.jumpToElement(multiIndex)
-            input_geom_obj = input_handle.inputValue().child(ompx.cvar.MPxGeometryFilter_inputGeom).asMesh()
-
-            output_handle = dataBlock.outputArrayValue(ompx.cvar.MPxGeometryFilter_outputGeom)
-            output_handle.jumpToElement(multiIndex)
-            output_geom_obj = output_handle.outputValue().asMesh()
+        with MayaNativeProfiler("in-geo", 2):
+            with MayaNativeProfiler("in-dataHandle", 3):
+                input_handle = dataBlock.inputArrayValue(ompx.cvar.MPxGeometryFilter_input)
+                input_handle.jumpToElement(multiIndex)
+                _input_geom_obj = input_handle.inputValue().child(ompx.cvar.MPxGeometryFilter_inputGeom)
+                with MayaNativeProfiler("in-asMesh", 4):
+                    input_geom_obj = _input_geom_obj.asMesh()
+        with MayaNativeProfiler("out-geo", 5):
+            with MayaNativeProfiler("out-dataHandle", 5):
+                output_handle = dataBlock.outputArrayValue(ompx.cvar.MPxGeometryFilter_outputGeom)
+                output_handle.jumpToElement(multiIndex)
+                _output_geom_obj = output_handle.outputValue()
+                with MayaNativeProfiler("out-asMesh", 4):
+                    output_geom_obj = _output_geom_obj.asMesh()
 
             if input_geom_obj.isNull() or output_geom_obj.isNull():
                 return
 
         with MayaNativeProfiler("fnMesh", 3):
-            mFnMesh_in = om1.MFnMesh(input_geom_obj)
-            self.vertex_count = mFnMesh_in.numVertices()
-            rawPoints_original_mgr = cMemoryView.CMemoryManager.from_ptr(int(mFnMesh_in.getRawPoints()), "f", (self.vertex_count * 3,))
-
-            mFnMesh_out = om1.MFnMesh(output_geom_obj)
-            self.rawPoints_output_mgr = cMemoryView.CMemoryManager.from_ptr(int(mFnMesh_out.getRawPoints()), "f", (self.vertex_count * 3,))
-
-            influences_handle = dataBlock.inputArrayValue(self.aInfluenceMatrix)
-            influences_count = influences_handle.elementCount()
+            with MayaNativeProfiler("in-fnMesh", 7):
+                mFnMesh_in = om1.MFnMesh(input_geom_obj)
+                self.vertex_count = mFnMesh_in.numVertices()
+                with MayaNativeProfiler("in-buildBuffer", 5):
+                    rawPoints_original_mgr = cMemoryView.CMemoryManager.from_ptr(int(mFnMesh_in.getRawPoints()), "f", (self.vertex_count * 3,))
+            with MayaNativeProfiler("out-fnMesh", 6):
+                mFnMesh_out = om1.MFnMesh(output_geom_obj)
+                with MayaNativeProfiler("out-buildBuffer", 4):
+                    self.rawPoints_output_mgr = cMemoryView.CMemoryManager.from_ptr(int(mFnMesh_out.getRawPoints()), "f", (self.vertex_count * 3,))
 
         with MayaNativeProfiler("influences allocate", 4):
+            influences_handle = dataBlock.inputArrayValue(self.aInfluenceMatrix)
+            influences_count = influences_handle.elementCount()
             if self.influences_count != influences_count:
                 self.influences_count = influences_count
                 self._influencesMatrix_mgr = cMemoryView.CMemoryManager.allocate("d", (influences_count, 16))
