@@ -398,7 +398,6 @@ class CoreBrushEngine:
         i: cython.int  # 全局循环索引
         j: cython.int  # V2F 局部循环索引
 
-        # 🌟 纯 Python 模式类型注解，摒弃 cdef
         cache_hit: cython.bint = False  # 缓存命中标记
 
         # =====================================================================
