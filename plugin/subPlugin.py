@@ -1,58 +1,58 @@
-import maya.api.OpenMaya as om2
+import maya.api.OpenMaya as om
 import maya.api.OpenMayaUI as omui
 import maya.api.OpenMayaRender as omr
-import maya.api.OpenMayaAnim as oma  # 🌟 新增：用于获取时间
 import ctypes
-import math  # 🌟 新增：用于计算正弦波
+
+
+PLUGIN_VENDOR = "DDDonzy"
+PLUGIN_VERSION = "1.0"
+PLUGIN_API_VERSION = "Any"
 
 
 def maya_useNewAPI():
     pass
 
 
-# 🌟 修改点 1：基类改为 om2.MPxSurfaceShape，并重命名为 TriangleShape
-class TriangleShape(om2.MPxSurfaceShape):
-    id = om2.MTypeId(0x80089)
-    drawDbClassification = "drawdb/subscene/triangleShape"
-    registrantId = "TriangleShapePlugin"
-
-    lineWidthAttr = om2.MObject()
-    pointSizeAttr = om2.MObject()
-
+class RenderData:
     def __init__(self):
-        om2.MPxSurfaceShape.__init__(self)
+        self.line_width = 5.0
+        self.point_size = 15.0
+        self.draw_faces = True
+        self.draw_lines = True
+        self.draw_points = True
 
-    @classmethod
-    def creator(cls):
-        return TriangleShape()
+        # fmt:off
+        self.dirty_vertices_pos   = True
 
-    @classmethod
-    def initialize(cls):
-        # 🌟 2. 创建真正的 Maya 节点属性，暴露在通道盒里！
-        nAttr = om2.MFnNumericAttribute()
+        self.dirty_face_colors    = True
+        self.dirty_line_colors    = True
+        self.dirty_point_colors   = True
 
-        # 创建“线宽”属性 (默认 5.0)
-        cls.lineWidthAttr = nAttr.create("lineWidth", "lw", om2.MFnNumericData.kFloat, 5.0)
-        nAttr.keyable = True  # 允许在通道盒显示并做动画
-        nAttr.storable = True  # 允许保存在 Maya 文件里
-        nAttr.setMin(1.0)  # 最小 1 个像素
-        om2.MPxNode.addAttribute(cls.lineWidthAttr)
+        self.dirty_face_indices   = True
+        self.dirty_line_indices   = True
+        self.dirty_point_indices  = True
+        # fmt:on
 
-        # 创建“点大小”属性 (默认 15.0)
-        cls.pointSizeAttr = nAttr.create("pointSize", "ps", om2.MFnNumericData.kFloat, 15.0)
-        nAttr.keyable = True
-        nAttr.storable = True
-        nAttr.setMin(1.0)
-        om2.MPxNode.addAttribute(cls.pointSizeAttr)
+        self.vertices_pos   = (ctypes.c_float * 9)(00.0, 00.0, 00.0,
+                                                   10.0, 00.0, 00.0, 
+                                                   05.0, 10.0, 00.0)  # fmt:skip
+        self.face_colors    = (ctypes.c_float * 12)(1.0, 0.0, 0.0, 0.1,
+                                                    1.0, 0.0, 1.0, 0.1, 
+                                                    0.0, 1.0, 0.0, 0.1)  # fmt:skip
+        self.line_colors    = (ctypes.c_float * 12)(1.0, 1.0, 1.0, 1.0,
+                                                    0.0, 1.0, 1.0, 1.0, 
+                                                    0.0, 0.0, 1.0, 1.0)  # fmt:skip
+        self.point_colors   = (ctypes.c_float * 12)(0.0, 1.0, 0.0, 1.0,
+                                                    1.0, 0.0, 0.0, 1.0, 
+                                                    1.0, 1.0, 0.0, 1.0)  # fmt:skip
 
-    def isBounded(self):
-        return True
+        self.point_indices = (ctypes.c_uint32 * 3)(0, 1, 2)  # fmt:skip
+        self.face_indices  = (ctypes.c_uint32 * 3)(0, 1, 2)  # fmt:skip
+        self.line_indices  = (ctypes.c_uint32 * 6)(0, 1,
+                                                   1, 2, 
+                                                   2, 0)  # fmt:skip
 
-    def boundingBox(self):
-        return om2.MBoundingBox(om2.MPoint(-100, -100, -100), om2.MPoint(100, 100, 100))
 
-
-# 🌟 修改点 2：必须添加配套的 UI 类 (属于 omui)
 class TriangleShapeUI(omui.MPxSurfaceShapeUI):
     def __init__(self):
         omui.MPxSurfaceShapeUI.__init__(self)
@@ -62,28 +62,129 @@ class TriangleShapeUI(omui.MPxSurfaceShapeUI):
         return TriangleShapeUI()
 
 
+# 🌟 修改点 1：基类改为 om2.MPxSurfaceShape，并重命名为 TriangleShape
+class TriangleShape(om.MPxSurfaceShape):
+    TYPE_ID = om.MTypeId(0x80089)
+    NODE_NAME = "triangleShape"
+    DRAW_REGISTRANT_ID = "TriangleShapeOverride"
+    DRAW_DB_CLASSIFICATION = "drawdb/subscene/triangleShape"
+
+    lineWidthAttr = om.MObject()
+    pointSizeAttr = om.MObject()
+    drawFacesAttr = om.MObject()
+    drawLinesAttr = om.MObject()
+    drawPointsAttr = om.MObject()
+
+    # 🌟 伪输出属性，专门用来触发 compute
+    outDummyAttr = om.MObject()
+
+    def __init__(self):
+        om.MPxSurfaceShape.__init__(self)
+        self.render_data = RenderData()  # 挂载数据中心
+
+    @classmethod
+    def creator(cls):
+        return TriangleShape()
+
+    @classmethod
+    def initialize(cls):
+        # 🌟 2. 创建真正的 Maya 节点属性，暴露在通道盒里！
+        nAttr = om.MFnNumericAttribute()
+
+        # 创建“线宽”属性 (默认 5.0)
+        cls.lineWidthAttr = nAttr.create("lineWidth", "lw", om.MFnNumericData.kFloat, 5.0)
+        nAttr.keyable = True  # 允许在通道盒显示并做动画
+        nAttr.storable = True  # 允许保存在 Maya 文件里
+        nAttr.setMin(0.0)  # 最小 1 个像素
+        om.MPxNode.addAttribute(cls.lineWidthAttr)
+
+        # 创建“点大小”属性 (默认 15.0)
+        cls.pointSizeAttr = nAttr.create("pointSize", "ps", om.MFnNumericData.kFloat, 15.0)
+        nAttr.keyable = True
+        nAttr.storable = True
+        om.MPxNode.addAttribute(cls.pointSizeAttr)
+
+        # 创建“显示面”开关属性 (默认 True)
+        cls.drawFacesAttr = nAttr.create("drawFaces", "df", om.MFnNumericData.kBoolean, True)
+        nAttr.keyable = True
+        nAttr.storable = True
+        om.MPxNode.addAttribute(cls.drawFacesAttr)
+
+        # 创建“显示边”开关属性 (默认 True)
+        cls.drawLinesAttr = nAttr.create("drawLines", "dl", om.MFnNumericData.kBoolean, True)
+        nAttr.keyable = True
+        nAttr.storable = True
+        om.MPxNode.addAttribute(cls.drawLinesAttr)
+
+        # 创建“显示点”开关属性 (默认 True)
+        cls.drawPointsAttr = nAttr.create("drawPoints", "dp", om.MFnNumericData.kBoolean, True)
+        nAttr.keyable = True
+        nAttr.storable = True
+        om.MPxNode.addAttribute(cls.drawPointsAttr)
+
+        # 🌟 3. 创建 Dummy 输出属性并建立依赖图脏数据传播 (Dirty Propagation)
+        cls.outDummyAttr = nAttr.create("outDummy", "od", om.MFnNumericData.kInt, 0)
+        nAttr.writable = False
+        nAttr.storable = False
+        nAttr.hidden = True
+        om.MPxNode.addAttribute(cls.outDummyAttr)
+
+        # 将所有渲染输入属性与 dummy 输出绑定
+        om.MPxNode.attributeAffects(cls.lineWidthAttr, cls.outDummyAttr)
+        om.MPxNode.attributeAffects(cls.pointSizeAttr, cls.outDummyAttr)
+        om.MPxNode.attributeAffects(cls.drawFacesAttr, cls.outDummyAttr)
+        om.MPxNode.attributeAffects(cls.drawLinesAttr, cls.outDummyAttr)
+        om.MPxNode.attributeAffects(cls.drawPointsAttr, cls.outDummyAttr)
+
+    def compute(self, plug, dataBlock):
+        # 🌟 4. 当属性发生改变被拉取时，触发 compute，在此更新数据中心！
+        if plug == TriangleShape.outDummyAttr:
+            self.render_data.line_width = dataBlock.inputValue(TriangleShape.lineWidthAttr).asFloat()
+            self.render_data.point_size = dataBlock.inputValue(TriangleShape.pointSizeAttr).asFloat()
+            self.render_data.draw_faces = dataBlock.inputValue(TriangleShape.drawFacesAttr).asBool()
+            self.render_data.draw_lines = dataBlock.inputValue(TriangleShape.drawLinesAttr).asBool()
+            self.render_data.draw_points = dataBlock.inputValue(TriangleShape.drawPointsAttr).asBool()
+
+            # 🌟 注意：如果以后你在这里加入了控制坐标/颜色的输入属性，
+            # 并在 compute 里修改了 self.render_data.vertices 数组，
+            # 你只需要将对应的阀门打开即可！例如：
+            # self.render_data.dirty_vertices = True
+            # 当前这里只拉取了开关和尺寸，不需要动显存，所以什么都不用标脏。
+
+            # 标记伪输出属性为 Clean
+            # dataBlock.outputValue(TriangleShape.outDummyAttr).setInt(1)
+            dataBlock.outputValue(TriangleShape.outDummyAttr).setClean()
+        else:
+            return om.kUnknownParameter
+
+    def isBounded(self):
+        return True
+
+    def boundingBox(self):
+        return om.MBoundingBox(om.MPoint(-100, -100, -100), om.MPoint(100, 100, 100))
+
+
 class TriangleOverride(omr.MPxSubSceneOverride):
     def __init__(self, obj):
         super(TriangleOverride, self).__init__(obj)
         self.node_obj = obj
 
-        self.item_name = "my_triangle_item"
-        self.item_name_line = "my_triangle_line"  # 🌟 新增：线的名字
-        self.item_name_point = "my_triangle_point"  # 🌟 新增：点的名字
+        self.item_name_face = "my_triangle_face"  # 面的名字
+        self.item_name_line = "my_triangle_line"  # 线的名字
+        self.item_name_point = "my_triangle_point"  # 点的名字
 
-        self.vtx_buffer = None
-        self.norm_buffer = None
-        self.clr_buffer = None
-        self.idx_buffer = None
-        self.vtx_buffer_array = None
+        self.vertex_buffer = None
+        self.color_buffer_face = None
+        self.index_buffer_face = None
+        self.vertex_buffer_array_face = None
 
-        # 🌟 新增：为线和点准备独立的显存池
-        self.clr_buffer_line = None
-        self.clr_buffer_point = None
-        self.idx_buffer_line = None
-        self.idx_buffer_point = None
-        self.vtx_buffer_array_line = None
-        self.vtx_buffer_array_point = None
+        # 为线和点准备独立的显存池
+        self.color_buffer_line = None
+        self.color_buffer_point = None
+        self.index_buffer_line = None
+        self.index_buffer_point = None
+        self.vertex_buffer_array_line = None
+        self.vertex_buffer_array_point = None
 
     @classmethod
     def creator(cls, obj):
@@ -96,26 +197,25 @@ class TriangleOverride(omr.MPxSubSceneOverride):
         return True
 
     def update(self, container, frameContext):
-        render_item = container.find(self.item_name)
-        # 🌟 新增：查找线和点
+        render_item_face = container.find(self.item_name_face)
         render_item_line = container.find(self.item_name_line)
         render_item_point = container.find(self.item_name_point)
 
         shader_mgr = omr.MRenderer.getShaderManager()
 
         # ==========================================
-        # 1. 核心面 (保持你完美的代码不变！)
+        # 🌟 1. 面
         # ==========================================
-        if render_item is None:
-            render_item = omr.MRenderItem.create(self.item_name, omr.MRenderItem.MaterialSceneItem, omr.MGeometry.kTriangles)
-            render_item.setSelectionMask(om2.MSelectionMask("polymesh"))
-            render_item.setDrawMode(omr.MGeometry.kAll)
-            shader = shader_mgr.getStockShader(omr.MShaderManager.k3dCPVSolidShader)
-            render_item.setShader(shader)
-            container.add(render_item)
+        if render_item_face is None:
+            render_item_face = omr.MRenderItem.create(self.item_name_face, omr.MRenderItem.MaterialSceneItem, omr.MGeometry.kTriangles)
+            render_item_face.setSelectionMask(om.MSelectionMask("polymesh"))
+            render_item_face.setDrawMode(omr.MGeometry.kShaded | omr.MGeometry.kTextured)
+            shader = shader_mgr.getStockShader(omr.MShaderManager.k3dCPVSolidShader).clone()
+            render_item_face.setShader(shader)
+            container.add(render_item_face)
 
         # ==========================================
-        # 🌟 2. 装饰线 (免疫点击闪退！)
+        # 🌟 2. 线
         # ==========================================
         if render_item_line is None:
             # 关键：使用 DecorationItem，Maya射线会直接无视它！
@@ -130,7 +230,7 @@ class TriangleOverride(omr.MPxSubSceneOverride):
             container.add(render_item_line)
 
         # ==========================================
-        # 🌟 3. 装饰点 (免疫点击闪退！)
+        # 🌟 3. 点
         # ==========================================
         if render_item_point is None:
             # 关键：使用 DecorationItem！
@@ -138,133 +238,133 @@ class TriangleOverride(omr.MPxSubSceneOverride):
             render_item_point.setDrawMode(omr.MGeometry.kAll)
             render_item_point.setDepthPriority(omr.MRenderItem.sActiveWireDepthPriority)
             # 🌟 5. 同样必须 clone() 胖点着色器
-            shader_pt = shader_mgr.getStockShader(omr.MShaderManager.k3dCPVFatPointShader).clone()
-            render_item_point.setShader(shader_pt)
+            shader_point = shader_mgr.getStockShader(omr.MShaderManager.k3dCPVFatPointShader).clone()
+            render_item_point.setShader(shader_point)
             container.add(render_item_point)
+
+        # ==========================================================
+        # 🌟 阶段 A：提取渲染状态
+        # ==========================================================
+        # 1. 轻量级拉取 dummy 属性触发 DG
+        om.MPlug(self.node_obj, TriangleShape.outDummyAttr).asInt()
+        render_data: RenderData = om.MFnDependencyNode(self.node_obj).userNode().render_data
 
         # ==========================================
         # 显存开辟
         # ==========================================
-        if self.vtx_buffer is None:
-            self.vtx_buffer = omr.MVertexBuffer(omr.MVertexBufferDescriptor("", omr.MGeometry.kPosition, omr.MGeometry.kFloat, 3))
-            self.norm_buffer = omr.MVertexBuffer(omr.MVertexBufferDescriptor("", omr.MGeometry.kNormal, omr.MGeometry.kFloat, 3))
-            self.clr_buffer = omr.MVertexBuffer(omr.MVertexBufferDescriptor("", omr.MGeometry.kColor, omr.MGeometry.kFloat, 4))
-            self.idx_buffer = omr.MIndexBuffer(omr.MGeometry.kUnsignedInt32)
+        if self.vertex_buffer is None:
+            # 1. 共享的顶点坐标显存池
+            self.vertex_buffer = omr.MVertexBuffer(omr.MVertexBufferDescriptor("", omr.MGeometry.kPosition, omr.MGeometry.kFloat, 3))
 
-            self.vtx_buffer_array = omr.MVertexBufferArray()
-            self.vtx_buffer_array.append(self.vtx_buffer, "")
-            self.vtx_buffer_array.append(self.norm_buffer, "")
-            self.vtx_buffer_array.append(self.clr_buffer, "")
+            # 2. 面 (Face) 专属显存及阵列打包
+            self.color_buffer_face = omr.MVertexBuffer(omr.MVertexBufferDescriptor("", omr.MGeometry.kColor, omr.MGeometry.kFloat, 4))
+            self.index_buffer_face = omr.MIndexBuffer(omr.MGeometry.kUnsignedInt32)
+            self.vertex_buffer_array_face = omr.MVertexBufferArray()
+            self.vertex_buffer_array_face.append(self.vertex_buffer, "")
+            self.vertex_buffer_array_face.append(self.color_buffer_face, "")
 
-            # 🌟 新增：为线和点开辟颜色与索引显存
-            self.clr_buffer_line = omr.MVertexBuffer(omr.MVertexBufferDescriptor("", omr.MGeometry.kColor, omr.MGeometry.kFloat, 4))
-            self.clr_buffer_point = omr.MVertexBuffer(omr.MVertexBufferDescriptor("", omr.MGeometry.kColor, omr.MGeometry.kFloat, 4))
-            self.idx_buffer_line = omr.MIndexBuffer(omr.MGeometry.kUnsignedInt32)
-            self.idx_buffer_point = omr.MIndexBuffer(omr.MGeometry.kUnsignedInt32)
+            # 3. 线 (Line) 专属显存及阵列打包
+            self.color_buffer_line = omr.MVertexBuffer(omr.MVertexBufferDescriptor("", omr.MGeometry.kColor, omr.MGeometry.kFloat, 4))
+            self.index_buffer_line = omr.MIndexBuffer(omr.MGeometry.kUnsignedInt32)
+            self.vertex_buffer_array_line = omr.MVertexBufferArray()
+            self.vertex_buffer_array_line.append(self.vertex_buffer, "")
+            self.vertex_buffer_array_line.append(self.color_buffer_line, "")
 
-            # 🌟 新增：打包线和点的阵列 (它们共享你的 vtx_buffer 坐标！)
-            self.vtx_buffer_array_line = omr.MVertexBufferArray()
-            self.vtx_buffer_array_line.append(self.vtx_buffer, "")
-            self.vtx_buffer_array_line.append(self.norm_buffer, "")
-            self.vtx_buffer_array_line.append(self.clr_buffer_line, "")
+            # 4. 点 (Point) 专属显存及阵列打包
+            self.color_buffer_point = omr.MVertexBuffer(omr.MVertexBufferDescriptor("", omr.MGeometry.kColor, omr.MGeometry.kFloat, 4))
+            self.index_buffer_point = omr.MIndexBuffer(omr.MGeometry.kUnsignedInt32)
+            self.vertex_buffer_array_point = omr.MVertexBufferArray()
+            self.vertex_buffer_array_point.append(self.vertex_buffer, "")
+            self.vertex_buffer_array_point.append(self.color_buffer_point, "")
 
-            self.vtx_buffer_array_point = omr.MVertexBufferArray()
-            self.vtx_buffer_array_point.append(self.vtx_buffer, "")
-            self.vtx_buffer_array_point.append(self.norm_buffer, "")
-            self.vtx_buffer_array_point.append(self.clr_buffer_point, "")
-
-        # ==========================================================
-        # 动态写入顶点坐标 (完全没变，共享变形！)
-        # ==========================================================
-        current_time = oma.MAnimControl.currentTime().value
-        dynamic_y = 10.0 + math.sin(current_time * 5.0) * 5.0
-
-        vtx_addr = self.vtx_buffer.acquire(3, True)
-        raw_vtx = (ctypes.c_float * 9)(0.0, 0.0, 0.0,   
-                                       10.0, 0.0, 0.0, 
-                                       5.0, dynamic_y, 0.0)  # fmt:off
-        ctypes.memmove(vtx_addr, ctypes.addressof(raw_vtx), 9 * 4)
-        self.vtx_buffer.commit(vtx_addr)
-
-        # 强写法线
-        norm_addr = self.norm_buffer.acquire(3, True)
-        raw_norm = (ctypes.c_float * 9)(0.0, 0.0, 1.0, 
-                                        0.0, 0.0, 1.0, 
-                                        0.0, 0.0, 1.0)  # fmt:skip
-        ctypes.memmove(norm_addr, ctypes.addressof(raw_norm), 9 * 4)
-        self.norm_buffer.commit(norm_addr)
-
-        # 强写面的颜色
-        clr_addr = self.clr_buffer.acquire(3, True)
-        raw_clr = (ctypes.c_float * 12)(1.0, 0.0, 0.0, 0.10, 
-                                        1.0, 0.0, 1.0, 0.10, 
-                                        0.0, 1.0, 0.0, 0.10)  # fmt:skip
-        ctypes.memmove(clr_addr, ctypes.addressof(raw_clr), 12 * 4)
-        self.clr_buffer.commit(clr_addr)
-
-        # 🌟 强写线的颜色 (例如：全青色)
-        clr_addr_l = self.clr_buffer_line.acquire(3, True)
-        raw_clr_l = (ctypes.c_float * 12)(1.0, 1.0, 1.0, 1.0, 
-                                          0.0, 1.0, 1.0, 1.0, 
-                                          0.0, 0.0, 1.0, 1.0)  # fmt:skip
-        ctypes.memmove(clr_addr_l, ctypes.addressof(raw_clr_l), 12 * 4)
-        self.clr_buffer_line.commit(clr_addr_l)
-
-        # 🌟 强写点的颜色 (例如：全黄色)
-        clr_addr_p = self.clr_buffer_point.acquire(3, True)
-        raw_clr_p = (ctypes.c_float * 12)(0.0, 1.0, 0.0, 1.0, 
-                                          1.0, 0.0, 0.0, 1.0, 
-                                          1.0, 1.0, 0.0, 1.0)  # fmt:skip
-        ctypes.memmove(clr_addr_p, ctypes.addressof(raw_clr_p), 12 * 4)
-        self.clr_buffer_point.commit(clr_addr_p)
-
-        # 强写面的图纸 (3 个索引)
-        idx_addr = self.idx_buffer.acquire(3, True)
-        raw_idx = (ctypes.c_uint32 * 3)(0, 1, 2)
-        ctypes.memmove(idx_addr, ctypes.addressof(raw_idx), 3 * 4)
-        self.idx_buffer.commit(idx_addr)
-
-        # 🌟 强写线的图纸 (6 个索引 = 3 条边)
-        idx_addr_l = self.idx_buffer_line.acquire(6, True)
-        raw_idx_l = (ctypes.c_uint32 * 6)(0, 1, 
-                                          1, 2, 
-                                          2, 0)  # fmt:skip
-        ctypes.memmove(idx_addr_l, ctypes.addressof(raw_idx_l), 6 * 4)
-        self.idx_buffer_line.commit(idx_addr_l)
-
-        # 🌟 强写点的图纸 (3 个索引)
-        idx_addr_p = self.idx_buffer_point.acquire(3, True)
-        raw_idx_p = (ctypes.c_uint32 * 3)(0, 1, 2)
-        ctypes.memmove(idx_addr_p, ctypes.addressof(raw_idx_p), 3 * 4)
-        self.idx_buffer_point.commit(idx_addr_p)
+            # 🌟 核心修复：如果是全新开辟的显存(如撤销删除重建Override、或开启新视口时)
+            # 此时的 GPU 缓冲是空的！必须强制将节点的阀门全部打开，保证基础数据能拷入新缓冲！
+            render_data.dirty_vertices_pos = True
+            render_data.dirty_face_colors = True
+            render_data.dirty_line_colors = True
+            render_data.dirty_point_colors = True
+            render_data.dirty_face_indices = True
+            render_data.dirty_line_indices = True
+            render_data.dirty_point_indices = True
 
         # ==========================================================
-        # 🌟 阶段 B：每帧实时更新着色器参数！
+        # 更新顶点坐标缓冲 (面、线、点共享同一套动画变形)
         # ==========================================================
-        # 获取最新的 render item 引用
-        ri_line_now = container.find(self.item_name_line)
-        ri_point_now = container.find(self.item_name_point)
 
-        # 读取通道盒(Channel Box)里当前的数值
-        # 🌟 修改点 3：这里读取属性时的类名改为 TriangleShape
-        plug_lw = om2.MPlug(self.node_obj, TriangleShape.lineWidthAttr)
-        plug_ps = om2.MPlug(self.node_obj, TriangleShape.pointSizeAttr)
+        # 仅当对应的 dirty 为 True 时，才向 GPU 拷贝！
+        # --- 点位置显存同步 ---
+        if render_data.dirty_vertices_pos:
+            vertex_count = len(render_data.vertices_pos) // 3
+            vertex_addr = self.vertex_buffer.acquire(vertex_count, True)
+            ctypes.memmove(vertex_addr, ctypes.addressof(render_data.vertices_pos), ctypes.sizeof(render_data.vertices_pos))
+            self.vertex_buffer.commit(vertex_addr)
+            render_data.dirty_vertices_pos = False
 
-        current_lw = plug_lw.asFloat()
-        current_ps = plug_ps.asFloat()
+        # --- 面专属显存同步 ---
+        if render_data.dirty_face_colors:
+            color_count = len(render_data.face_colors) // 4
+            color_addr_face = self.color_buffer_face.acquire(color_count, True)
+            ctypes.memmove(color_addr_face, ctypes.addressof(render_data.face_colors), ctypes.sizeof(render_data.face_colors))
+            self.color_buffer_face.commit(color_addr_face)
+            render_data.dirty_face_colors = False
 
-        # 动态修改专属着色器参数！
-        if ri_line_now:
-            ri_line_now.getShader().setParameter("lineWidth", (current_lw, current_lw))
+        if render_data.dirty_face_indices:
+            index_count = len(render_data.face_indices)
+            index_addr_face = self.index_buffer_face.acquire(index_count, True)
+            ctypes.memmove(index_addr_face, ctypes.addressof(render_data.face_indices), ctypes.sizeof(render_data.face_indices))
+            self.index_buffer_face.commit(index_addr_face)
+            render_data.dirty_face_indices = False
 
-        if ri_point_now:
-            ri_point_now.getShader().setParameter("pointSize", (current_ps, current_ps))
+        # --- 线专属显存同步 ---
+        if render_data.dirty_line_colors:
+            color_count = len(render_data.line_colors) // 4
+            color_addr_line = self.color_buffer_line.acquire(color_count, True)
+            ctypes.memmove(color_addr_line, ctypes.addressof(render_data.line_colors), ctypes.sizeof(render_data.line_colors))
+            self.color_buffer_line.commit(color_addr_line)
+            render_data.dirty_line_colors = False
+
+        if render_data.dirty_line_indices:
+            index_count = len(render_data.line_indices)
+            index_addr_line = self.index_buffer_line.acquire(index_count, True)
+            ctypes.memmove(index_addr_line, ctypes.addressof(render_data.line_indices), ctypes.sizeof(render_data.line_indices))
+            self.index_buffer_line.commit(index_addr_line)
+            render_data.dirty_line_indices = False
+
+        # --- 点专属显存同步 ---
+        if render_data.dirty_point_colors:
+            color_count = len(render_data.point_colors) // 4
+            color_addr_point = self.color_buffer_point.acquire(color_count, True)
+            ctypes.memmove(color_addr_point, ctypes.addressof(render_data.point_colors), ctypes.sizeof(render_data.point_colors))
+            self.color_buffer_point.commit(color_addr_point)
+            render_data.dirty_point_colors = False
+
+        if render_data.dirty_point_indices:
+            index_count = len(render_data.point_indices)
+            index_addr_point = self.index_buffer_point.acquire(index_count, True)
+            ctypes.memmove(index_addr_point, ctypes.addressof(render_data.point_indices), ctypes.sizeof(render_data.point_indices))
+            self.index_buffer_point.commit(index_addr_point)
+            render_data.dirty_point_indices = False
+
+        # ==========================================================
+        # 🌟 阶段 B：应用渲染状态到 RenderItem
+        # ==========================================================
+        # 动态修改专属着色器参数及渲染开关！
+        if render_item_face:
+            render_item_face.enable(render_data.draw_faces)
+
+        if render_item_line:
+            render_item_line.getShader().setParameter("lineWidth", (render_data.line_width, render_data.line_width))
+            render_item_line.enable(render_data.draw_lines)
+
+        if render_item_point:
+            render_item_point.getShader().setParameter("pointSize", (render_data.point_size, render_data.point_size))
+            render_item_point.enable(render_data.draw_points)
 
         # 终极绑定通知
-        bbox = om2.MBoundingBox(om2.MPoint(-100, -100, -100), om2.MPoint(100, 100, 100))
-        self.setGeometryForRenderItem(render_item, self.vtx_buffer_array, self.idx_buffer, bbox)
-        self.setGeometryForRenderItem(render_item_line, self.vtx_buffer_array_line, self.idx_buffer_line, bbox)
-        self.setGeometryForRenderItem(render_item_point, self.vtx_buffer_array_point, self.idx_buffer_point, bbox)
+        bbox = om.MBoundingBox(om.MPoint(-100, -100, -100), om.MPoint(100, 100, 100))
+        self.setGeometryForRenderItem(render_item_face, self.vertex_buffer_array_face, self.index_buffer_face, bbox)
+        self.setGeometryForRenderItem(render_item_line, self.vertex_buffer_array_line, self.index_buffer_line, bbox)
+        self.setGeometryForRenderItem(render_item_point, self.vertex_buffer_array_point, self.index_buffer_point, bbox)
 
     def areControlsAllocated(self):
         return False
@@ -273,17 +373,37 @@ class TriangleOverride(omr.MPxSubSceneOverride):
         pass
 
 
-def initializePlugin(obj):
-    plugin = om2.MFnPlugin(obj, "VP2_ZeroCopy_Core", "1.0", "Any")
+def initializePlugin(mObject: om.MObject):
+    plugin: om.MFnPlugin = om.MFnPlugin(
+        mObject,
+        PLUGIN_VENDOR,
+        PLUGIN_VERSION,
+        PLUGIN_API_VERSION,
+    )
 
     # 🌟 修改点 4：改为使用 registerShape，传入 UI 类和表面形状类型
-    plugin.registerShape("triangleShape", TriangleShape.id, TriangleShape.creator, TriangleShape.initialize, TriangleShapeUI.creator, TriangleShape.drawDbClassification)
+    plugin.registerShape(
+        TriangleShape.NODE_NAME,
+        TriangleShape.TYPE_ID,
+        TriangleShape.creator,
+        TriangleShape.initialize,
+        TriangleShapeUI.creator,
+        TriangleShape.DRAW_DB_CLASSIFICATION,
+    )
 
-    omr.MDrawRegistry.registerSubSceneOverrideCreator(TriangleShape.drawDbClassification, TriangleShape.registrantId, TriangleOverride.creator)
+    omr.MDrawRegistry.registerSubSceneOverrideCreator(
+        TriangleShape.DRAW_DB_CLASSIFICATION,
+        TriangleShape.DRAW_REGISTRANT_ID,
+        TriangleOverride.creator,
+    )
 
 
-def uninitializePlugin(obj):
-    plugin = om2.MFnPlugin(obj)
-    omr.MDrawRegistry.deregisterSubSceneOverrideCreator(TriangleShape.drawDbClassification, TriangleShape.registrantId)
-    # 🌟 修改点 5：卸载时注销对应的 ID
-    plugin.deregisterNode(TriangleShape.id)
+def uninitializePlugin(mObject):
+    plugin: om.MFnPlugin = om.MFnPlugin(mObject)
+
+    omr.MDrawRegistry.deregisterSubSceneOverrideCreator(
+        TriangleShape.DRAW_DB_CLASSIFICATION,
+        TriangleShape.DRAW_REGISTRANT_ID,
+    )
+    # 卸载时注销对应的 ID
+    plugin.deregisterNode(TriangleShape.TYPE_ID)
