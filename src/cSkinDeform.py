@@ -94,6 +94,9 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         self.mesh_context = MeshTopologyContext()
         self.brush_context = BrushHitContext()
 
+        # ---
+        self._need_deform = True
+
     def setDirty(self):
         """
         - 用于笔刷调用，提醒Deform，更新权重
@@ -121,16 +124,29 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
             self._bindPreMatrix_is_dirty = True
         elif plug == self.aGeomMatrix:
             self._geoMatrix_is_dirty = True
+
+        weights_plugs = (self.aWeights, self.aLayerCompound, self.aLayerMask, self.aLayerWeights, self.aLayerEnabled, self.aRefresh)
+        if plug in weights_plugs or plug == self.aInfluenceMatrix or plug == self.aBindPreMatrix or plug == self.aGeomMatrix:
+            self._need_deform = True
+
         return super(CythonSkinDeformer, self).setDependentsDirty(plug, dirtyPlugArray)
 
     def preEvaluation(self, context, evaluationNode):
         if context.isNormal():
+            any_input_dirty = False
+
             if evaluationNode.dirtyPlugExists(self.aGeomMatrix):
                 self._geoMatrix_is_dirty = True
+                any_input_dirty = True
+
             if evaluationNode.dirtyPlugExists(self.aInfluenceMatrix):
                 self._influencesMatrix_is_dirty = True
+                any_input_dirty = True
+
             if evaluationNode.dirtyPlugExists(self.aBindPreMatrix):
                 self._bindPreMatrix_is_dirty = True
+                any_input_dirty = True
+
             if (
                 evaluationNode.dirtyPlugExists(self.aWeights)
                 or evaluationNode.dirtyPlugExists(self.aLayerCompound)
@@ -140,6 +156,11 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
                 or evaluationNode.dirtyPlugExists(self.aRefresh)
             ):
                 self._weights_is_dirty = True
+                any_input_dirty = True
+
+            if any_input_dirty:
+                self._need_deform = True
+
         return super(CythonSkinDeformer, self).preEvaluation(context, evaluationNode)
 
     def update_topology(self, mFnMesh: om1.MFnMesh):
@@ -178,6 +199,14 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
             edge_list[i * 2] = om1.MScriptUtil.getInt2ArrayItem(ptr, 0, 0)
             edge_list[i * 2 + 1] = om1.MScriptUtil.getInt2ArrayItem(ptr, 0, 1)
         self.mesh_context.edge_indices = cBufferManager.BufferManager.from_list(edge_list, "i")
+
+    @maya_profile(0, "Compute")
+    def compute(self, *args, **kwargs):
+        if not self._need_deform:
+            return
+        _ = super().compute(*args, **kwargs)
+        self._need_deform = False
+        return _
 
     @maya_profile(0, "Deform")
     def deform(self, dataBlock: om1.MDataBlock, geoIter, localToWorldMatrix, multiIndex):
@@ -292,7 +321,6 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
                 self._translateVector_mgr.view,
                 envelope,
             )
-        print("deform")
 
     @classmethod
     def nodeInitializer(cls):
