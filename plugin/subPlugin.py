@@ -3,6 +3,15 @@ import maya.api.OpenMayaUI as omui
 import maya.api.OpenMayaRender as omr
 import ctypes
 
+# 引入核心计算模块与注册表
+from gskin.src._cRegistry import SkinRegistry
+from gskin.src import cColorCython as cColor
+
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from gskin.src.cSkinDeform import CythonSkinDeformer
 
 PLUGIN_VENDOR = "DDDonzy"
 PLUGIN_VERSION = "1.0"
@@ -21,7 +30,27 @@ class RenderData:
         self.draw_lines = True
         self.draw_points = True
 
+        self.default_draw_faces = False
+        self.default_draw_lines = False
+        self.default_draw_points = False
+
+        # Default Solid Colors
+        self._attr_default_color_face_val = (0.5, 0.5, 0.5, 1.0)
+        self._attr_default_color_line_val = (0.0, 1.0, 0.0, 1.0)
+        self._attr_default_color_point_val = (0.0, 0.0, 1.0, 1.0)
+
+        # New configurable colors (tuples for easier handling)
         # fmt:off
+        self._attr_wire_color_val            = (0.0, 1.0, 1.0, 1.0)
+        self._attr_vertex_color_val          = (1.0, 0.0, 0.0, 1.0)
+        self._attr_mask_remap_a_color_val    = (0.1, 0.1, 0.1, 1.0)  # Default alpha 1.0 from attribute
+        self._attr_mask_remap_b_color_val    = (0.1, 1.0, 0.1, 1.0)  # Default alpha 1.0 from attribute
+        self._attr_weights_remap_a_color_val = (0.0, 0.0, 0.0, 1.0)  # Default alpha 1.0 from attribute
+        self._attr_weights_remap_b_color_val = (1.0, 1.0, 1.0, 1.0)  # Default alpha 1.0 from attribute
+        self._attr_brush_remap_a_color_val   = (1.0, 0.0, 0.0, 1.0)  # Default alpha 1.0 from attribute
+        self._attr_brush_remap_b_color_val   = (1.0, 1.0, 0.0, 1.0)  # Default alpha 1.0 from attribute
+
+        # dirty
         self.dirty_vertices_pos   = True
 
         self.dirty_face_colors    = True
@@ -31,11 +60,12 @@ class RenderData:
         self.dirty_face_indices   = True
         self.dirty_line_indices   = True
         self.dirty_point_indices  = True
-        # fmt:on
 
-        self.vertices_pos   = (ctypes.c_float * 9)(00.0, 00.0, 00.0,
-                                                   10.0, 00.0, 00.0, 
-                                                   05.0, 10.0, 00.0)  # fmt:skip
+
+        # buffer
+        self.vertices_pos   = (ctypes.c_float * 9 )(00.0, 00.0, 00.0,
+                                                    10.0, 00.0, 00.0, 
+                                                    05.0, 10.0, 00.0)  # fmt:skip
         self.face_colors    = (ctypes.c_float * 12)(1.0, 0.0, 0.0, 0.1,
                                                     1.0, 0.0, 1.0, 0.1, 
                                                     0.0, 1.0, 0.0, 0.1)  # fmt:skip
@@ -51,6 +81,7 @@ class RenderData:
         self.line_indices  = (ctypes.c_uint32 * 6)(0, 1,
                                                    1, 2, 
                                                    2, 0)  # fmt:skip
+        # fmt:on
 
 
 class TriangleShapeUI(omui.MPxSurfaceShapeUI):
@@ -69,11 +100,34 @@ class TriangleShape(om.MPxSurfaceShape):
     DRAW_REGISTRANT_ID = "TriangleShapeOverride"
     DRAW_DB_CLASSIFICATION = "drawdb/subscene/triangleShape"
 
+    # 🌟 核心连接与涂抹状态属性
+    cSkinMessageAttr = om.MObject()
+    paintLayerAttr = om.MObject()
+    paintInfluenceAttr = om.MObject()
+    paintMaskAttr = om.MObject()
+    renderModeAttr = om.MObject()
+
     lineWidthAttr = om.MObject()
     pointSizeAttr = om.MObject()
     drawFacesAttr = om.MObject()
     drawLinesAttr = om.MObject()
     drawPointsAttr = om.MObject()
+    wireColorAttr = om.MObject()
+    vertexColorAttr = om.MObject()
+    maskRemapAColorAttr = om.MObject()
+    maskRemapBColorAttr = om.MObject()
+    weightsRemapAColorAttr = om.MObject()
+    weightsRemapBColorAttr = om.MObject()
+    brushRemapAColorAttr = om.MObject()
+    brushRemapBColorAttr = om.MObject()
+
+    # 🌟 Default Solid Items Attributes
+    defaultDrawFacesAttr = om.MObject()
+    defaultDrawLinesAttr = om.MObject()
+    defaultDrawPointsAttr = om.MObject()
+    defaultFaceColorAttr = om.MObject()
+    defaultLineColorAttr = om.MObject()
+    defaultPointColorAttr = om.MObject()
 
     # 🌟 伪输出属性，专门用来触发 compute
     outDummyAttr = om.MObject()
@@ -81,6 +135,8 @@ class TriangleShape(om.MPxSurfaceShape):
     def __init__(self):
         om.MPxSurfaceShape.__init__(self)
         self.render_data = RenderData()  # 挂载数据中心
+        # 预先储存好包围盒，避免每帧重复创建对象
+        self._boundingBox = om.MBoundingBox(om.MPoint(-100, -100, -100), om.MPoint(100, 100, 100))
 
     @classmethod
     def creator(cls):
@@ -90,78 +146,276 @@ class TriangleShape(om.MPxSurfaceShape):
     def initialize(cls):
         # 🌟 2. 创建真正的 Maya 节点属性，暴露在通道盒里！
         nAttr = om.MFnNumericAttribute()
+        eAttr = om.MFnEnumAttribute()
+        mAttr = om.MFnMessageAttribute()
+
+        # 核心 Message 端口
+        TriangleShape.cSkinMessageAttr = mAttr.create("cSkinMessage", "csm")
+        mAttr.storable = False
+        TriangleShape.addAttribute(TriangleShape.cSkinMessageAttr)
+
+        TriangleShape.renderModeAttr = eAttr.create("renderMode", "rm", 0)
+        eAttr.addField("Heatmap", 0)
+        eAttr.addField("Alpha", 1)
+        eAttr.storable = True
+        TriangleShape.addAttribute(TriangleShape.renderModeAttr)
+
+        TriangleShape.paintLayerAttr = nAttr.create("paintLayer", "pal", om.MFnNumericData.kInt, 0)
+        nAttr.storable = True
+        nAttr.channelBox = True
+        TriangleShape.addAttribute(TriangleShape.paintLayerAttr)
+
+        TriangleShape.paintInfluenceAttr = nAttr.create("paintInfluence", "pai", om.MFnNumericData.kInt, 0)
+        nAttr.storable = True
+        nAttr.channelBox = True
+        TriangleShape.addAttribute(TriangleShape.paintInfluenceAttr)
+
+        TriangleShape.paintMaskAttr = nAttr.create("paintMask", "pam", om.MFnNumericData.kBoolean, False)
+        nAttr.storable = True
+        nAttr.channelBox = True
+        TriangleShape.addAttribute(TriangleShape.paintMaskAttr)
 
         # 创建“线宽”属性 (默认 5.0)
-        cls.lineWidthAttr = nAttr.create("lineWidth", "lw", om.MFnNumericData.kFloat, 5.0)
+        TriangleShape.lineWidthAttr = nAttr.create("lineWidth", "lw", om.MFnNumericData.kFloat, 5.0)
         nAttr.keyable = True  # 允许在通道盒显示并做动画
         nAttr.storable = True  # 允许保存在 Maya 文件里
         nAttr.setMin(0.0)  # 最小 1 个像素
-        om.MPxNode.addAttribute(cls.lineWidthAttr)
+        TriangleShape.addAttribute(TriangleShape.lineWidthAttr)
 
         # 创建“点大小”属性 (默认 15.0)
-        cls.pointSizeAttr = nAttr.create("pointSize", "ps", om.MFnNumericData.kFloat, 15.0)
+        TriangleShape.pointSizeAttr = nAttr.create("pointSize", "ps", om.MFnNumericData.kFloat, 15.0)
         nAttr.keyable = True
         nAttr.storable = True
-        om.MPxNode.addAttribute(cls.pointSizeAttr)
+        TriangleShape.addAttribute(TriangleShape.pointSizeAttr)
 
         # 创建“显示面”开关属性 (默认 True)
-        cls.drawFacesAttr = nAttr.create("drawFaces", "df", om.MFnNumericData.kBoolean, True)
+        TriangleShape.drawFacesAttr = nAttr.create("drawFaces", "df", om.MFnNumericData.kBoolean, True)
         nAttr.keyable = True
         nAttr.storable = True
-        om.MPxNode.addAttribute(cls.drawFacesAttr)
+        TriangleShape.addAttribute(TriangleShape.drawFacesAttr)
 
         # 创建“显示边”开关属性 (默认 True)
-        cls.drawLinesAttr = nAttr.create("drawLines", "dl", om.MFnNumericData.kBoolean, True)
+        TriangleShape.drawLinesAttr = nAttr.create("drawLines", "dl", om.MFnNumericData.kBoolean, True)
         nAttr.keyable = True
         nAttr.storable = True
-        om.MPxNode.addAttribute(cls.drawLinesAttr)
+        TriangleShape.addAttribute(TriangleShape.drawLinesAttr)
 
         # 创建“显示点”开关属性 (默认 True)
-        cls.drawPointsAttr = nAttr.create("drawPoints", "dp", om.MFnNumericData.kBoolean, True)
+        TriangleShape.drawPointsAttr = nAttr.create("drawPoints", "dp", om.MFnNumericData.kBoolean, True)
         nAttr.keyable = True
         nAttr.storable = True
-        om.MPxNode.addAttribute(cls.drawPointsAttr)
+        TriangleShape.addAttribute(TriangleShape.drawPointsAttr)
+
+        # 创建 Default 渲染项开关
+        TriangleShape.defaultDrawFacesAttr = nAttr.create("defaultDrawFaces", "ddf", om.MFnNumericData.kBoolean, False)
+        nAttr.keyable = True
+        nAttr.storable = True
+        TriangleShape.addAttribute(TriangleShape.defaultDrawFacesAttr)
+
+        TriangleShape.defaultDrawLinesAttr = nAttr.create("defaultDrawLines", "ddl", om.MFnNumericData.kBoolean, False)
+        nAttr.keyable = True
+        nAttr.storable = True
+        TriangleShape.addAttribute(TriangleShape.defaultDrawLinesAttr)
+
+        TriangleShape.defaultDrawPointsAttr = nAttr.create("defaultDrawPoints", "ddp", om.MFnNumericData.kBoolean, False)
+        nAttr.keyable = True
+        nAttr.storable = True
+        TriangleShape.addAttribute(TriangleShape.defaultDrawPointsAttr)
 
         # 🌟 3. 创建 Dummy 输出属性并建立依赖图脏数据传播 (Dirty Propagation)
-        cls.outDummyAttr = nAttr.create("outDummy", "od", om.MFnNumericData.kInt, 0)
+        TriangleShape.outDummyAttr = nAttr.create("outDummy", "od", om.MFnNumericData.kInt, 0)
         nAttr.writable = False
         nAttr.storable = False
         nAttr.hidden = True
-        om.MPxNode.addAttribute(cls.outDummyAttr)
+        TriangleShape.addAttribute(TriangleShape.outDummyAttr)
+
+        # Helper function to add color attributes
+        def add_color(long_name, short_name, default_rgb):
+            attr = nAttr.createColor(long_name, short_name)
+            nAttr.default = default_rgb
+            nAttr.storable = True
+            nAttr.keyable = True
+            TriangleShape.addAttribute(attr)
+            return attr
+
+        # New color attributes
+        TriangleShape.wireColorAttr = add_color("renderWireColor", "wcl", (0.0, 1.0, 1.0))
+        TriangleShape.vertexColorAttr = add_color("renderVertexColor", "vcl", (1.0, 0.0, 0.0))
+        TriangleShape.maskRemapAColorAttr = add_color("maskRemapAColor", "mra", (0.1, 0.1, 0.1))
+        TriangleShape.maskRemapBColorAttr = add_color("maskRemapBColor", "mrb", (0.1, 1.0, 0.1))
+        TriangleShape.weightsRemapAColorAttr = add_color("weightsRemapAColor", "wra", (0.0, 0.0, 0.0))
+        TriangleShape.weightsRemapBColorAttr = add_color("weightsRemapBColor", "wrb", (1.0, 1.0, 1.0))
+        TriangleShape.brushRemapAColorAttr = add_color("brushRemapAColor", "bra", (1.0, 0.0, 0.0))
+        TriangleShape.brushRemapBColorAttr = add_color("brushRemapBColor", "brb", (1.0, 1.0, 0.0))
+
+        # New Default color attributes
+        TriangleShape.defaultFaceColorAttr = add_color("defaultFaceColor", "dfc", (0.5, 0.5, 0.5))
+        TriangleShape.defaultLineColorAttr = add_color("defaultLineColor", "dlc", (0.0, 1.0, 0.0))
+        TriangleShape.defaultPointColorAttr = add_color("defaultPointColor", "dpc", (0.0, 0.0, 1.0))
+
+        # Add to attributeAffects
+        TriangleShape.attributeAffects(TriangleShape.wireColorAttr, TriangleShape.outDummyAttr)
+        TriangleShape.attributeAffects(TriangleShape.vertexColorAttr, TriangleShape.outDummyAttr)
+        TriangleShape.attributeAffects(TriangleShape.maskRemapAColorAttr, TriangleShape.outDummyAttr)
+        TriangleShape.attributeAffects(TriangleShape.maskRemapBColorAttr, TriangleShape.outDummyAttr)
+        TriangleShape.attributeAffects(TriangleShape.weightsRemapAColorAttr, TriangleShape.outDummyAttr)
+        TriangleShape.attributeAffects(TriangleShape.weightsRemapBColorAttr, TriangleShape.outDummyAttr)
+        TriangleShape.attributeAffects(TriangleShape.brushRemapAColorAttr, TriangleShape.outDummyAttr)
+        TriangleShape.attributeAffects(TriangleShape.brushRemapBColorAttr, TriangleShape.outDummyAttr)
 
         # 将所有渲染输入属性与 dummy 输出绑定
-        om.MPxNode.attributeAffects(cls.lineWidthAttr, cls.outDummyAttr)
-        om.MPxNode.attributeAffects(cls.pointSizeAttr, cls.outDummyAttr)
-        om.MPxNode.attributeAffects(cls.drawFacesAttr, cls.outDummyAttr)
-        om.MPxNode.attributeAffects(cls.drawLinesAttr, cls.outDummyAttr)
-        om.MPxNode.attributeAffects(cls.drawPointsAttr, cls.outDummyAttr)
+        TriangleShape.attributeAffects(TriangleShape.cSkinMessageAttr, TriangleShape.outDummyAttr)
+        TriangleShape.attributeAffects(TriangleShape.renderModeAttr, TriangleShape.outDummyAttr)
+        TriangleShape.attributeAffects(TriangleShape.paintLayerAttr, TriangleShape.outDummyAttr)
+        TriangleShape.attributeAffects(TriangleShape.paintInfluenceAttr, TriangleShape.outDummyAttr)
+        TriangleShape.attributeAffects(TriangleShape.paintMaskAttr, TriangleShape.outDummyAttr)
+
+        TriangleShape.attributeAffects(TriangleShape.lineWidthAttr, TriangleShape.outDummyAttr)
+        TriangleShape.attributeAffects(TriangleShape.pointSizeAttr, TriangleShape.outDummyAttr)
+        TriangleShape.attributeAffects(TriangleShape.drawFacesAttr, TriangleShape.outDummyAttr)
+        TriangleShape.attributeAffects(TriangleShape.drawLinesAttr, TriangleShape.outDummyAttr)
+        TriangleShape.attributeAffects(TriangleShape.wireColorAttr, TriangleShape.outDummyAttr)
+        TriangleShape.attributeAffects(TriangleShape.vertexColorAttr, TriangleShape.outDummyAttr)
+        TriangleShape.attributeAffects(TriangleShape.maskRemapAColorAttr, TriangleShape.outDummyAttr)
+        TriangleShape.attributeAffects(TriangleShape.maskRemapBColorAttr, TriangleShape.outDummyAttr)
+        TriangleShape.attributeAffects(TriangleShape.weightsRemapAColorAttr, TriangleShape.outDummyAttr)
+        TriangleShape.attributeAffects(TriangleShape.weightsRemapBColorAttr, TriangleShape.outDummyAttr)
+        TriangleShape.attributeAffects(TriangleShape.brushRemapAColorAttr, TriangleShape.outDummyAttr)
+        TriangleShape.attributeAffects(TriangleShape.brushRemapBColorAttr, TriangleShape.outDummyAttr)
+        TriangleShape.attributeAffects(TriangleShape.drawPointsAttr, TriangleShape.outDummyAttr)
+
+        TriangleShape.attributeAffects(TriangleShape.defaultDrawFacesAttr, TriangleShape.outDummyAttr)
+        TriangleShape.attributeAffects(TriangleShape.defaultDrawLinesAttr, TriangleShape.outDummyAttr)
+        TriangleShape.attributeAffects(TriangleShape.defaultDrawPointsAttr, TriangleShape.outDummyAttr)
+        TriangleShape.attributeAffects(TriangleShape.defaultFaceColorAttr, TriangleShape.outDummyAttr)
+        TriangleShape.attributeAffects(TriangleShape.defaultLineColorAttr, TriangleShape.outDummyAttr)
+        TriangleShape.attributeAffects(TriangleShape.defaultPointColorAttr, TriangleShape.outDummyAttr)
 
     def compute(self, plug, dataBlock):
-        # 🌟 4. 当属性发生改变被拉取时，触发 compute，在此更新数据中心！
-        if plug == TriangleShape.outDummyAttr:
-            self.render_data.line_width = dataBlock.inputValue(TriangleShape.lineWidthAttr).asFloat()
-            self.render_data.point_size = dataBlock.inputValue(TriangleShape.pointSizeAttr).asFloat()
-            self.render_data.draw_faces = dataBlock.inputValue(TriangleShape.drawFacesAttr).asBool()
-            self.render_data.draw_lines = dataBlock.inputValue(TriangleShape.drawLinesAttr).asBool()
-            self.render_data.draw_points = dataBlock.inputValue(TriangleShape.drawPointsAttr).asBool()
-
-            # 🌟 注意：如果以后你在这里加入了控制坐标/颜色的输入属性，
-            # 并在 compute 里修改了 self.render_data.vertices 数组，
-            # 你只需要将对应的阀门打开即可！例如：
-            # self.render_data.dirty_vertices = True
-            # 当前这里只拉取了开关和尺寸，不需要动显存，所以什么都不用标脏。
-
-            # 标记伪输出属性为 Clean
-            # dataBlock.outputValue(TriangleShape.outDummyAttr).setInt(1)
-            dataBlock.outputValue(TriangleShape.outDummyAttr).setClean()
-        else:
+        if plug != TriangleShape.outDummyAttr:
             return om.kUnknownParameter
+
+        # 1. 扁平化属性读取
+        self.render_data.line_width = dataBlock.inputValue(TriangleShape.lineWidthAttr).asFloat()
+        self.render_data.point_size = dataBlock.inputValue(TriangleShape.pointSizeAttr).asFloat()
+        self.render_data.draw_faces = dataBlock.inputValue(TriangleShape.drawFacesAttr).asBool()
+        self.render_data.draw_lines = dataBlock.inputValue(TriangleShape.drawLinesAttr).asBool()
+        self.render_data.draw_points = dataBlock.inputValue(TriangleShape.drawPointsAttr).asBool()
+        self.render_data._attr_wire_color_val = (*dataBlock.inputValue(TriangleShape.wireColorAttr).asFloat3(), 1.0)
+        self.render_data._attr_vertex_color_val = (*dataBlock.inputValue(TriangleShape.vertexColorAttr).asFloat3(), 1.0)
+        self.render_data._attr_mask_remap_a_color_val = (*dataBlock.inputValue(TriangleShape.maskRemapAColorAttr).asFloat3(), 1.0)
+        self.render_data._attr_mask_remap_b_color_val = (*dataBlock.inputValue(TriangleShape.maskRemapBColorAttr).asFloat3(), 1.0)
+        self.render_data._attr_weights_remap_a_color_val = (*dataBlock.inputValue(TriangleShape.weightsRemapAColorAttr).asFloat3(), 1.0)
+        self.render_data._attr_weights_remap_b_color_val = (*dataBlock.inputValue(TriangleShape.weightsRemapBColorAttr).asFloat3(), 1.0)
+        self.render_data._attr_brush_remap_a_color_val = (*dataBlock.inputValue(TriangleShape.brushRemapAColorAttr).asFloat3(), 1.0)
+        self.render_data._attr_brush_remap_b_color_val = (*dataBlock.inputValue(TriangleShape.brushRemapBColorAttr).asFloat3(), 1.0)
+
+        self.render_data.default_draw_faces = dataBlock.inputValue(TriangleShape.defaultDrawFacesAttr).asBool()
+        self.render_data.default_draw_lines = dataBlock.inputValue(TriangleShape.defaultDrawLinesAttr).asBool()
+        self.render_data.default_draw_points = dataBlock.inputValue(TriangleShape.defaultDrawPointsAttr).asBool()
+        self.render_data._attr_default_color_face_val = (*dataBlock.inputValue(TriangleShape.defaultFaceColorAttr).asFloat3(), 1.0)
+        self.render_data._attr_default_color_line_val = (*dataBlock.inputValue(TriangleShape.defaultLineColorAttr).asFloat3(), 1.0)
+        self.render_data._attr_default_color_point_val = (*dataBlock.inputValue(TriangleShape.defaultPointColorAttr).asFloat3(), 1.0)
+
+        # 2. 扁平化数据同步与渲染调用
+        self._update_from_cSkin(dataBlock)
+
+        # 3. 标记伪输出属性为 Clean
+        dataBlock.outputValue(TriangleShape.outDummyAttr).setClean()
+
+    def _update_from_cSkin(self, dataBlock):
+        """管线接线员：获取上游内存并刷新渲染上下文数据，使用前置判定消灭深层嵌套"""
+        cSkin_plug: om.MPlug = om.MPlug(self.thisMObject(), TriangleShape.cSkinMessageAttr)
+        if not cSkin_plug.isConnected:
+            return
+
+        conns = cSkin_plug.connectedTo(True, False)
+        if not conns:
+            return
+
+        cSkin_node = conns[0].node()
+        cSkin: CythonSkinDeformer = SkinRegistry.get_instance_by_api2(cSkin_node)
+
+        if not cSkin or getattr(cSkin, "mesh_context", None) is None:
+            return
+
+        # 主动将自己挂载到 cSkin 的观察者里，这样它形变完就能顺着网线踢我们一脚刷新
+        cSkin.preview_shape_mObj = self.thisMObject()
+
+        mesh_ctx = cSkin.mesh_context
+        vtx_count = mesh_ctx.vertex_count
+        if vtx_count <= 0:
+            return
+
+        # 1. 核心操作：直接将 CMemoryManager 底层的 ctypes 缓存数组赋值给 RenderData
+        if mesh_ctx.vertex_positions:
+            self.render_data.vertices_pos = mesh_ctx.vertex_positions._cache
+            self.render_data.dirty_vertices_pos = True
+
+        if mesh_ctx.triangle_indices:
+            self.render_data.face_indices = mesh_ctx.triangle_indices._cache
+            self.render_data.dirty_face_indices = True
+            
+        if mesh_ctx.edge_indices:
+            self.render_data.line_indices = mesh_ctx.edge_indices._cache
+            self.render_data.dirty_line_indices = True
+
+        # 2. 动态维护 RenderData 里的颜色和点索引数组大小
+        current_color_len = len(self.render_data.face_colors) // 4
+        if current_color_len != vtx_count:
+            self.render_data.face_colors = (ctypes.c_float * (vtx_count * 4))()
+            self.render_data.line_colors = (ctypes.c_float * (vtx_count * 4))()
+            self.render_data.point_colors = (ctypes.c_float * (vtx_count * 4))()
+            self.render_data.point_indices = (ctypes.c_uint32 * vtx_count)(*range(vtx_count))
+            self.render_data.dirty_point_indices = True
+
+        # 3. 计算颜色：调用 Cython 引擎直接把颜色压入 RenderData 的 ctypes 数组中
+        face_cv = memoryview(self.render_data.face_colors).cast("B").cast("f", shape=(vtx_count, 4))
+        line_cv = memoryview(self.render_data.line_colors).cast("B").cast("f", shape=(vtx_count, 4))
+        point_cv = memoryview(self.render_data.point_colors).cast("B").cast("f", shape=(vtx_count, 4))
+
+        cColor.render_fill(line_cv, self.render_data._attr_wire_color_val)
+        cColor.render_fill(point_cv, self.render_data._attr_vertex_color_val)
+
+        # 获取权重切片
+        weights_view = None
+        if getattr(cSkin, "weights_manager", None):
+            paint_layer = dataBlock.inputValue(TriangleShape.paintLayerAttr).asInt()
+            paint_mask = dataBlock.inputValue(TriangleShape.paintMaskAttr).asBool()
+            _, inf_count, _, safe_weights_view = cSkin.weights_manager.parse_raw_weights(cSkin.weights_manager.get_raw_weights(paint_layer, paint_mask))
+            if inf_count > 0 and safe_weights_view:
+                paint_inf = dataBlock.inputValue(TriangleShape.paintInfluenceAttr).asInt()
+                safe_idx = max(0, min(paint_inf, inf_count - 1))
+                weights_view = safe_weights_view[safe_idx::inf_count]
+
+        # 渲染面片颜色
+        render_mode = dataBlock.inputValue(TriangleShape.renderModeAttr).asInt()
+        paint_mask = dataBlock.inputValue(TriangleShape.paintMaskAttr).asBool()
+        if weights_view is not None:
+            if paint_mask:
+                cColor.render_gradient(weights_view, face_cv, self.render_data._attr_mask_remap_a_color_val, self.render_data._attr_mask_remap_b_color_val)
+            elif render_mode == 1:
+                cColor.render_gradient(weights_view, face_cv, self.render_data._attr_weights_remap_a_color_val, self.render_data._attr_weights_remap_b_color_val)
+            else:
+                cColor.render_heatmap(weights_view, face_cv)
+        else:
+            cColor.render_fill(face_cv, (0.0, 0.0, 1.0, 1.0))
+
+        # 笔刷高亮叠加
+        brush_ctx = getattr(cSkin, "brush_context", None)
+        if brush_ctx and brush_ctx.is_valid:
+            cColor.render_brush_gradient(point_cv, brush_ctx.hit_indices.view, brush_ctx.hit_weights.view, brush_ctx.hit_count, self.render_data._attr_brush_remap_a_color_val, self.render_data._attr_brush_remap_b_color_val)
+
+        # 颜色更新完毕，打上脏标放行
+        self.render_data.dirty_face_colors = True
+        self.render_data.dirty_line_colors = True
+        self.render_data.dirty_point_colors = True
 
     def isBounded(self):
         return True
 
     def boundingBox(self):
-        return om.MBoundingBox(om.MPoint(-100, -100, -100), om.MPoint(100, 100, 100))
+        return self._boundingBox
 
 
 class TriangleOverride(omr.MPxSubSceneOverride):
@@ -172,6 +426,10 @@ class TriangleOverride(omr.MPxSubSceneOverride):
         self.item_name_face = "my_triangle_face"  # 面的名字
         self.item_name_line = "my_triangle_line"  # 线的名字
         self.item_name_point = "my_triangle_point"  # 点的名字
+
+        self.item_name_default_face = "my_default_solid_face"
+        self.item_name_default_line = "my_default_solid_line"
+        self.item_name_default_point = "my_default_solid_point"
 
         self.vertex_buffer = None
         self.color_buffer_face = None
@@ -185,6 +443,8 @@ class TriangleOverride(omr.MPxSubSceneOverride):
         self.index_buffer_point = None
         self.vertex_buffer_array_line = None
         self.vertex_buffer_array_point = None
+
+        self.vertex_buffer_array_default = None
 
     @classmethod
     def creator(cls, obj):
@@ -242,12 +502,49 @@ class TriangleOverride(omr.MPxSubSceneOverride):
             render_item_point.setShader(shader_point)
             container.add(render_item_point)
 
+        # ==========================================
+        # 🌟 Default 纯色面
+        # ==========================================
+        render_item_default_face = container.find(self.item_name_default_face)
+        if render_item_default_face is None:
+            render_item_default_face = omr.MRenderItem.create(self.item_name_default_face, omr.MRenderItem.MaterialSceneItem, omr.MGeometry.kTriangles)
+            render_item_default_face.setSelectionMask(om.MSelectionMask("polymesh"))
+            render_item_default_face.setDrawMode(omr.MGeometry.kShaded | omr.MGeometry.kTextured)
+            shader_default_face = shader_mgr.getStockShader(omr.MShaderManager.k3dSolidShader).clone()
+            render_item_default_face.setShader(shader_default_face)
+            container.add(render_item_default_face)
+
+        # ==========================================
+        # 🌟 Default 纯色线
+        # ==========================================
+        render_item_default_line = container.find(self.item_name_default_line)
+        if render_item_default_line is None:
+            render_item_default_line = omr.MRenderItem.create(self.item_name_default_line, omr.MRenderItem.DecorationItem, omr.MGeometry.kLines)
+            render_item_default_line.setDrawMode(omr.MGeometry.kAll)
+            render_item_default_line.setDepthPriority(omr.MRenderItem.sActiveWireDepthPriority)
+            shader_default_line = shader_mgr.getStockShader(omr.MShaderManager.k3dThickLineShader).clone()
+            render_item_default_line.setShader(shader_default_line)
+            container.add(render_item_default_line)
+
+        # ==========================================
+        # 🌟 Default 纯色点
+        # ==========================================
+        render_item_default_point = container.find(self.item_name_default_point)
+        if render_item_default_point is None:
+            render_item_default_point = omr.MRenderItem.create(self.item_name_default_point, omr.MRenderItem.DecorationItem, omr.MGeometry.kPoints)
+            render_item_default_point.setDrawMode(omr.MGeometry.kAll)
+            render_item_default_point.setDepthPriority(omr.MRenderItem.sActiveWireDepthPriority)
+            shader_default_point = shader_mgr.getStockShader(omr.MShaderManager.k3dFatPointShader).clone()
+            render_item_default_point.setShader(shader_default_point)
+            container.add(render_item_default_point)
+
         # ==========================================================
         # 🌟 阶段 A：提取渲染状态
         # ==========================================================
         # 1. 轻量级拉取 dummy 属性触发 DG
         om.MPlug(self.node_obj, TriangleShape.outDummyAttr).asInt()
-        render_data: RenderData = om.MFnDependencyNode(self.node_obj).userNode().render_data
+        shape_inst: TriangleShape = om.MFnDependencyNode(self.node_obj).userNode()
+        render_data: RenderData = shape_inst.render_data
 
         # ==========================================
         # 显存开辟
@@ -277,7 +574,10 @@ class TriangleOverride(omr.MPxSubSceneOverride):
             self.vertex_buffer_array_point.append(self.vertex_buffer, "")
             self.vertex_buffer_array_point.append(self.color_buffer_point, "")
 
-            # 🌟 核心修复：如果是全新开辟的显存(如撤销删除重建Override、或开启新视口时)
+            # 5. 纯坐标专属阵列打包 (为 default 单色项目准备，不挂载颜色缓冲)
+            self.vertex_buffer_array_default = omr.MVertexBufferArray()
+            self.vertex_buffer_array_default.append(self.vertex_buffer, "")
+
             # 此时的 GPU 缓冲是空的！必须强制将节点的阀门全部打开，保证基础数据能拷入新缓冲！
             render_data.dirty_vertices_pos = True
             render_data.dirty_face_colors = True
@@ -295,76 +595,124 @@ class TriangleOverride(omr.MPxSubSceneOverride):
         # --- 点位置显存同步 ---
         if render_data.dirty_vertices_pos:
             vertex_count = len(render_data.vertices_pos) // 3
-            vertex_addr = self.vertex_buffer.acquire(vertex_count, True)
-            ctypes.memmove(vertex_addr, ctypes.addressof(render_data.vertices_pos), ctypes.sizeof(render_data.vertices_pos))
-            self.vertex_buffer.commit(vertex_addr)
+            if vertex_count > 0:
+                vertex_addr = self.vertex_buffer.acquire(vertex_count, True)
+                if vertex_addr:
+                    ctypes.memmove(vertex_addr, ctypes.addressof(render_data.vertices_pos), ctypes.sizeof(render_data.vertices_pos))
+                    self.vertex_buffer.commit(vertex_addr)
             render_data.dirty_vertices_pos = False
 
         # --- 面专属显存同步 ---
         if render_data.dirty_face_colors:
             color_count = len(render_data.face_colors) // 4
-            color_addr_face = self.color_buffer_face.acquire(color_count, True)
-            ctypes.memmove(color_addr_face, ctypes.addressof(render_data.face_colors), ctypes.sizeof(render_data.face_colors))
-            self.color_buffer_face.commit(color_addr_face)
+            if color_count > 0:
+                color_addr_face = self.color_buffer_face.acquire(color_count, True)
+                if color_addr_face:
+                    ctypes.memmove(color_addr_face, ctypes.addressof(render_data.face_colors), ctypes.sizeof(render_data.face_colors))
+                    self.color_buffer_face.commit(color_addr_face)
             render_data.dirty_face_colors = False
 
         if render_data.dirty_face_indices:
             index_count = len(render_data.face_indices)
-            index_addr_face = self.index_buffer_face.acquire(index_count, True)
-            ctypes.memmove(index_addr_face, ctypes.addressof(render_data.face_indices), ctypes.sizeof(render_data.face_indices))
-            self.index_buffer_face.commit(index_addr_face)
+            if index_count > 0:
+                index_addr_face = self.index_buffer_face.acquire(index_count, True)
+                if index_addr_face:
+                    ctypes.memmove(index_addr_face, ctypes.addressof(render_data.face_indices), ctypes.sizeof(render_data.face_indices))
+                    self.index_buffer_face.commit(index_addr_face)
             render_data.dirty_face_indices = False
 
         # --- 线专属显存同步 ---
         if render_data.dirty_line_colors:
             color_count = len(render_data.line_colors) // 4
-            color_addr_line = self.color_buffer_line.acquire(color_count, True)
-            ctypes.memmove(color_addr_line, ctypes.addressof(render_data.line_colors), ctypes.sizeof(render_data.line_colors))
-            self.color_buffer_line.commit(color_addr_line)
+            if color_count > 0:
+                color_addr_line = self.color_buffer_line.acquire(color_count, True)
+                if color_addr_line:
+                    ctypes.memmove(color_addr_line, ctypes.addressof(render_data.line_colors), ctypes.sizeof(render_data.line_colors))
+                    self.color_buffer_line.commit(color_addr_line)
             render_data.dirty_line_colors = False
 
         if render_data.dirty_line_indices:
             index_count = len(render_data.line_indices)
-            index_addr_line = self.index_buffer_line.acquire(index_count, True)
-            ctypes.memmove(index_addr_line, ctypes.addressof(render_data.line_indices), ctypes.sizeof(render_data.line_indices))
-            self.index_buffer_line.commit(index_addr_line)
+            if index_count > 0:
+                index_addr_line = self.index_buffer_line.acquire(index_count, True)
+                if index_addr_line:
+                    ctypes.memmove(index_addr_line, ctypes.addressof(render_data.line_indices), ctypes.sizeof(render_data.line_indices))
+                    self.index_buffer_line.commit(index_addr_line)
             render_data.dirty_line_indices = False
 
         # --- 点专属显存同步 ---
         if render_data.dirty_point_colors:
             color_count = len(render_data.point_colors) // 4
-            color_addr_point = self.color_buffer_point.acquire(color_count, True)
-            ctypes.memmove(color_addr_point, ctypes.addressof(render_data.point_colors), ctypes.sizeof(render_data.point_colors))
-            self.color_buffer_point.commit(color_addr_point)
+            if color_count > 0:
+                color_addr_point = self.color_buffer_point.acquire(color_count, True)
+                if color_addr_point:
+                    ctypes.memmove(color_addr_point, ctypes.addressof(render_data.point_colors), ctypes.sizeof(render_data.point_colors))
+                    self.color_buffer_point.commit(color_addr_point)
             render_data.dirty_point_colors = False
 
         if render_data.dirty_point_indices:
             index_count = len(render_data.point_indices)
-            index_addr_point = self.index_buffer_point.acquire(index_count, True)
-            ctypes.memmove(index_addr_point, ctypes.addressof(render_data.point_indices), ctypes.sizeof(render_data.point_indices))
-            self.index_buffer_point.commit(index_addr_point)
+            if index_count > 0:
+                index_addr_point = self.index_buffer_point.acquire(index_count, True)
+                if index_addr_point:
+                    ctypes.memmove(index_addr_point, ctypes.addressof(render_data.point_indices), ctypes.sizeof(render_data.point_indices))
+                    self.index_buffer_point.commit(index_addr_point)
             render_data.dirty_point_indices = False
 
         # ==========================================================
         # 🌟 阶段 B：应用渲染状态到 RenderItem
         # ==========================================================
-        # 动态修改专属着色器参数及渲染开关！
+        # 动态修改专属着色器参数及渲染开关！(加入数据判空与长度对齐的终极安全防护)
+        vertex_count = len(render_data.vertices_pos) // 3
+        has_vertices = vertex_count > 0
+
         if render_item_face:
-            render_item_face.enable(render_data.draw_faces)
+            has_faces = has_vertices and (len(render_data.face_indices) > 0)
+            # 🛡️ 安全锁：颜色数组里的点数，必须大于等于顶点数组里的点数！
+            is_color_safe = (len(render_data.face_colors) // 4) >= vertex_count
+            render_item_face.enable(render_data.draw_faces and has_faces and is_color_safe)
 
         if render_item_line:
             render_item_line.getShader().setParameter("lineWidth", (render_data.line_width, render_data.line_width))
-            render_item_line.enable(render_data.draw_lines)
+            has_lines = has_vertices and (len(render_data.line_indices) > 0)
+            # 🛡️ 安全锁：线颜色安全校验
+            is_color_safe = (len(render_data.line_colors) // 4) >= vertex_count
+            render_item_line.enable(render_data.draw_lines and has_lines and is_color_safe)
 
         if render_item_point:
             render_item_point.getShader().setParameter("pointSize", (render_data.point_size, render_data.point_size))
-            render_item_point.enable(render_data.draw_points)
+            has_points = has_vertices and (len(render_data.point_indices) > 0)
+            # 🛡️ 安全锁：点颜色安全校验
+            is_color_safe = (len(render_data.point_colors) // 4) >= vertex_count
+            render_item_point.enable(render_data.draw_points and has_points and is_color_safe)
+
+        # Default 纯色渲染项控制
+        if render_item_default_face:
+            render_item_default_face.getShader().setParameter("solidColor", render_data._attr_default_color_face_val)
+            has_default_faces = has_vertices and (len(render_data.face_indices) > 0)
+            render_item_default_face.enable(render_data.default_draw_faces and has_default_faces)
+
+        if render_item_default_line:
+            render_item_default_line.getShader().setParameter("solidColor", render_data._attr_default_color_line_val)
+            render_item_default_line.getShader().setParameter("lineWidth", (render_data.line_width, render_data.line_width))
+            has_default_lines = has_vertices and (len(render_data.line_indices) > 0)
+            render_item_default_line.enable(render_data.default_draw_lines and has_default_lines)
+
+        if render_item_default_point:
+            render_item_default_point.getShader().setParameter("solidColor", render_data._attr_default_color_point_val)
+            render_item_default_point.getShader().setParameter("pointSize", (render_data.point_size, render_data.point_size))
+            has_default_points = has_vertices and (len(render_data.point_indices) > 0)
+            render_item_default_point.enable(render_data.default_draw_points and has_default_points)
 
         # 终极绑定通知
-        bbox = om.MBoundingBox(om.MPoint(-100, -100, -100), om.MPoint(100, 100, 100))
+        # 交给 Shape 实例直接返回已缓存好的包围盒，避免每帧运算和创建新对象
+        bbox = shape_inst.boundingBox()
         self.setGeometryForRenderItem(render_item_face, self.vertex_buffer_array_face, self.index_buffer_face, bbox)
         self.setGeometryForRenderItem(render_item_line, self.vertex_buffer_array_line, self.index_buffer_line, bbox)
         self.setGeometryForRenderItem(render_item_point, self.vertex_buffer_array_point, self.index_buffer_point, bbox)
+        self.setGeometryForRenderItem(render_item_default_face, self.vertex_buffer_array_default, self.index_buffer_face, bbox)
+        self.setGeometryForRenderItem(render_item_default_line, self.vertex_buffer_array_default, self.index_buffer_line, bbox)
+        self.setGeometryForRenderItem(render_item_default_point, self.vertex_buffer_array_default, self.index_buffer_point, bbox)
 
     def areControlsAllocated(self):
         return False

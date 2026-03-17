@@ -6,10 +6,11 @@ import ctypes
 import maya.OpenMaya as om1  # type:ignore
 import maya.OpenMayaMPx as ompx  # type:ignore
 
-from . import cMemoryView
+from . import cBufferManager
 from .cWeightsManager import WeightsManager
 from . import cSkinDeformCython
 from . import _cRegistry
+from .cSkinContext import MeshTopologyContext, BrushHitContext
 
 # from ._profile import MicroProfiler, DeepProfiler, maya_profile, MayaNativeProfiler
 from ._cProfilerCython import MayaNativeProfiler, maya_profile
@@ -28,7 +29,10 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         "mObject",  # 变形器自身对象
         "mFnDep",  # 依赖图函数集
         "plug_refresh",
-        "weights_manager"
+        "weights_manager",
+        "mesh_context",  # 网格拓扑与坐标上下文
+        "brush_context",  # 笔刷运行状态上下文
+        "preview_shape_mObj",  # 挂载的视口预览节点 (API 2.0 对象)
         # ==========================================
         # 🔴 私有数据 (Private) - 仅供 deform 内部计算使用
         # ==========================================
@@ -56,21 +60,15 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
     aBindPreMatrix = om1.MObject()
     aRefresh = om1.MObject()
 
-    _memory_task_queue = None
-    """
-    任务队列，外部修改dataBlock中的内存数据容易出问题
-    通过`dispatch_memory_task`函数，把外面修改数据的函数，提交到队列，
-    在 `deform` 函数中执行。
-    """
 
     def __init__(self):
         super(CythonSkinDeformer, self).__init__()
 
         # --- 初始化公有数据 ---
         self.vertex_count: int = 0
-        self.rawPoints_output_mgr: "cMemoryView.CMemoryManager" = None
+        self.rawPoints_output_mgr: cBufferManager.BufferManager = None
         self.influences_count: int = 0
-        self.influences_locks_mgr: "cMemoryView.CMemoryManager" = None
+        self.influences_locks_mgr: cBufferManager.BufferManager = None
         self.hashCode: int = None
         self.mObject: om1.MObject = None
         self.mFnDep: om1.MFnDependencyNode = None
@@ -86,14 +84,18 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         self._get_matrix_i = om1.MMatrix()
         self._geo_matrix_is_identity = True
 
-        self._influencesMatrix_mgr: "cMemoryView.CMemoryManager" = None
-        self._bindPreMatrix_mgr: "cMemoryView.CMemoryManager" = None
-        self._rotateMatrix_mgr: "cMemoryView.CMemoryManager" = None
-        self._translateVector_mgr: "cMemoryView.CMemoryManager" = None
+        self._influencesMatrix_mgr: cBufferManager.BufferManager = None
+        self._bindPreMatrix_mgr: cBufferManager.BufferManager = None
+        self._rotateMatrix_mgr: cBufferManager.BufferManager = None
+        self._translateVector_mgr: cBufferManager.BufferManager = None
 
         self.weights_manager = None
         self._skinWeights = None
-        """"""
+
+        # --- 初始化上下文环境 ---
+        self.mesh_context = MeshTopologyContext()
+        self.brush_context = BrushHitContext()
+        self.preview_shape_mObj = None
 
     def setDirty(self):
         """
@@ -143,6 +145,43 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
                 self._weights_is_dirty = True
         return super(CythonSkinDeformer, self).preEvaluation(context, evaluationNode)
 
+    def update_topology(self, mFnMesh: om1.MFnMesh):
+        """
+        🧠 提取并更新基础物理拓扑，存入 mesh_context。
+        仅在首次解算或顶点数发生变化时执行，为笔刷和渲染提供静态拓扑数据。
+        """
+        current_vertex_count    = mFnMesh.numVertices()  # fmt:skip
+        current_edge_count      = mFnMesh.numEdges()  # fmt:skip
+        current_polygon_count   = mFnMesh.numPolygons()  # fmt:skip
+
+        if (self.mesh_context.vertex_count     == current_vertex_count   and
+            self.mesh_context.edge_count       == current_edge_count     and
+            self.mesh_context.polygon_count    == current_polygon_count  and
+            self.mesh_context.triangle_indices is not None):  # fmt:skip
+            # 判断topology是否改变,没有改变直接 return
+            return
+
+        self.mesh_context.vertex_count = current_vertex_count
+        self.mesh_context.edge_count = current_edge_count
+        self.mesh_context.polygon_count = current_polygon_count
+
+        # 1. 提取面 (GPU 面片渲染 & 笔刷 Raycast)
+        tri_counts = om1.MIntArray()
+        tri_indices = om1.MIntArray()
+        mFnMesh.getTriangles(tri_counts, tri_indices)
+        self.mesh_context.triangle_indices = cBufferManager.BufferManager.from_list(list(tri_indices), "i")
+
+        # 2. 提取边 (GPU 线框渲染 & BFS 拓扑引擎)
+        num_edges = mFnMesh.numEdges()
+        edge_list = [0] * (num_edges * 2)
+        util = om1.MScriptUtil()
+        ptr = util.asInt2Ptr()
+        for i in range(num_edges):
+            mFnMesh.getEdgeVertices(i, ptr)
+            edge_list[i * 2] = om1.MScriptUtil.getInt2ArrayItem(ptr, 0, 0)
+            edge_list[i * 2 + 1] = om1.MScriptUtil.getInt2ArrayItem(ptr, 0, 1)
+        self.mesh_context.edge_indices = cBufferManager.BufferManager.from_list(edge_list, "i")
+
     @maya_profile(0, "Deform")
     def deform(self, dataBlock: om1.MDataBlock, geoIter, localToWorldMatrix, multiIndex):
         with MayaNativeProfiler("Envelop", 1):
@@ -173,20 +212,24 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
                 mFnMesh_in = om1.MFnMesh(input_geom_obj)
                 self.vertex_count = mFnMesh_in.numVertices()
                 with MayaNativeProfiler("in-buildBuffer", 5):
-                    rawPoints_original_mgr = cMemoryView.CMemoryManager.from_ptr(int(mFnMesh_in.getRawPoints()), "f", (self.vertex_count * 3,))
+                    rawPoints_original_mgr = cBufferManager.BufferManager.from_ptr(int(mFnMesh_in.getRawPoints()), "f", (self.vertex_count * 3,))
+                with MayaNativeProfiler("in-topology", 1):
+                    self.update_topology(mFnMesh_in)
+
             with MayaNativeProfiler("out-fnMesh", 6):
                 mFnMesh_out = om1.MFnMesh(output_geom_obj)
                 with MayaNativeProfiler("out-buildBuffer", 4):
-                    self.rawPoints_output_mgr = cMemoryView.CMemoryManager.from_ptr(int(mFnMesh_out.getRawPoints()), "f", (self.vertex_count * 3,))
+                    self.rawPoints_output_mgr = cBufferManager.BufferManager.from_ptr(int(mFnMesh_out.getRawPoints()), "f", (self.vertex_count * 3,))
+                    self.mesh_context.vertex_positions = self.rawPoints_output_mgr
 
         with MayaNativeProfiler("influences allocate", 4):
             influences_handle = dataBlock.inputArrayValue(self.aInfluenceMatrix)
             influences_count = influences_handle.elementCount()
             if self.influences_count != influences_count:
                 self.influences_count = influences_count
-                self._influencesMatrix_mgr = cMemoryView.CMemoryManager.allocate("d", (influences_count, 16))
-                self._rotateMatrix_mgr = cMemoryView.CMemoryManager.allocate("f", (influences_count, 9))
-                self._translateVector_mgr = cMemoryView.CMemoryManager.allocate("f", (influences_count, 3))
+                self._influencesMatrix_mgr = cBufferManager.BufferManager.allocate("d", (influences_count, 16))
+                self._rotateMatrix_mgr = cBufferManager.BufferManager.allocate("f", (influences_count, 9))
+                self._translateVector_mgr = cBufferManager.BufferManager.allocate("f", (influences_count, 3))
                 for b in range(influences_count):
                     for i in range(16):
                         self._influencesMatrix_mgr.view[b, i] = 1.0 if (i % 5 == 0) else 0.0
@@ -211,7 +254,7 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
                     bind_m_array = fn_bind_array.array()
                     if bind_m_array.length() > 0:
                         addr_base = int(bind_m_array[0].this)
-                        self._bindPreMatrix_mgr = cMemoryView.CMemoryManager.from_ptr(addr_base, "d", (bind_m_array.length(), 16))
+                        self._bindPreMatrix_mgr = cBufferManager.BufferManager.from_ptr(addr_base, "d", (bind_m_array.length(), 16))
                     self._bindPreMatrix_is_dirty = False
 
         with MayaNativeProfiler("geo matrix", 7):
@@ -253,6 +296,12 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
                 envelope,
             )
 
+        # 💥 触发视口刷新 (通知 subPlugin 更新)
+        if self.preview_shape_mObj is not None:
+            import maya.api.OpenMayaRender as omr
+
+            omr.MRenderer.setGeometryDrawDirty(self.preview_shape_mObj, True)
+
     @classmethod
     def nodeInitializer(cls):
         tAttr, mAttr, nAttr, cAttr = om1.MFnTypedAttribute(), om1.MFnMatrixAttribute(), om1.MFnNumericAttribute(), om1.MFnCompoundAttribute()
@@ -282,8 +331,8 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         cAttr.addChild(cls.aLayerMask)
 
         cls.aRefresh = nAttr.create("cRefresh", "cr", om1.MFnNumericData.kInt, False)
-        nAttr.setKeyable(False)  # 不要让它出现在通道盒里
-        nAttr.setStorable(False)  # 💥 告诉 Maya 这个属性不需要存进文件
+        nAttr.setKeyable(False)
+        nAttr.setStorable(False)
         nAttr.setCached(False)
         for attr in [cls.aGeomMatrix, cls.aWeights, cls.aInfluenceMatrix, cls.aBindPreMatrix, cls.aLayerCompound, cls.aRefresh]:
             cls.addAttribute(attr)

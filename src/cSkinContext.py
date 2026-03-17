@@ -1,7 +1,7 @@
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .cMemoryView import CMemoryManager
+    from .cBufferManager import BufferManager
 
 
 # ==============================================================================
@@ -12,6 +12,8 @@ class MeshTopologyContext:
     """统一的数据结构，包含渲染所需的所有网格数据，包括动态的顶点位置和静态的拓扑。"""
     __slots__ = (
         "vertex_count",
+        "edge_count",
+        "polygon_count",
         "vertex_positions",
         "triangle_indices",
         "edge_indices",
@@ -21,11 +23,13 @@ class MeshTopologyContext:
 
     def __init__(self):
         self.vertex_count: int = 0
-        self.vertex_positions: CMemoryManager = None
-        self.triangle_indices: CMemoryManager = None
-        self.edge_indices: CMemoryManager = None
-        self.adjacency_offsets:CMemoryManager = None
-        self.adjacency_indices:CMemoryManager  = None
+        self.edge_count: int = 0
+        self.polygon_count: int = 0
+        self.vertex_positions: BufferManager = None
+        self.triangle_indices: BufferManager = None
+        self.edge_indices: BufferManager = None
+        self.adjacency_offsets:BufferManager = None
+        self.adjacency_indices:BufferManager  = None
 
 
 class BrushHitContext:
@@ -40,8 +44,8 @@ class BrushHitContext:
 
     def __init__(self):
         self.hit_count    : int            = 0
-        self.hit_indices  : CMemoryManager = None
-        self.hit_weights  : CMemoryManager = None
+        self.hit_indices  : BufferManager = None
+        self.hit_weights  : BufferManager = None
         self.hit_center_position: tuple = (0.0, 0.0, 0.0)
 
     @property

@@ -4,7 +4,7 @@ import typing
 from dataclasses import dataclass
 
 # 统一使用相对路径和模块导入
-from . import cMemoryView
+from . import cBufferManager
 from . import cBrushCoreCython as cBrushCoreCython
 from . import apiundo
 
@@ -73,9 +73,9 @@ class WeightBrushManager:
         # 🛡️ 3. 预分配 Undo/Redo 撤销系统内存池
         # =================================================================
         inf_count = self.cSkin.influences_count if self.cSkin else 1
-        self.modified_vtx_bool_mgr = cMemoryView.CMemoryManager.allocate("B", (vtx_count,))
-        self.modified_vtx_indices_mgr = cMemoryView.CMemoryManager.allocate("i", (vtx_count,))
-        self.undo_buffer_mgr = cMemoryView.CMemoryManager.allocate("f", (vtx_count, inf_count))
+        self.modified_vtx_bool_mgr = cBufferManager.BufferManager.allocate("B", (vtx_count,))
+        self.modified_vtx_indices_mgr = cBufferManager.BufferManager.allocate("i", (vtx_count,))
+        self.undo_buffer_mgr = cBufferManager.BufferManager.allocate("f", (vtx_count, inf_count))
         """ 撤销内存池 [i, j]：一次性预分配全量权重快照空间，用于备份刷写前的原始权重 """
 
         # Stroke 状态
@@ -178,7 +178,7 @@ class WeightBrushManager:
 
         weights_2d = weights_1d.cast("B").cast("f", (vtx_count, influences_count))
         # influence locked indices
-        self._temp_locks_mgr = cMemoryView.CMemoryManager.allocate("B", (influences_count,))
+        self._temp_locks_mgr = cBufferManager.BufferManager.allocate("B", (influences_count,))
 
         self.active_processor = cBrushCoreCython.SkinWeightProcessor(
             weights_2d,

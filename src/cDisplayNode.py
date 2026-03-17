@@ -10,7 +10,7 @@ import maya.api.OpenMayaRender as omr
 from . import cBoundingBoxCython
 
 from . import cColorCython as cColor
-from .cMemoryView import CMemoryManager
+from .cBufferManager import BufferManager
 from ._cRegistry import SkinRegistry
 from .cSkinContext import BrushHitContext, MeshTopologyContext, RenderContext
 
@@ -130,7 +130,7 @@ class WeightGeometryOverride(omr.MPxGeometryOverride):
                         color_buf = data.createVertexBuffer(req)
                         color_addr = color_buf.acquire(vtx_count * 3, True)
                         if color_addr:
-                            color_view = CMemoryManager.from_ptr(color_addr, "f", (vtx_count * 3, 4)).view
+                            color_view = BufferManager.from_ptr(color_addr, "f", (vtx_count * 3, 4)).view
                             weights = self._class_shape.active_paint_weights
 
                             if weights is not None:
@@ -425,7 +425,7 @@ class WeightPreviewShape(om.MPxSurfaceShape):
 
         # 提取三角形索引
         _, tri_vtx_indices = mFnMesh.getTriangles()
-        self.mesh_context.triangle_indices = CMemoryManager.from_list(list(tri_vtx_indices), "i")
+        self.mesh_context.triangle_indices = BufferManager.from_list(list(tri_vtx_indices), "i")
 
         # 提取边索引
         num_edges = mFnMesh.numEdges
@@ -434,7 +434,7 @@ class WeightPreviewShape(om.MPxSurfaceShape):
             p1, p2 = mFnMesh.getEdgeVertices(i)
             edge_indices[i * 2] = p1
             edge_indices[i * 2 + 1] = p2
-        self.mesh_context.edge_indices = CMemoryManager.from_list(edge_indices, "i")
+        self.mesh_context.edge_indices = BufferManager.from_list(edge_indices, "i")
 
     def _update_render_context(self):
         """将前端 Plug 属性同步到 Shape 的本地状态中"""

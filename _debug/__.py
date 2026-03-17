@@ -1,0 +1,45 @@
+from importlib import reload
+
+import maya.cmds as cmds
+import maya.api.OpenMaya as om2
+import maya.api.OpenMayaAnim as oma2
+from gskin.src import cWeightsManager as wm
+
+import gskin._debug.gskinReload as gskinReload
+from gskin._debug.convert import get_skinWeights, convert_skin_to_cSkin
+from gskin.src._cRegistry import SkinRegistry
+
+
+maya_file = r"C:/Users/ext.dxu/Desktop/ng_test.ma"
+
+
+gskinReload.reload_modules_in_path()
+gskinReload.reload_all_plugins()
+
+# test file
+cmds.file(maya_file, o=1, f=1)
+    
+    
+cmds.refresh()
+# convert
+sk_node = "skinCluster1"
+shape = cmds.skinCluster(sk_node, q=1, g=1)[0]
+cSkin = convert_skin_to_cSkin(sk_node)
+
+
+cmds.refresh()
+
+# set weights
+maya_weights, _ = get_skinWeights(sk_node)
+vertex_count = cmds.polyEvaluate(shape, vertex=True)
+influence_indices = cmds.getAttr(f"{sk_node}.matrix", mi=1)
+manager = wm.WeightsManager.get_manager_from_cSkin(f"{'cSkinDeformer1'}")
+manager.rebuild_layer(-1,0,vertex_count,2, influence_indices, list(maya_weights))
+
+
+cmds.createNode("triangleShape")
+
+
+
+cmds.connectAttr("cSkinDeformer1.message","triangleShape1.cSkinMessage")
+

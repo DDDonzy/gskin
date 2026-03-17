@@ -54,7 +54,7 @@ def ensure_bytes(data, typecode="f") -> bytes:
     raise TypeError(f"无法将 {type(data)} 转换为安全的 bytes 备份。")
 
 
-class CMemoryManager:
+class BufferManager:
     """
     一个高效的、零拷贝的内存管理器。
     它负责 C 级别连续内存的申请、生命周期管理和 Pythonic 视图生成。
@@ -83,8 +83,8 @@ class CMemoryManager:
 
     @staticmethod
     def allocate(format_char: str, shape: tuple):
-        instance = CMemoryManager()
-        if format_char not in CMemoryManager._CTYPES_MAP:
+        instance = BufferManager()
+        if format_char not in BufferManager._CTYPES_MAP:
             raise ValueError(f"Unsupported format character: {format_char}")
 
         total_elements = 1
@@ -99,7 +99,7 @@ class CMemoryManager:
             instance.view = memoryview(instance._cache).cast(format_char)
             return instance
 
-        ctype_base = CMemoryManager._CTYPES_MAP[format_char]
+        ctype_base = BufferManager._CTYPES_MAP[format_char]
         instance._cache = (ctype_base * total_elements)()
         instance.ptr = ctypes.addressof(instance._cache)
         instance.format_char = format_char
@@ -109,7 +109,7 @@ class CMemoryManager:
 
     @staticmethod
     def from_list(data_list: list, format_char: str = "f", shape: tuple = None):
-        instance = CMemoryManager()
+        instance = BufferManager()
 
         safe_list = data_list if data_list else []
 
@@ -129,7 +129,7 @@ class CMemoryManager:
         从已存在的内存地址创建一个只读的内存视图管理器。
         注意: 此方法不管理内存的生命周期，调用者需确保该内存地址持续有效。
         """
-        instance = CMemoryManager()
+        instance = BufferManager()
         if not address or not shape:
             return instance
 
@@ -140,7 +140,7 @@ class CMemoryManager:
             return instance
 
         # 1. 计算内存大小和 C 类型
-        ctype_base = CMemoryManager._CTYPES_MAP[format_char]
+        ctype_base = BufferManager._CTYPES_MAP[format_char]
 
         # 2. 从裸指针创建 ctypes 数组 (无拷贝)
         c_array_type = ctype_base * total_elements
@@ -157,13 +157,13 @@ class CMemoryManager:
 
         return instance
 
-    def reshape(self, new_shape: tuple) -> "CMemoryManager":
+    def reshape(self, new_shape: tuple) -> "BufferManager":
         """
         在不改变底层数据的情况下，返回一个具有新维度的内存管理器实例。
         这是一个零拷贝操作。
         """
         # 创建一个新的实例来持有新的视图，但共享底层的 _cache
-        new_instance = CMemoryManager()
+        new_instance = BufferManager()
         new_instance._cache = self._cache  # 共享引用，防止 GC
         new_instance.ptr = self.ptr
         new_instance.format_char = self.format_char

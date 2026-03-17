@@ -10,7 +10,7 @@ import maya.OpenMaya as om1  # type:ignore
 from . import apiundo
 from . import cBrushCoreCython
 from ._cRegistry import SkinRegistry
-from .cMemoryView import CMemoryManager, ensure_memoryview
+from .cBufferManager import BufferManager, ensure_memoryview
 
 
 if typing.TYPE_CHECKING:
@@ -63,7 +63,7 @@ class WeightsHandle:
     mObject_mesh : om1.MObject     = None
     mFnMesh      : om1.MFnMesh     = None
 
-    memory       : CMemoryManager  = None
+    memory       : BufferManager  = None
     """权重数据的底层`CMemoryManager`对象"""
     max_capacity : int             = -1
     """当前寄生 `MFnMesh` 的最大储存数据的长度(也可以理解为预分配数组大小)"""
@@ -149,14 +149,14 @@ class WeightsHandle:
 
         self.max_capacity = _vtx_count * 3  # 预分配数组大小
         _ptr = int(self.mFnMesh.getRawPoints())
-        _full_memory = CMemoryManager.from_ptr(_ptr, "f", (self.max_capacity,))
+        _full_memory = BufferManager.from_ptr(_ptr, "f", (self.max_capacity,))
         _int_view = _full_memory.view.cast("B").cast("i")
 
         self.vtx_count = _int_view[0]  # 内存地址第一个数据是 权重vertex_count:int
         self.influence_count = _int_view[1]  # 内存地址第二个数据是 权重influence_count:int
 
         self.length = (2 + self.influence_count) + (self.vtx_count * self.influence_count)  # 内存有效长度
-        self.memory = CMemoryManager.from_ptr(_ptr, "f", (self.length,))  # 生成 cMemoryManager
+        self.memory = BufferManager.from_ptr(_ptr, "f", (self.length,))  # 生成 cMemoryManager
 
     def _build_mesh_buffer(self, vtx_count: int):
         """
@@ -207,7 +207,7 @@ class WeightsHandle:
             resized = True
 
         if self.mFnMesh is not None:
-            self.memory = CMemoryManager.from_ptr(int(self.mFnMesh.getRawPoints()), "f", (self.length,))
+            self.memory = BufferManager.from_ptr(int(self.mFnMesh.getRawPoints()), "f", (self.length,))
 
         return resized
 
