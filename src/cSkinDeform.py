@@ -32,7 +32,6 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         "weights_manager",
         "mesh_context",  # 网格拓扑与坐标上下文
         "brush_context",  # 笔刷运行状态上下文
-        "preview_shape_mObj",  # 挂载的视口预览节点 (API 2.0 对象)
         # ==========================================
         # 🔴 私有数据 (Private) - 仅供 deform 内部计算使用
         # ==========================================
@@ -59,7 +58,6 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
     aInfluenceMatrix = om1.MObject()
     aBindPreMatrix = om1.MObject()
     aRefresh = om1.MObject()
-
 
     def __init__(self):
         super(CythonSkinDeformer, self).__init__()
@@ -95,7 +93,6 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         # --- 初始化上下文环境 ---
         self.mesh_context = MeshTopologyContext()
         self.brush_context = BrushHitContext()
-        self.preview_shape_mObj = None
 
     def setDirty(self):
         """
@@ -295,12 +292,7 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
                 self._translateVector_mgr.view,
                 envelope,
             )
-
-        # 💥 触发视口刷新 (通知 subPlugin 更新)
-        if self.preview_shape_mObj is not None:
-            import maya.api.OpenMayaRender as omr
-
-            omr.MRenderer.setGeometryDrawDirty(self.preview_shape_mObj, True)
+        print("deform")
 
     @classmethod
     def nodeInitializer(cls):

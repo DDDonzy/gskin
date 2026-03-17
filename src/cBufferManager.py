@@ -2,6 +2,13 @@ import ctypes
 import array
 
 
+__all__ = [
+    "BufferManager",
+    "ensure_bytes",
+    "ensure_memoryview",
+]
+
+
 def ensure_memoryview(data, typecode="f"):
     """
     将输入对象转换为 memoryview。
@@ -62,7 +69,7 @@ class BufferManager:
     """
 
     # --- 优化: 使用 __slots__ 替代 __dict__，提升属性访问速度并降低内存占用 ---
-    __slots__ = ("_cache", "view", "ptr", "format_char", "shape")
+    __slots__ = ("ctypes", "view", "ptr", "format_char", "shape")
 
     _CTYPES_MAP = {
         "d": ctypes.c_double,
@@ -75,11 +82,48 @@ class BufferManager:
 
     def __init__(self):
         """初始化一个空的内存管理器实例。"""
-        self._cache = None
+        self.ctypes = None
         self.view: memoryview = None
         self.ptr: int = 0
         self.format_char: str = ""
         self.shape: tuple = ()
+
+    @staticmethod
+    def auto(data, format_char: str = "f", shape: tuple = None):
+        """
+        [万能路由函数]
+        根据输入对象类型自动选择最优的构建路径：
+        1. 如果是 BufferManager 实例：直接返回。
+        2. 如果是 int：视为内存地址，调用 from_ptr (零拷贝)。
+        3. 如果支持 Buffer 协议 (array, cython memoryview, bytes)：调用 from_buffer (严格零拷贝)。
+        4. 如果是 list/tuple 或 Maya API 1.0 数组：调用 from_list (显式拷贝)。
+        """
+        if data is None:
+            return BufferManager()
+
+        # --- 路径 1: 实例直接穿透 (最快) ---
+        if isinstance(data, BufferManager):
+            return data
+
+        # --- 路径 2: 裸指针 (零拷贝) ---
+        if isinstance(data, int):
+            return BufferManager.from_ptr(data, format_char, shape)
+
+        # --- 路径 3: 显式拷贝路径 (通过类型检测分流，避免 try...except 的开销) ---
+        # 优先拦截不支持 Buffer 协议且需要拷贝的类型（如 list 或 Maya API 1.0 对象）
+        data_type = type(data)
+        if issubclass(data_type, (list, tuple)) or "maya.OpenMaya" in str(data_type):
+            return BufferManager.from_list(data, format_char, shape)
+
+        # --- 路径 4: Buffer 协议桥接 (零拷贝) ---
+        # 适配 array.array, numpy, cython views 等。
+        # 因为绝大多数高性能数据都支持 buffer，进入此路径时发生异常的概率极低。
+        try:
+            return BufferManager.from_buffer(data, format_char, shape)
+        except (TypeError, ValueError):
+            pass
+
+        raise TypeError(f"BufferManager.auto 无法转换输入类型: {data_type}")
 
     @staticmethod
     def allocate(format_char: str, shape: tuple):
@@ -92,35 +136,62 @@ class BufferManager:
             total_elements *= dim
 
         if total_elements <= 0:
-            instance._cache = array.array(format_char)
-            instance.ptr, _ = instance._cache.buffer_info()
+            ctype_base = BufferManager._CTYPES_MAP[format_char]
+            instance.ctypes = (ctype_base * 0)()
+            instance.ptr = ctypes.addressof(instance.ctypes)
             instance.format_char = format_char
             instance.shape = shape
-            instance.view = memoryview(instance._cache).cast(format_char)
+            instance.view = memoryview(instance.ctypes).cast("B").cast(format_char, shape=shape)
             return instance
 
         ctype_base = BufferManager._CTYPES_MAP[format_char]
-        instance._cache = (ctype_base * total_elements)()
-        instance.ptr = ctypes.addressof(instance._cache)
+        instance.ctypes = (ctype_base * total_elements)()
+        instance.ptr = ctypes.addressof(instance.ctypes)
         instance.format_char = format_char
         instance.shape = shape
-        instance.view = memoryview(instance._cache).cast("B").cast(format_char, shape=shape)
+        instance.view = memoryview(instance.ctypes).cast("B").cast(format_char, shape=shape)
         return instance
 
     @staticmethod
     def from_list(data_list: list, format_char: str = "f", shape: tuple = None):
-        instance = BufferManager()
-
         safe_list = data_list if data_list else []
+        count = len(safe_list)
+        final_shape = shape if shape is not None else (count,)
 
-        instance._cache = array.array(format_char, safe_list)
-        instance.ptr, _ = instance._cache.buffer_info()
+        # 统一使用 allocate，确保 ctypes 永远是 ctypes 对象
+        instance = BufferManager.allocate(format_char, final_shape)
+        if count > 0:
+            # ctypes 数组支持高效的切片批量赋值
+            instance.ctypes[:] = safe_list
+        return instance
+
+    @staticmethod
+    def from_buffer(data, format_char: str, shape: tuple = None):
+        """
+        [严格零拷贝] 将支持 Buffer 协议的对象 (如 array.array 或 Cython 返回的数组)
+        包装为 BufferManager。它会确保底层的 ctypes 是 ctypes 对象，
+        从而兼容 ctypes.addressof()，同时与原数据共享内存。
+
+        注意：如果 data 不支持可写 buffer 协议，将抛出 TypeError。
+        """
+        if data is None:
+            return BufferManager()
+
+        # 1. 探测字节大小
+        mv = memoryview(data)
+        ctype_base = BufferManager._CTYPES_MAP[format_char]
+        item_size = ctypes.sizeof(ctype_base)
+        num_elements = mv.nbytes // item_size
+
+        instance = BufferManager()
         instance.format_char = format_char
+        instance.shape = shape if shape is not None else (num_elements,)
 
-        final_shape = shape if shape is not None else (len(safe_list),)
-        instance.shape = final_shape
-        instance.view = memoryview(instance._cache).cast("B").cast(format_char, shape=final_shape)
+        # 2. 核心魔法：严格执行零拷贝包装。身份转换为原生的 ctypes 数组。
+        instance.ctypes = (ctype_base * num_elements).from_buffer(data)
 
+        instance.ptr = ctypes.addressof(instance.ctypes)
+        instance.view = memoryview(instance.ctypes).cast("B").cast(format_char, shape=instance.shape)
         return instance
 
     @staticmethod
@@ -144,7 +215,7 @@ class BufferManager:
 
         # 2. 从裸指针创建 ctypes 数组 (无拷贝)
         c_array_type = ctype_base * total_elements
-        instance._cache = c_array_type.from_address(address)
+        instance.ctypes = c_array_type.from_address(address)
 
         # 3. 记录基础信息
         instance.ptr = address
@@ -153,7 +224,7 @@ class BufferManager:
 
         # 4. 生成零拷贝视图
         # 💥 优化: ctypes 对象原生支持 memoryview 协议，无需二次转换
-        instance.view = memoryview(instance._cache).cast("B").cast(format_char, shape=shape)
+        instance.view = memoryview(instance.ctypes).cast("B").cast(format_char, shape=shape)
 
         return instance
 
@@ -162,9 +233,9 @@ class BufferManager:
         在不改变底层数据的情况下，返回一个具有新维度的内存管理器实例。
         这是一个零拷贝操作。
         """
-        # 创建一个新的实例来持有新的视图，但共享底层的 _cache
+        # 创建一个新的实例来持有新的视图，但共享底层的 ctypes 对象引用
         new_instance = BufferManager()
-        new_instance._cache = self._cache  # 共享引用，防止 GC
+        new_instance.ctypes = self.ctypes  # 共享引用，防止 GC
         new_instance.ptr = self.ptr
         new_instance.format_char = self.format_char
         new_instance.shape = new_shape
@@ -202,6 +273,22 @@ class BufferManager:
             to_fill = min(filled, total_elements - filled)
             ctypes.memmove(self.ptr + filled * element_size, self.ptr, to_fill * element_size)
             filled += to_fill
+
+    @property
+    def nbytes(self) -> int:
+        """获取缓冲区总字节数"""
+        return self.view.nbytes if self.view else 0
+
+    def copy_to(self, dest_ptr: int):
+        """
+        [极速拷贝] 将当前缓冲区的内容拷贝到指定的内存地址。
+        常用于将数据从 CPU 内存同步到 GPU 映射的地址。
+        """
+        if not self.ptr or not dest_ptr:
+            return
+        sz = self.view.nbytes
+        if sz > 0:
+            ctypes.memmove(dest_ptr, self.ptr, sz)
 
     def __repr__(self) -> str:
         return f"<CMemoryManager ptr=0x{self.ptr:X} format='{self.format_char}' shape={self.shape}>"

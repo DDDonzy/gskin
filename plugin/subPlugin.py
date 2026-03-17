@@ -101,11 +101,11 @@ class TriangleShape(om.MPxSurfaceShape):
     DRAW_DB_CLASSIFICATION = "drawdb/subscene/triangleShape"
 
     # 🌟 核心连接与涂抹状态属性
-    cSkinMessageAttr = om.MObject()
     paintLayerAttr = om.MObject()
     paintInfluenceAttr = om.MObject()
     paintMaskAttr = om.MObject()
     renderModeAttr = om.MObject()
+    inMeshAttr = om.MObject()
 
     lineWidthAttr = om.MObject()
     pointSizeAttr = om.MObject()
@@ -147,12 +147,7 @@ class TriangleShape(om.MPxSurfaceShape):
         # 🌟 2. 创建真正的 Maya 节点属性，暴露在通道盒里！
         nAttr = om.MFnNumericAttribute()
         eAttr = om.MFnEnumAttribute()
-        mAttr = om.MFnMessageAttribute()
-
-        # 核心 Message 端口
-        TriangleShape.cSkinMessageAttr = mAttr.create("cSkinMessage", "csm")
-        mAttr.storable = False
-        TriangleShape.addAttribute(TriangleShape.cSkinMessageAttr)
+        tAttr = om.MFnTypedAttribute()
 
         TriangleShape.renderModeAttr = eAttr.create("renderMode", "rm", 0)
         eAttr.addField("Heatmap", 0)
@@ -174,6 +169,12 @@ class TriangleShape(om.MPxSurfaceShape):
         nAttr.storable = True
         nAttr.channelBox = True
         TriangleShape.addAttribute(TriangleShape.paintMaskAttr)
+
+        # 创建“输入网格”属性，用于替代以前的 message 连接查找 cSkinDeform
+        TriangleShape.inMeshAttr = tAttr.create("inputMesh", "ipm", om.MFnData.kMesh)
+        tAttr.storable = False
+        tAttr.writable = True
+        TriangleShape.addAttribute(TriangleShape.inMeshAttr)
 
         # 创建“线宽”属性 (默认 5.0)
         TriangleShape.lineWidthAttr = nAttr.create("lineWidth", "lw", om.MFnNumericData.kFloat, 5.0)
@@ -264,8 +265,9 @@ class TriangleShape(om.MPxSurfaceShape):
         TriangleShape.attributeAffects(TriangleShape.brushRemapBColorAttr, TriangleShape.outDummyAttr)
 
         # 将所有渲染输入属性与 dummy 输出绑定
-        TriangleShape.attributeAffects(TriangleShape.cSkinMessageAttr, TriangleShape.outDummyAttr)
+        TriangleShape.attributeAffects(TriangleShape.inMeshAttr, TriangleShape.outDummyAttr)
         TriangleShape.attributeAffects(TriangleShape.renderModeAttr, TriangleShape.outDummyAttr)
+
         TriangleShape.attributeAffects(TriangleShape.paintLayerAttr, TriangleShape.outDummyAttr)
         TriangleShape.attributeAffects(TriangleShape.paintInfluenceAttr, TriangleShape.outDummyAttr)
         TriangleShape.attributeAffects(TriangleShape.paintMaskAttr, TriangleShape.outDummyAttr)
@@ -292,9 +294,9 @@ class TriangleShape(om.MPxSurfaceShape):
         TriangleShape.attributeAffects(TriangleShape.defaultPointColorAttr, TriangleShape.outDummyAttr)
 
     def compute(self, plug, dataBlock):
-        if plug != TriangleShape.outDummyAttr:
-            return om.kUnknownParameter
-
+        print("compute")
+        # if plug != TriangleShape.outDummyAttr:
+        #     return
         # 1. 扁平化属性读取
         self.render_data.line_width = dataBlock.inputValue(TriangleShape.lineWidthAttr).asFloat()
         self.render_data.point_size = dataBlock.inputValue(TriangleShape.pointSizeAttr).asFloat()
@@ -321,11 +323,12 @@ class TriangleShape(om.MPxSurfaceShape):
         self._update_from_cSkin(dataBlock)
 
         # 3. 标记伪输出属性为 Clean
+        # dataBlock.outputValue(TriangleShape.outDummyAttr).setInt(dataBlock.outputValue(TriangleShape.outDummyAttr).asInt() + 1)
         dataBlock.outputValue(TriangleShape.outDummyAttr).setClean()
 
     def _update_from_cSkin(self, dataBlock):
         """管线接线员：获取上游内存并刷新渲染上下文数据，使用前置判定消灭深层嵌套"""
-        cSkin_plug: om.MPlug = om.MPlug(self.thisMObject(), TriangleShape.cSkinMessageAttr)
+        cSkin_plug: om.MPlug = om.MPlug(self.thisMObject(), TriangleShape.inMeshAttr)
         if not cSkin_plug.isConnected:
             return
 
@@ -349,15 +352,15 @@ class TriangleShape(om.MPxSurfaceShape):
 
         # 1. 核心操作：直接将 CMemoryManager 底层的 ctypes 缓存数组赋值给 RenderData
         if mesh_ctx.vertex_positions:
-            self.render_data.vertices_pos = mesh_ctx.vertex_positions._cache
+            self.render_data.vertices_pos = mesh_ctx.vertex_positions.ctypes
             self.render_data.dirty_vertices_pos = True
 
         if mesh_ctx.triangle_indices:
-            self.render_data.face_indices = mesh_ctx.triangle_indices._cache
+            self.render_data.face_indices = mesh_ctx.triangle_indices.ctypes
             self.render_data.dirty_face_indices = True
-            
+
         if mesh_ctx.edge_indices:
-            self.render_data.line_indices = mesh_ctx.edge_indices._cache
+            self.render_data.line_indices = mesh_ctx.edge_indices.ctypes
             self.render_data.dirty_line_indices = True
 
         # 2. 动态维护 RenderData 里的颜色和点索引数组大小
@@ -457,6 +460,7 @@ class TriangleOverride(omr.MPxSubSceneOverride):
         return True
 
     def update(self, container, frameContext):
+        print("update")
         render_item_face = container.find(self.item_name_face)
         render_item_line = container.find(self.item_name_line)
         render_item_point = container.find(self.item_name_point)
