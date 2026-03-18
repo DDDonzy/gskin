@@ -51,16 +51,7 @@ class MeshTopologyContext:
         self.v2v_indices      = None
         self.v2f_offsets      = None
         self.v2f_indices      = None
-    def __repr__(self) -> str:
-        return (
-            f"MeshTopologyContext(\n"
-            f"  counts: verts={self.vertex_count}, edges={self.edge_count}, tris={self.triangle_count}\n"
-            f"  positions: current={self.vertex_positions}, rest={self.rest_positions}\n"
-            f"  base_topo: tri_idx={self.triangle_indices}, edge_idx={self.edge_indices}\n"
-            f"  v2v_csr: offsets={self.v2v_offsets}, indices={self.v2v_indices}\n"
-            f"  v2f_csr: offsets={self.v2f_offsets}, indices={self.v2f_indices}\n"
-            f")"
-        )
+
 
 
 class BrushHitContext:
