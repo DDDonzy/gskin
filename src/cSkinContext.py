@@ -9,27 +9,58 @@ if TYPE_CHECKING:
 # ==============================================================================
 # fmt:off
 class MeshTopologyContext:
-    """统一的数据结构，包含渲染所需的所有网格数据，包括动态的顶点位置和静态的拓扑。"""
-    __slots__ = (
-        "vertex_count",
-        "edge_count",
-        "polygon_count",
-        "vertex_positions",
-        "triangle_indices",
-        "edge_indices",
-        "adjacency_offsets", 
-        "adjacency_indices",
-    )
+    """
+    统一的数据结构，包含变形/渲染所需的所有网格数据。
+    严格区分了动态的顶点位置与静态的拓扑/邻接表，方便 BufferManager 统一管理生命周期。
+    """
+    __slots__ = ("vertex_count",
+                 "edge_count",
+                 "polygon_count",
+                 "triangle_count",
+                 "vertex_positions",
+                 "triangle_indices",
+                 "edge_indices",
+                 "v2v_offsets",
+                 "v2v_indices",
+                 "v2f_offsets",
+                 "v2f_indices") # fmt:skip
 
     def __init__(self):
-        self.vertex_count: int = 0
-        self.edge_count: int = 0
-        self.polygon_count: int = 0
-        self.vertex_positions: BufferManager = None
-        self.triangle_indices: BufferManager = None
-        self.edge_indices: BufferManager = None
-        self.adjacency_offsets:BufferManager = None
-        self.adjacency_indices:BufferManager  = None
+        self.vertex_count  : int = 0
+        self.edge_count    : int = 0
+        self.polygon_count : int = 0
+        self.triangle_count: int = 0
+        # 点位置 Buffer
+        self.vertex_positions:BufferManager = None
+        # 基础拓扑 Buffer
+        self.triangle_indices:BufferManager = None
+        self.edge_indices    :BufferManager = None
+        # v2v CSR Buffer 
+        self.v2v_offsets:BufferManager = None
+        self.v2v_indices:BufferManager = None
+        # v2f CSR Buffer
+        self.v2f_offsets:BufferManager = None
+        self.v2f_indices:BufferManager = None
+
+    def clear(self):
+        """可选的清理方法：用于显式释放底层的连续内存"""
+        self.vertex_positions = None
+        self.triangle_indices = None
+        self.edge_indices     = None
+        self.v2v_offsets      = None
+        self.v2v_indices      = None
+        self.v2f_offsets      = None
+        self.v2f_indices      = None
+    def __repr__(self) -> str:
+        return (
+            f"MeshTopologyContext(\n"
+            f"  counts: verts={self.vertex_count}, edges={self.edge_count}, tris={self.triangle_count}\n"
+            f"  positions: current={self.vertex_positions}, rest={self.rest_positions}\n"
+            f"  base_topo: tri_idx={self.triangle_indices}, edge_idx={self.edge_indices}\n"
+            f"  v2v_csr: offsets={self.v2v_offsets}, indices={self.v2v_indices}\n"
+            f"  v2f_csr: offsets={self.v2f_offsets}, indices={self.v2f_indices}\n"
+            f")"
+        )
 
 
 class BrushHitContext:

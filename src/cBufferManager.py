@@ -228,6 +228,39 @@ class BufferManager:
 
         return instance
 
+    @staticmethod
+    def from_ctypes(ctypes_array, format_char: str = "i", shape: tuple = None):
+        """
+        [终极 0 拷贝接收器]
+        直接接管由 Cython/C 极速运算后返回的原生 ctypes 连续内存数组。
+        完全没有内存拷贝，直接提取底层裸指针和内存视图，并将生命周期安全地绑定到本实例。
+
+        Args:
+            ctypes_array: 原生的 ctypes 数组实例 (例如 (c_int * 10)())
+            format_char (str): 目标类型码，默认为 "i" (32位整型)
+            shape (tuple): 形状。如果为 None，则自动使用一维数组的长度
+        """
+        instance = BufferManager()
+        if ctypes_array is None:
+            return instance
+
+        # 1. 直接接管 ctypes 对象，这极其重要！
+        # 只要 BufferManager 活着，这块 C 内存就不会被 Python GC 回收
+        instance.ctypes = ctypes_array
+
+        # 2. 直接获取底层物理内存的裸指针 (极速)
+        instance.ptr = ctypes.addressof(ctypes_array)
+        instance.format_char = format_char
+
+        # 3. 自动推断 Shape
+        instance.shape = shape if shape is not None else (len(ctypes_array),)
+
+        # 4. 生成统一标准的 memoryview 视图
+        # 采用你源码中经典的 "B" (Bytes) 中转强转法，确保维度绝对安全
+        instance.view = memoryview(ctypes_array).cast("B").cast(format_char, shape=instance.shape)
+
+        return instance
+
     def reshape(self, new_shape: tuple) -> "BufferManager":
         """
         在不改变底层数据的情况下，返回一个具有新维度的内存管理器实例。

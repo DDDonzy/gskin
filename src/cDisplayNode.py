@@ -409,7 +409,7 @@ class WeightPreviewShape(om.MPxSurfaceShape):
                 self._update_topology(mFnMesh)
 
         # 跨域读取！
-        self.mesh_context.vertex_positions = cSkin.rawPoints_output_mgr
+        self.mesh_context.vertex_positions = cSkin.rawPoints_output
         return self.mesh_context
 
     def _update_topology(self, mFnMesh: om.MFnMesh):

@@ -142,6 +142,7 @@ MY_PLUGIN_CATEGORY = om1.MProfiler.addCategory("CythonSkinPlugin", "Cython Nodes
 # ==============================================================================
 _ALIVE_STRINGS = set()
 
+
 def get_safe_string(text):
     """确保传入的是 str，并强制全局续命"""
     if not isinstance(text, str):
@@ -156,7 +157,7 @@ class MayaNativeProfiler:
     def __init__(self, event_name, color=5):
         # 1. 把名字丢进保活池，拿到拥有不死之身的 str
         self.event_name = get_safe_string(event_name)
-        
+
         # 颜色 ID 推荐: 2(橘红), 5(蓝色), 6(红色), 7(绿色)
         self.color = color
         self.event_id = 0
