@@ -391,8 +391,11 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
 
         with MayaNativeProfiler("Update Weights", 2):
             if self.isDirty_weights:
-                print("更新权重")
-                self.weights_manager.update_data(dataBlock)
+                with MayaNativeProfiler("Update WeightsManager", 3):
+                    self.weights_manager.update_data(dataBlock)
+                with MayaNativeProfiler("Update Weights", 4):
+                    self.weights_manager.process_queued_strokes()
+
                 self.isDirty_weights = False
 
             _weightsView = self.weights_manager.get_raw_weights(-1, 0)

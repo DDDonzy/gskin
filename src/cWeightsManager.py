@@ -4,6 +4,9 @@ from __future__ import annotations
 import typing
 import array
 import functools
+import threading
+from collections import deque
+
 
 import maya.OpenMaya as om1  # type:ignore
 from maya import cmds
@@ -42,6 +45,27 @@ def updateDG(func):
                 # 触发你原本的强制刷新逻辑
                 if hasattr(self, "updateDG") and callable(getattr(self, "updateDG")):
                     self.updateDG()
+
+    return wrapper
+
+
+def async_queued_task(func):
+    """
+    [魔法装饰器]
+    拦截函数的直接执行，将其打包为闭包任务推入队列，并通知 Maya 刷新。
+    """
+
+    @functools.wraps(func)
+    def wrapper(self, *args, **kwargs):
+        # 1. 使用 partial 将函数本体、self 以及所有参数“冻结”成一个待执行任务包
+        task = functools.partial(func, self, *args, **kwargs)
+
+        # 2. 塞进队列
+        with self.queue_lock:
+            self.stroke_queue.append(task)
+
+        # 3. 踢醒 Maya 的 deform
+        self.updateDG()
 
     return wrapper
 
@@ -203,12 +227,16 @@ class WeightsHandle:
             (self.mObject_mesh,
              self.mFnMesh     ,
              self.max_capacity) = self._build_mesh_buffer((length + 2) // 3)  # fmt:skip
-
-            self.length = length
+            if self.mDataHandle is not None:
+                self.mDataHandle.setMObject(self.mObject_mesh)
             resized = True
+
+        self.length = length
 
         if self.mFnMesh is not None:
             self.memory = BufferManager.from_ptr(int(self.mFnMesh.getRawPoints()), "f", (self.length,))
+            if resized:
+                    self.memory.fill(0)
 
         return resized
 
@@ -220,14 +248,10 @@ class WeightsHandle:
         self.length = -1
         self.max_capacity = -1
 
-        return True
-
-    def commit(self):
-        """强制提交到 Maya，仅作为外部状态刷新接口"""
-        if (self.mObject_mesh is not None) and (self.mDataHandle is not None):
+        if self.mDataHandle is not None:
             self.mDataHandle.setMObject(self.mObject_mesh)
-            if self.mPlug is not None:
-                self.mPlug.setMDataHandle(self.mDataHandle)
+
+        return True
 
 
 class WeightsLayerItem:
@@ -279,6 +303,24 @@ class WeightsManager:
         self.plug_weights: om1.MPlug = om1.MPlug(cSkin.mObject, cSkin.aWeights)
 
         self.layers: dict[int, WeightsLayerItem] = {}
+
+        # 🚀 新增：把指令队列和锁封装在 Manager 内部
+        self.stroke_queue = deque()
+        self.queue_lock = threading.Lock()
+
+    def process_queued_strokes(self):
+        """
+        [内部专用] 消化队列里的任务。在 deform 周期内调用。
+        """
+        if not self.stroke_queue:
+            return
+
+        with self.queue_lock:
+            while self.stroke_queue:
+                # 弹出任务包
+                task = self.stroke_queue.popleft()
+                # 💥 闭眼直接调用它！它会自动把之前保存的参数全部传进去执行
+                task()
 
     @classmethod
     def get_manager_from_cSkin(cls, cSkinNodeName: str):
@@ -383,23 +425,23 @@ class WeightsManager:
             return None
 
         vtx_count, inf_count, _, weights_1d = self.parse_raw_weights(_raw_view)
+        print(vtx_count,inf_count)
 
         weights_2d = weights_1d.cast("B").cast("f", (vtx_count, inf_count))
 
-        tmp_idx = array.array("i", [0]) * vtx_count
-        tmp_bool = array.array("B", [0]) * vtx_count
-        tmp_locks = array.array("B", [0]) * inf_count
+        tmp_idx   = BufferManager.allocate("i", (vtx_count,))
+        tmp_bool  = BufferManager.allocate("B", (vtx_count,))
+        tmp_locks = BufferManager.allocate("B", (inf_count,))
 
         # 分配 Undo 内存 (先拉平为 1D，再利用 memoryview 强转为 2D)
-        _undo_buffer = array.array("f", [0.0]) * (vtx_count * inf_count)
-        tmp_undo_view = memoryview(_undo_buffer).cast("B").cast("f", shape=(vtx_count, inf_count))
+        _undo_buffer = BufferManager.allocate("f", (vtx_count, inf_count))
 
         processor = cBrushCoreCython.SkinWeightProcessor(
             weights_2d,
-            memoryview(tmp_idx),
-            memoryview(tmp_bool),
-            memoryview(tmp_locks),
-            tmp_undo_view,
+            tmp_idx.view,       # 直接传入 view
+            tmp_bool.view,      # 直接传入 view
+            tmp_locks.view,     # 直接传入 view
+            _undo_buffer.view,  # 直接传入完美的 2D view！
         )
         return processor
 
@@ -416,7 +458,7 @@ class WeightsManager:
         # 撤销时不需要记录新的 Undo 快照，也不需要复杂的模式，直接暴力 Replace (blend_mode=2)
         processor.set_custom_array(source_values=sparse_values, blend_mode=2, vertex_indices=vtx_indices, channel_indices=channel_indices)
 
-    @updateDG
+    @async_queued_task
     def set_weights(
         self,
         layer_idx: int,
@@ -479,7 +521,7 @@ class WeightsManager:
 
         return True
 
-    @updateDG
+    @async_queued_task
     def rebuild_layer(self, layer_idx, is_mask, vtx_count, inf_count, influence_indices, weights_1d, backup=True):
         """
         [全量重建/覆盖图层]
@@ -507,12 +549,11 @@ class WeightsManager:
 
         if vtx_count == 0:
             handle.clear()
-            handle.commit()
             return True
 
         # --- [2. Python 负责重建底层物理内存与骨骼 Header (搭地基)] ---
         total_size = (2 + len(influence_indices)) + (vtx_count * len(influence_indices))
-        resized = handle.resize(total_size)
+        handle.resize(total_size)
         if not handle.is_valid:
             return False
 
@@ -522,7 +563,6 @@ class WeightsManager:
         if influence_indices:
             _int[2 : 2 + len(influence_indices)] = BufferManager.auto(influence_indices, "i").view
 
-        # --- Cython 引擎接管纯数据写入 (填数据)] ---
         processor = self._create_processor(layer_idx, is_mask)
         if processor:
             processor.set_custom_array(
@@ -532,8 +572,6 @@ class WeightsManager:
                 channel_indices=None,
             )
 
-        if resized:
-            handle.commit()
         return True
 
     def get_weights(self, layer_idx: int, is_mask: bool, vtx_indices=None, bone_local_indices=None):
