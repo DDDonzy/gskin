@@ -232,10 +232,10 @@ class WeightBrushManager:
 
             # ✨ 核心改变：使用专用的稀疏状态还原器，强行覆盖，绝对精准！
             def undo():
-                wm.set_sparse_data(layer, mask, mod_vtx_idx, mod_ch_idx, old_sparse)
+                wm._set_sparse_data(layer, mask, mod_vtx_idx, mod_ch_idx, old_sparse)
 
             def redo():
-                wm.set_sparse_data(layer, mask, mod_vtx_idx, mod_ch_idx, new_sparse)
+                wm._set_sparse_data(layer, mask, mod_vtx_idx, mod_ch_idx, new_sparse)
 
             # 提交到咱们自己的 API 撤销栈
             apiundo.commit(redo, undo, execute=False)

@@ -60,6 +60,10 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
     aInfluenceMatrix  = om1.MObject()
     aBindPreMatrix    = om1.MObject()
     aRefresh          = om1.MObject()
+    # ---
+    aCurrentPaintLayerIndex     = om1.MObject()
+    aCurrentPaintInfluenceIndex = om1.MObject()
+    aCurrentPaintMaskBool       = om1.MObject()
     # fmt:on
 
     def __init__(self):
@@ -141,18 +145,22 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
                     self.aRefresh):  # fmt:skip
             self.isDirty = True
             self.isDirty_weights = True
+
         # --- matrix
         elif plug == self.aInfluenceMatrix:
             self.isDirty = True
             self.isDirty_influencesMatrix = True
+
         # --- bind pre matrix
         elif plug == self.aBindPreMatrix:
             self.isDirty = True
             self.isDirty_bindPreMatrix = True
+
         # --- geo transform matrix
         elif plug == self.aGeomMatrix:
             self.isDirty = True
             self.isDirty_geoMatrix = True
+
         # --- input geometry
         elif plug == ompx.cvar.MPxGeometryFilter_inputGeom or \
              plug == ompx.cvar.MPxGeometryFilter_input:  # fmt:skip
@@ -232,10 +240,19 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         tri_counts = om1.MIntArray()
         tri_indices = om1.MIntArray()
         mFnMesh.getTriangles(tri_counts, tri_indices)
-
         tri_list = list(tri_indices)
         self.mesh_context.triangle_count = len(tri_list) // 3
         self.mesh_context.triangle_indices = BufferManager.from_list(tri_list, "i")
+
+        # --- Quad Edge Indices
+        quad_edge_list = [0] * (current_edge_count * 2)
+        util = om1.MScriptUtil()
+        ptr = util.asInt2Ptr()
+        for i in range(current_edge_count):
+            mFnMesh.getEdgeVertices(i, ptr)
+            quad_edge_list[i * 2]     = om1.MScriptUtil.getInt2ArrayItem(ptr, 0, 0)
+            quad_edge_list[i * 2 + 1] = om1.MScriptUtil.getInt2ArrayItem(ptr, 0, 1)
+        self.mesh_context.quad_edge_indices = BufferManager.from_list(quad_edge_list, "i")
 
         # --- Edge Indices
         unique_edges_ctypes = cTopology.compute_unique_edge_indices(self.mesh_context.triangle_indices.view)
@@ -251,6 +268,33 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         self.mesh_context.v2f_offsets = BufferManager.from_ctypes(v2f_offsets_ctypes)
         self.mesh_context.v2f_indices = BufferManager.from_ctypes(v2f_indices_ctypes)
         # fmt:on
+
+    def active_paint_weights(self) -> memoryview | None:
+        """
+        直接从 manager 提取当前需要绘制的的权重视图。
+
+        Returns:
+            weightsView (memoryview | None): 返回针对特定骨骼切片后的视图。
+        """
+        cSkin = self.cSkin
+        ctx = self.render_context
+
+        if not cSkin or cSkin.weights_manager is None:
+            return None
+
+        # 1. 越过 handle，直接向 manager 索取解析好的全量数据
+        _, inf_count, _, safe_weights_view = cSkin.weights_manager.parse_raw_weights(
+            cSkin.weights_manager.get_raw_weights(ctx.paintLayerIndex, ctx.paintMask),
+        )
+
+        # 如果没有骨骼或者视图为空，直接退出
+        if inf_count <= 0 or not safe_weights_view:
+            return None
+
+        # 2. 计算安全偏移量
+        safe_idx = max(0, min(ctx.paintInfluenceIndex, inf_count - 1))
+
+        return safe_weights_view[safe_idx::inf_count]
 
     @maya_profile(0, "Compute")
     def compute(self, *args, **kwargs):
@@ -347,6 +391,7 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
 
         with MayaNativeProfiler("Update Weights", 2):
             if self.isDirty_weights:
+                print("更新权重")
                 self.weights_manager.update_data(dataBlock)
                 self.isDirty_weights = False
 
@@ -428,13 +473,23 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         nAttr.setCached(False)
 
         # ====================================
-        _attrs = (CythonSkinDeformer.aGeomMatrix, 
-                  CythonSkinDeformer.aBindPreMatrix, 
-                  CythonSkinDeformer.aInfluenceMatrix, 
-                  CythonSkinDeformer.aWeights, 
-                  CythonSkinDeformer.aLayerCompound, 
-                  CythonSkinDeformer.aRefresh)  # fmt:skip
-
-        for attr in _attrs:
+        for attr in  (CythonSkinDeformer.aGeomMatrix, 
+                      CythonSkinDeformer.aBindPreMatrix, 
+                      CythonSkinDeformer.aInfluenceMatrix, 
+                      CythonSkinDeformer.aWeights, 
+                      CythonSkinDeformer.aLayerCompound, 
+                      CythonSkinDeformer.aRefresh):  # fmt:skip
             CythonSkinDeformer.addAttribute(attr)
             CythonSkinDeformer.attributeAffects(attr, ompx.cvar.MPxGeometryFilter_outputGeom)
+
+        # --- Paint
+        CythonSkinDeformer.aCurrentPaintLayerIndex = nAttr.create("currentPaintLayer", "cpl", om1.MFnNumericData.kInt, -1)
+        nAttr.setMin(-1)
+        nAttr.setHidden(True)
+        CythonSkinDeformer.aCurrentPaintInfluenceIndex = nAttr.create("currentPaintInfluence", "cpi", om1.MFnNumericData.kInt, 0)
+        nAttr.setHidden(True)
+        CythonSkinDeformer.aCurrentPaintMaskBool = nAttr.create("currentPaintMask", "cpm", om1.MFnNumericData.kBoolean, False)
+        nAttr.setHidden(True)
+        CythonSkinDeformer.addAttribute(CythonSkinDeformer.aCurrentPaintLayerIndex)
+        CythonSkinDeformer.addAttribute(CythonSkinDeformer.aCurrentPaintInfluenceIndex)
+        CythonSkinDeformer.addAttribute(CythonSkinDeformer.aCurrentPaintMaskBool)

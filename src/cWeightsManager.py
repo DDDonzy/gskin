@@ -6,11 +6,12 @@ import array
 import functools
 
 import maya.OpenMaya as om1  # type:ignore
+from maya import cmds
 
 from . import apiundo
 from . import cBrushCoreCython
 from ._cRegistry import SkinRegistry
-from .cBufferManager import BufferManager, ensure_memoryview
+from .cBufferManager import BufferManager
 
 
 if typing.TYPE_CHECKING:
@@ -373,7 +374,9 @@ class WeightsManager:
 
     def _create_processor(self, layer_idx: int, is_mask: bool):
         """
-        提取指定图层的物理内存，并为其实例 `SkinWeightProcessor`。
+        - 提取指定图层的物理内存，并为创建 `SkinWeightProcessor`实例，可以根据`return`的实例进行操作。
+        - `SkinWeightProcessor` 本质是笔刷处理器，初始化权重笔刷，将权重数据与笔刷引擎托管给父类进行通用运算。
+        - 在这里可以用来快速设置权重，并且自动注册undo和redo快照(参考`set_sparse_data`函数)。
         """
         _raw_view = self.get_raw_weights(layer_idx, is_mask)
         if _raw_view is None:
@@ -401,7 +404,7 @@ class WeightsManager:
         return processor
 
     @updateDG
-    def set_sparse_data(self, layer_idx: int, is_mask: bool, vtx_indices, channel_indices, sparse_values):
+    def _set_sparse_data(self, layer_idx: int, is_mask: bool, vtx_indices, channel_indices, sparse_values):
         """
         专供 Undo / Redo 闭包调用。
         直接使用 C 级覆盖能力还原快照，彻底告别 Python 循环！
@@ -436,17 +439,24 @@ class WeightsManager:
             return False
 
         # 转为 Cython 认识的 memoryview
-        v_view = ensure_memoryview(vtx_indices, "i") if vtx_indices is not None else None
-        b_view = ensure_memoryview(locked_influence_indices, "i") if locked_influence_indices is not None else None
-        src_view = ensure_memoryview(weights_1d, "f")
-        fal_view = ensure_memoryview(falloff_weights, "f") if falloff_weights is not None else None
+        # fmt:off
+        v_view   = BufferManager.auto(vtx_indices              , "i").view    if vtx_indices              is not None else None
+        b_view   = BufferManager.auto(locked_influence_indices , "i").view    if locked_influence_indices is not None else None
+        src_view = BufferManager.auto(weights_1d               , "f").view
+        fal_view = BufferManager.auto(falloff_weights          , "f").view    if falloff_weights          is not None else None
+        # fmt:on
 
         # 开启快照录制
         if backup:
             processor.begin_stroke()
 
         # Cython 执行带混合模式的覆写
-        processor.set_custom_array(source_values=src_view, blend_mode=blend_mode, vertex_indices=v_view, channel_indices=b_view, alpha=alpha, falloff_weights=fal_view)
+        processor.set_custom_array( source_values   = src_view   ,
+                                    blend_mode      = blend_mode ,
+                                    vertex_indices  = v_view     ,
+                                    channel_indices = b_view     ,
+                                    alpha           = alpha      ,
+                                    falloff_weights = fal_view   )  # fmt:skip
 
         # 如果不是mask，覆写后必须进行权重归一化！
         if not is_mask and normalize:
@@ -460,10 +470,10 @@ class WeightsManager:
                 mod_vtx, mod_ch, old_sparse, new_sparse = undo_data
 
                 def redo():
-                    self.set_sparse_data(layer_idx, is_mask, mod_vtx, mod_ch, new_sparse)
+                    self._set_sparse_data(layer_idx, is_mask, mod_vtx, mod_ch, new_sparse)
 
                 def undo():
-                    self.set_sparse_data(layer_idx, is_mask, mod_vtx, mod_ch, old_sparse)
+                    self._set_sparse_data(layer_idx, is_mask, mod_vtx, mod_ch, old_sparse)
 
                 apiundo.commit(redo, undo, execute=False)
 
@@ -481,10 +491,11 @@ class WeightsManager:
 
         # --- [1. 记录图层全量结构快照] ---
         if backup:
-            old_v_cnt, old_i_cnt, old_g_bones, _, _, old_w_1d = self.get_weights(layer_idx, is_mask)
+            old_v_cnt, old_i_cnt, old_g_bones, _, _, old_w_1d = self.get_weights(layer_idx, is_mask)  # get weights 是拷贝，无需再次拷贝
 
-            safe_new_idx = array.array("i", influence_indices)
-            safe_new_w = array.array("f", ensure_memoryview(weights_1d, "f"))
+            # 传入进来的数据可能是引用，这个数据要用来处理 redo, 一定要拷贝数据
+            safe_new_idx = array.array("i", BufferManager.auto(influence_indices, "i").view)
+            safe_new_w = array.array("f", BufferManager.auto(weights_1d, "f").view)
 
             def redo():
                 self.rebuild_layer(layer_idx, is_mask, vtx_count, inf_count, safe_new_idx, safe_new_w, backup=False)
@@ -509,12 +520,17 @@ class WeightsManager:
         _int = _view.cast("B").cast("i")
         _int[0], _int[1] = vtx_count, len(influence_indices)
         if influence_indices:
-            _int[2 : 2 + len(influence_indices)] = ensure_memoryview(influence_indices, "i")
+            _int[2 : 2 + len(influence_indices)] = BufferManager.auto(influence_indices, "i").view
 
-        # --- [3. 召唤 Cython 引擎接管纯数据写入 (填数据)] ---
+        # --- Cython 引擎接管纯数据写入 (填数据)] ---
         processor = self._create_processor(layer_idx, is_mask)
         if processor:
-            processor.set_custom_array(source_values=ensure_memoryview(weights_1d, "f"), blend_mode=2, vertex_indices=None, channel_indices=None)
+            processor.set_custom_array(
+                source_values=BufferManager.auto(weights_1d, "f").view,
+                blend_mode=2,
+                vertex_indices=None,
+                channel_indices=None,
+            )
 
         if resized:
             handle.commit()
@@ -549,8 +565,8 @@ class WeightsManager:
         if not processor:
             return v_count, i_count, global_bone_ids, array.array("i"), array.array("i"), array.array("f")
 
-        v_view = ensure_memoryview(vtx_indices, "i") if vtx_indices is not None else None
-        b_view = ensure_memoryview(bone_local_indices, "i") if bone_local_indices is not None else None
+        v_view = BufferManager.auto(vtx_indices, "i").view if vtx_indices is not None else None
+        b_view = BufferManager.auto(bone_local_indices, "i").view if bone_local_indices is not None else None
 
         # Cython 极速返回 1D 纯净数据
         weights_1d = processor.get_custom_array(v_view, b_view)

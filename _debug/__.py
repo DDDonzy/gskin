@@ -38,8 +38,5 @@ manager.rebuild_layer(-1,0,vertex_count,2, influence_indices, list(maya_weights)
 
 
 cmds.createNode("triangleShape")
-
-
-
 cmds.connectAttr("cSkinDeformer1.message","triangleShape1.cSkinMessage")
 

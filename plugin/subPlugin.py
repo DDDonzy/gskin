@@ -369,8 +369,8 @@ class TriangleShape(om.MPxSurfaceShape):
                 self.render_data.face_indices = mesh_ctx.triangle_indices.ctypes
                 self.render_data.dirty_face_indices = True
 
-            if mesh_ctx.edge_indices:
-                self.render_data.line_indices = mesh_ctx.edge_indices.ctypes
+            if mesh_ctx.quad_edge_indices:
+                self.render_data.line_indices = mesh_ctx.quad_edge_indices.ctypes
                 self.render_data.dirty_line_indices = True
 
             # 2. 动态维护 RenderData 里的颜色和点索引数组大小

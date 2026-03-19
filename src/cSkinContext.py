@@ -20,6 +20,7 @@ class MeshTopologyContext:
                  "vertex_positions",
                  "triangle_indices",
                  "edge_indices",
+                 "quad_edge_indices",
                  "v2v_offsets",
                  "v2v_indices",
                  "v2f_offsets",
@@ -33,8 +34,9 @@ class MeshTopologyContext:
         # 点位置 Buffer
         self.vertex_positions:BufferManager = None
         # 基础拓扑 Buffer
-        self.triangle_indices:BufferManager = None
-        self.edge_indices    :BufferManager = None
+        self.triangle_indices  :BufferManager = None
+        self.edge_indices      :BufferManager = None
+        self.quad_edge_indices :BufferManager = None
         # v2v CSR Buffer 
         self.v2v_offsets:BufferManager = None
         self.v2v_indices:BufferManager = None
@@ -44,13 +46,14 @@ class MeshTopologyContext:
 
     def clear(self):
         """可选的清理方法：用于显式释放底层的连续内存"""
-        self.vertex_positions = None
-        self.triangle_indices = None
-        self.edge_indices     = None
-        self.v2v_offsets      = None
-        self.v2v_indices      = None
-        self.v2f_offsets      = None
-        self.v2f_indices      = None
+        self.vertex_positions  = None
+        self.triangle_indices  = None
+        self.edge_indices      = None
+        self.quad_edge_indices = None
+        self.v2v_offsets       = None
+        self.v2v_indices       = None
+        self.v2f_offsets       = None
+        self.v2f_indices       = None
 
 
 
