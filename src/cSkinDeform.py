@@ -297,7 +297,7 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         return safe_weights_view[safe_idx::inf_count]
 
     @maya_profile(0, "Compute")
-    def compute(self, *args, **kwargs):
+    def compute(self, plug, dataBlock):
         """
         很蛋疼的是`DG`模式下，如果`.outputGeometry[i]`输出给多个模型，
         每个模型求值都会触发一次 `Deform` 函数，非常消耗性能，尤其是在绘制权重的时候，
@@ -308,7 +308,7 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         if not self.isDirty:
             return
 
-        res = super().compute(*args, **kwargs)
+        res = super().compute(plug, dataBlock)
         self.isDirty = False
         return res
 
@@ -391,13 +391,28 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
 
         with MayaNativeProfiler("Update Weights", 2):
             if self.isDirty_weights:
-                with MayaNativeProfiler("Update WeightsManager", 3):
-                    self.weights_manager.update_data(dataBlock)
-                with MayaNativeProfiler("Update Weights", 4):
-                    self.weights_manager.process_queued_strokes()
+                self.weights_manager.update_data(dataBlock)
+                self.weights_manager.process_queued_strokes()
+                handle = self.weights_manager.get_handle(-1, 0)
+                
+                data = dataBlock.inputValue(self.aWeights).data()
+                fn = om1.MFnVectorArrayData(data)
+                ary = fn.array()
+                print(ary.length())
+                
 
-                self.isDirty_weights = False
+                self.isDirty_weights = True
 
+            handle = self.weights_manager.get_handle(-1, 0)
+            fn = om1.MFnVectorArrayData(handle.mDataHandle.data())
+            ary = fn.array()
+            print(ary.length())
+
+            print(handle.mVectorArray.length())
+            print(handle.length)
+            if not handle.is_valid:
+                print("error")
+                return
             _weightsView = self.weights_manager.get_raw_weights(-1, 0)
             if _weightsView is None:
                 return
@@ -447,17 +462,22 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         mAttr.setUsesArrayDataBuilder(True)
 
         # --- weights
-        CythonSkinDeformer.aWeights = tAttr.create("cWeights", "cw", om1.MFnData.kMesh)
+        CythonSkinDeformer.aWeights = tAttr.create("cWeights", "cw", om1.MFnData.kVectorArray)
+        a = om1.MVectorArray()
+        a.setLength(1)
+        tAttr.setDefault(om1.MFnVectorArrayData().create(om1.MVectorArray(a)))
         tAttr.setHidden(True)
 
         # --- layer weights children
         CythonSkinDeformer.aLayerEnabled = nAttr.create("layerEnabled", "le", om1.MFnNumericData.kBoolean, False)
         nAttr.setHidden(True)
 
-        CythonSkinDeformer.aLayerWeights = tAttr.create("layerWeights", "lw", om1.MFnData.kMesh)
+        CythonSkinDeformer.aLayerWeights = tAttr.create("layerWeights", "lw", om1.MFnData.kVectorArray)
+        tAttr.setDefault(om1.MFnVectorArrayData().create(om1.MVectorArray()))
         tAttr.setHidden(True)
 
-        CythonSkinDeformer.aLayerMask = tAttr.create("layerMask", "lm", om1.MFnData.kMesh)
+        CythonSkinDeformer.aLayerMask = tAttr.create("layerMask", "lm", om1.MFnData.kVectorArray)
+        tAttr.setDefault(om1.MFnVectorArrayData().create(om1.MVectorArray()))
         tAttr.setHidden(True)
 
         # --- layer comp

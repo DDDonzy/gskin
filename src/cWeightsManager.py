@@ -9,7 +9,6 @@ from collections import deque
 
 
 import maya.OpenMaya as om1  # type:ignore
-from maya import cmds
 
 from . import apiundo
 from . import cBrushCoreCython
@@ -72,8 +71,12 @@ def async_queued_task(func):
 
 class WeightsHandle:
     """
-    权重数据装配器
-    采用 Header (int32) + Payload (float32) 混合内存布局。
+    权重数据装配器 (MVectorArray 0拷贝黑客版)
+
+    架构方案：
+    1. 物理伪装：将 32-bit Float 强行塞入 64-bit MVectorArray 中。
+    2. 原地扩容：通过 MVectorArray.setLength() 触发底层 C++ realloc，避免频繁销毁重建 MObject。
+    3. 内存布局：
         ```
         ----------------------------------------------------------------------------------
         | vtx_count (int) | inf_count (int) | bone_indices... (int) | Weights... (float) |
@@ -83,175 +86,155 @@ class WeightsHandle:
     """
 
     # fmt:off
-    mDataHandle  : om1.MDataHandle = None
-    mPlug        : om1.MPlug       = None
-    mObject_mesh : om1.MObject     = None
-    mFnMesh      : om1.MFnMesh     = None
+    mDataHandle  : om1.MDataHandle = None # 变形器计算周期内的临时句柄
+    mPlug        : om1.MPlug       = None # 节点插座，用于数据持久化
+    mObject_data : om1.MObject     = None # 包装了 VectorArray 的 Maya 数据实体
+    mVectorArray : om1.MVectorArray= None # 指向 MObject 内部缓冲区的引用
 
-    memory       : BufferManager  = None
-    """权重数据的底层`CMemoryManager`对象"""
-    max_capacity : int             = -1
-    """当前寄生 `MFnMesh` 的最大储存数据的长度(也可以理解为预分配数组大小)"""
-    length       : int             = -1
-    """
-    - 当前有效数据长度，对应 `self.memory:CMemoryManager` 的长度
-    - 数据结构 [vtx_count:int, influence_count:int, [influences_indices...], [weights...]]
-    """
+    memory       : BufferManager   = None # 权重数据的底层裸指针映射 (纯 Float 视图)
+    max_capacity : int             = -1   # 当前物理内存支持的最大 Float 存储量 (VectorLength * 6)
+    length       : int             = -1   # 当前逻辑数据的有效 Float 长度
     # fmt:on
 
-    def __init__(self, source: om1.MDataHandle | om1.MPlug):
-        if isinstance(source, om1.MPlug):
-            self.mPlug = source
-            # 提取短命的 MDataHandle
-            # 警告：这里会触发节点求值！
-            self.mDataHandle = self.mPlug.asMDataHandle()
-        elif isinstance(source, om1.MDataHandle):
-            self.mPlug = None
-            self.mDataHandle = source
-        else:
-            raise TypeError("Input not OpenMaya.MDataHandle or OpenMaya.MPlug")
-
-        self._setup_mesh_buffer(self.mDataHandle)
+    def __init__(self, mPlug: om1.MPlug, mDataHandle: om1.MDataHandle):
+        """
+        初始化装配器。
+        注：由于 nodeInitializer 设置了默认值，此处假定 mDataHandle 必定包含合法的 VectorArray。
+        """
+        self.mPlug = mPlug
+        self.mDataHandle = mDataHandle
+        self._setup_vector_buffer(self.mDataHandle)
 
     @property
     def is_valid(self) -> bool:
-        """检查当前 Handle 是否持有有效"""
-        if self.mDataHandle is None:
+        """检查内存映射是否有效且逻辑数据是否存在"""
+        # 1. 基础对象与内存引用检查
+        if self.mObject_data is None or self.mObject_data.isNull():
             return False
-        if self.mObject_mesh is None or self.mObject_mesh.isNull():
-            return False
-        if self.mFnMesh is None:
-            return False
-        if self.memory is None:
+        if self.mVectorArray is None or self.memory is None:
             return False
         if self.memory.view is None:
             return False
-        if self.length is None or self.length <= 0:
+
+        # 2. 获取表头数据
+        v_count = getattr(self, "vtx_count", 0)
+        i_count = getattr(self, "influence_count", 0)
+        
+        # 🚨 修正点 1：0 是合法的空图层状态！负数才是内存乱码
+        if v_count < 0 or i_count < 0:
             return False
+            
+        # 3. 计算所需的 Float 容量
+        # 哪怕 v_count 和 i_count 都是 0，Header 依然存在 (占用 2 个坑位)
+        required_floats = 2 + i_count + (v_count * i_count)
+        
+        # 物理分配的总容量 (1 个 MVector = 3 个 double = 6 个 float)
+        actual_floats = self.mVectorArray.length() * 6 
+
+        # 🚨 修正点 2：如果表头读出了巨大的乱码，required_floats 会远超 actual_floats
+        if required_floats > actual_floats:
+            return False
+
         return True
 
-    # -------------------------------------------------------------------------
-    # 显式工厂方法
-    # -------------------------------------------------------------------------
+    def _setup_vector_buffer(self, mDataHandle: om1.MDataHandle):
+        """
+        从 MDataHandle 解析并确立对 MVectorArray 内存块的绑定。
+        """
+        self.mObject_data = mDataHandle.data()
+        if self.mObject_data.isNull():
+            return
+
+        # 获取 MObject 内部数组的引用 (并非拷贝)
+        fn_vector_data = om1.MFnVectorArrayData(self.mObject_data)
+        self.mVectorArray = fn_vector_data.array()
+
+        # 刷新物理内存指针映射
+        self._remap_memory()
+
+    def _remap_memory(self):
+        """
+        核心方法：重新映射物理指针。
+        由于 setLength 会触发 C++ 内存重新分配，每次长度改变后必须刷新指针。
+        """
+        if self.mVectorArray is None or self.mVectorArray.length() <= 0:
+            return
+
+        # 1. 提取第 0 个元素的裸指针 (SWIG 代理地址)
+        _ptr = int(self.mVectorArray[0].this)
+        self.max_capacity = self.mVectorArray.length() * 6
+
+        # 2. 映射表头 (Header): 解析前两个 int32 (vtx_count, inf_count)
+        _header_memory = BufferManager.from_ptr(_ptr, "i", (2,))
+        self.vtx_count = _header_memory.view[0]
+        print("self.vtx_count",self.vtx_count)
+        self.influence_count = _header_memory.view[1]
+        print("self.influence_count",self.influence_count)
+
+        # 3. 计算并锁定逻辑数据视图长度
+        self.length = (2 + self.influence_count) + (self.vtx_count * self.influence_count)
+        print("self.length",self.length)
+
+        # 4. 生成 Float32 视图供 Cython 使用
+        self.memory = BufferManager.from_ptr(_ptr, "f", (self.length,))
+
+    def resize(self, length: int):
+        """
+        原地扩容底层物理内存。
+        通过修改 MVectorArray 长度，实现对 MObject 缓冲区的直接重塑。
+        """
+        # 如果当前容量足够，只需更新逻辑长度
+        if length <= self.max_capacity:
+            self.length = length
+            return False
+
+        # 1. 换算所需的 Vector 数量 (向上取整)
+        vector_count = (length + 5) // 6
+
+        # 2. 触发 C++ 原地扩容 (原地 realloc)
+        self.mVectorArray.setLength(vector_count)
+
+
+        return True
+
+    def commit(self):
+        """
+        [数据固化]
+        将当前内存里的 MObject 实体正式同步回节点的 MPlug。
+        这会触发 Maya 的存盘标记 (Scene Dirty) 并将数据存入 Internal Storage。
+        """
+        if self.mPlug and self.mObject_data and not self.mObject_data.isNull():
+            self.mPlug.setMObject(self.mObject_data)
+
+    def clear(self):
+        """
+        重置数据为默认状态 (1个元素的空壳)
+        """
+        empty_array = om1.MVectorArray()
+        empty_array.setLength(1)  # 保留1个元素防止 [0].this 崩溃
+
+        fn_data = om1.MFnVectorArrayData()
+        self.mObject_data = fn_data.create(empty_array)
+        self.mVectorArray = empty_array
+
+        if self.mDataHandle is not None:
+            self.mDataHandle.setMObject(self.mObject_data)
+
+        self._remap_memory()
+        return True
 
     @classmethod
     def from_attr_string(cls, attr_path: str):
-        """通过字符串路径直接获取 Handle，严格遵循显式装配规范"""
+        """工具方法：从字符串路径("node.attr")快速构建"""
         sel = om1.MSelectionList()
         try:
             sel.add(attr_path)
         except RuntimeError:
-            raise ValueError(f"找不到指定的属性路径: {attr_path}")
-
+            raise ValueError(f"Attribute path not found: {attr_path}")
         plug = om1.MPlug()
         sel.getPlug(0, plug)
-
-        # 显式实例化与底层变量初始化
-        instance = cls(plug)
-        return instance
-
-    def _setup_mesh_buffer(self, mDataHandle: om1.MDataHandle):
-        """
-        从MDataHandle解析权重数据
-
-        Side Effects :
-            - self.mObject_mesh
-            - self.mFnMesh
-            - self.max_capacity
-            - self.vtx_count
-            - self.influence_count
-            - self.length
-            - self.memory
-        """
-        self.mObject_mesh: om1.MObject = mDataHandle.asMesh()
-        if self.mObject_mesh.isNull():
-            return
-
-        self.mFnMesh = om1.MFnMesh(self.mObject_mesh)
-        _vtx_count = self.mFnMesh.numVertices()
-        if _vtx_count <= 0:
-            return None
-
-        self.max_capacity = _vtx_count * 3  # 预分配数组大小
-        _ptr = int(self.mFnMesh.getRawPoints())
-        _full_memory = BufferManager.from_ptr(_ptr, "f", (self.max_capacity,))
-        _int_view = _full_memory.view.cast("B").cast("i")
-
-        self.vtx_count = _int_view[0]  # 内存地址第一个数据是 权重vertex_count:int
-        self.influence_count = _int_view[1]  # 内存地址第二个数据是 权重influence_count:int
-
-        self.length = (2 + self.influence_count) + (self.vtx_count * self.influence_count)  # 内存有效长度
-        self.memory = BufferManager.from_ptr(_ptr, "f", (self.length,))  # 生成 cMemoryManager
-
-    def _build_mesh_buffer(self, vtx_count: int):
-        """
-        负责构建全新的 Mesh 对象，显式返回给调度者
-
-        Return:
-            - MObject (om1.MObject): New Meshes's MObject.
-            - MFnMesh (om1.MFnMesh): New MFnMesh instance.
-            - max_capacity (int): New MFnMesh's buffer max capacity.
-        """
-        vtx_count = max(3, vtx_count)
-        v_count = om1.MIntArray()
-        v_list = om1.MIntArray()
-        v_count.append(3)
-        v_list.append(0)
-        v_list.append(1)
-        v_list.append(2)
-
-        base_pts = om1.MFloatPointArray()
-        base_pts.setLength(vtx_count)
-
-        mObject = om1.MFnMeshData().create()
-        mFnMesh = om1.MFnMesh()
-        mFnMesh.create(vtx_count, 1, base_pts, v_count, v_list, mObject)
-
-        max_capacity = vtx_count * 3
-        return mObject, mFnMesh, max_capacity
-
-    def resize(self, length: int):
-        """
-        自动扩容底层物理内存空间。
-
-        Side Effects :
-            - self.mObject_mesh
-            - self.mFnMesh
-            - self.max_capacity
-            - self.length
-            - self.memory
-        """
-        resized = False
-
-        if length > self.max_capacity:
-            (self.mObject_mesh,
-             self.mFnMesh     ,
-             self.max_capacity) = self._build_mesh_buffer((length + 2) // 3)  # fmt:skip
-            if self.mDataHandle is not None:
-                self.mDataHandle.setMObject(self.mObject_mesh)
-            resized = True
-
-        self.length = length
-
-        if self.mFnMesh is not None:
-            self.memory = BufferManager.from_ptr(int(self.mFnMesh.getRawPoints()), "f", (self.length,))
-            if resized:
-                    self.memory.fill(0)
-
-        return resized
-
-    def clear(self):
-
-        self.mObject_mesh = om1.MFnMeshData().create()
-        self.mFnMesh = None
-        self.memory = None
-        self.length = -1
-        self.max_capacity = -1
-
-        if self.mDataHandle is not None:
-            self.mDataHandle.setMObject(self.mObject_mesh)
-
-        return True
+        # 注意：外部调用时需自行提供对应的 DataHandle 或是通过 plug.asMDataHandle() 获取
+        return cls(plug, plug.asMDataHandle())
 
 
 class WeightsLayerItem:
@@ -264,8 +247,8 @@ class WeightsLayerItem:
         _handle_enabled = mDataHandle.child(cSkin.aLayerEnabled)
 
         self.enabled = _handle_enabled.asBool()
-        self.weights = WeightsHandle(_handle_weights)
-        self.mask = WeightsHandle(_handle_mask)
+        self.weights = WeightsHandle(self.mPlug_mask, _handle_weights)
+        self.mask = WeightsHandle(self.mPlug_mask, _handle_mask)
 
     # ==========================================
     # 安全的属性获取：直接找 cSkin 要 MObject，完全不碰短命的 MDataHandle
@@ -327,24 +310,25 @@ class WeightsManager:
         cSkin: CythonSkinDeformer = SkinRegistry.from_instance_by_string(cSkinNodeName)
         return cSkin.weights_manager
 
-    def update_data(self, dataBlock: om1.MDataBlock):
+    def update_data(self, mDataBlock: om1.MDataBlock):
         """
         [状态同步器]
         一次性扫描 Maya 节点，刷新所有 Plug 缓存与底层内存池。
         当你在 UI 层面添加、删除了图层，或改变了节点连接后，手动调用此函数。
         """
         # weights
-        weights_dataHandle = dataBlock.inputValue(self.cSkin.aWeights)
-        self.weights = WeightsHandle(weights_dataHandle)
+        weights_dataHandle = mDataBlock.inputValue(self.cSkin.aWeights)
+        plug_weights = om1.MPlug(self.cSkin.mObject, self.cSkin.aWeights)
+        self.weights = WeightsHandle(plug_weights, weights_dataHandle)
 
         # layer
         self.layers.clear()
-        mArrayDataHandle: om1.MArrayDataHandle = dataBlock.inputArrayValue(self.cSkin.aLayerCompound)
+        mArrayDataHandle: om1.MArrayDataHandle = mDataBlock.inputArrayValue(self.cSkin.aLayerCompound)
         _count = mArrayDataHandle.elementCount()
         for idx in range(_count):
             mArrayDataHandle.jumpToArrayElement(idx)
             logical_idx = mArrayDataHandle.elementIndex()
-            element_handle = mArrayDataHandle.inputValue()
+            element_handle: om1.MDataHandle = mArrayDataHandle.inputValue()
             self.layers[logical_idx] = WeightsLayerItem(self.cSkin, element_handle, logical_idx)
 
     @property
@@ -425,12 +409,12 @@ class WeightsManager:
             return None
 
         vtx_count, inf_count, _, weights_1d = self.parse_raw_weights(_raw_view)
-        print(vtx_count,inf_count)
+        print(vtx_count, inf_count)
 
         weights_2d = weights_1d.cast("B").cast("f", (vtx_count, inf_count))
 
-        tmp_idx   = BufferManager.allocate("i", (vtx_count,))
-        tmp_bool  = BufferManager.allocate("B", (vtx_count,))
+        tmp_idx = BufferManager.allocate("i", (vtx_count,))
+        tmp_bool = BufferManager.allocate("B", (vtx_count,))
         tmp_locks = BufferManager.allocate("B", (inf_count,))
 
         # 分配 Undo 内存 (先拉平为 1D，再利用 memoryview 强转为 2D)
@@ -438,9 +422,9 @@ class WeightsManager:
 
         processor = cBrushCoreCython.SkinWeightProcessor(
             weights_2d,
-            tmp_idx.view,       # 直接传入 view
-            tmp_bool.view,      # 直接传入 view
-            tmp_locks.view,     # 直接传入 view
+            tmp_idx.view,  # 直接传入 view
+            tmp_bool.view,  # 直接传入 view
+            tmp_locks.view,  # 直接传入 view
             _undo_buffer.view,  # 直接传入完美的 2D view！
         )
         return processor
