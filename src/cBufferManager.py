@@ -1,5 +1,4 @@
 import ctypes
-import array
 
 
 __all__ = [
@@ -220,6 +219,42 @@ class BufferManager:
         new_instance.shape = new_shape
         new_instance.view = self.view.cast("B").cast(self.format_char, shape=new_shape)
         return new_instance
+
+    def slice(self, start: int, end: int = None) -> "BufferManager":
+        """
+        [极速零拷贝切片]
+        自动计算物理地址偏移，返回一个拥有独立精确 ptr 的子 Manager。
+        完美兼容 ctypes.memset 和 fill() 等绝对地址操作。
+        """
+        if self.view is None or not self.ptr:
+            return BufferManager()
+
+        # 假设主要操作的是一维展平的视图
+        total_elements = self.shape[0] if self.shape else len(self.view)
+
+        if end is None:
+            end = total_elements
+
+        # 支持 Python 的负数索引机制 (例如 -1 代表最后一个)
+        if start < 0:
+            start += total_elements
+        if end < 0:
+            end += total_elements
+
+        # 边界安全钳制
+        start = max(0, min(start, total_elements))
+        end = max(0, min(end, total_elements))
+
+        count = end - start
+        if count <= 0:
+            return BufferManager()
+
+        # 💥 核心魔法：让底层物理指针跟着切片一起移动！
+        item_size = self.view.itemsize
+        new_ptr = self.ptr + (start * item_size)
+
+        # 返回一个带有精确指针偏移的全新 Manager
+        return BufferManager.from_ptr(new_ptr, self.format_char, (count,))
 
     def fill(self, value):
         """

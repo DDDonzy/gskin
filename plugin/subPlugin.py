@@ -349,8 +349,6 @@ class TriangleShape(om.MPxSurfaceShape):
 
             if not cSkin or getattr(cSkin, "mesh_context", None) is None:
                 return
-        
-
 
             # 主动将自己挂载到 cSkin 的观察者里，这样它形变完就能顺着网线踢我们一脚刷新
             cSkin.preview_shape_mObj = self.thisMObject()
@@ -395,7 +393,7 @@ class TriangleShape(om.MPxSurfaceShape):
             if getattr(cSkin, "weights_manager", None):
                 paint_layer = dataBlock.inputValue(TriangleShape.paintLayerAttr).asInt()
                 paint_mask = dataBlock.inputValue(TriangleShape.paintMaskAttr).asBool()
-                _, inf_count, _, safe_weights_view = cSkin.weights_manager.parse_raw_weights(cSkin.weights_manager.get_raw_weights(paint_layer, paint_mask))
+                _, inf_count, _, safe_weights_view = cSkin.weights_manager.get_handle(paint_layer, paint_mask).parse_raw_weights()
                 if inf_count > 0 and safe_weights_view:
                     paint_inf = dataBlock.inputValue(TriangleShape.paintInfluenceAttr).asInt()
                     safe_idx = max(0, min(paint_inf, inf_count - 1))

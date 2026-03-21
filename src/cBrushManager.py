@@ -119,7 +119,7 @@ class WeightBrushManager:
         with MayaNativeProfiler("Raycast", 6):
             # ray cast
             hit_success, hit_pos, hit_normal, hit_tri, _, _, _ = self.engine.raycast(ray_source, ray_dir)
-            
+
         # 未命中处理
         if not hit_success:
             # if action == "hover":
@@ -171,8 +171,7 @@ class WeightBrushManager:
         if not handle.is_valid:
             return
 
-        raw_weights = weights_manager.get_raw_weights(layer_idx, is_mask)
-        vtx_count, influences_count, _, weights_1d = weights_manager.parse_raw_weights(raw_weights)
+        vtx_count, influences_count, _, weights_1d = weights_manager.get_handle(layer_idx, is_mask).parse_raw_weights()
         if vtx_count <= 0:
             return
 
@@ -232,14 +231,18 @@ class WeightBrushManager:
 
             # ✨ 核心改变：使用专用的稀疏状态还原器，强行覆盖，绝对精准！
             def undo():
-                wm._set_sparse_data(layer, mask, mod_vtx_idx, mod_ch_idx, old_sparse)
+                wm.set_sparse_weights(layer, mask, mod_vtx_idx, mod_ch_idx, old_sparse)
 
             def redo():
-                wm._set_sparse_data(layer, mask, mod_vtx_idx, mod_ch_idx, new_sparse)
+                wm.set_sparse_weights(layer, mask, mod_vtx_idx, mod_ch_idx, new_sparse)
 
             # 提交到咱们自己的 API 撤销栈
             apiundo.commit(redo, undo, execute=False)
 
-        # 清除挂载状态，让 Python 回收临时对象
+        wm = self.cSkin.weights_manager
+        handle = wm.get_handle(self.layer_idx, self.is_mask)
+        if handle and handle.is_valid:
+            handle.commit()
+
         self.active_processor = None
         self.active_handle = None

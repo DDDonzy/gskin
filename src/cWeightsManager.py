@@ -5,6 +5,7 @@ import typing
 import array
 import functools
 import threading
+import contextlib
 from collections import deque
 
 
@@ -18,55 +19,6 @@ from .cBufferManager import BufferManager
 
 if typing.TYPE_CHECKING:
     from .cSkinDeform import CythonSkinDeformer  # type: ignore
-
-
-def updateDG(func):
-    """
-    触发唯一次 Maya 视口刷新。
-    """
-
-    @functools.wraps(func)
-    def wrapper(self: WeightsManager, *args, **kwargs):
-        # 检查当前是否已经处于某一个 updateDG 的执行周期内
-        is_top_level = not getattr(self, "_is_dg_updating", False)
-
-        # 如果是最外层调用，把门锁死
-        if is_top_level:
-            self._is_dg_updating = True
-
-        try:
-            return func(self, *args, **kwargs)
-        finally:
-            # 只有最外层函数运行完毕，才允许刷新视口
-            if is_top_level:
-                self._is_dg_updating = False  # 先解锁
-
-                # 触发你原本的强制刷新逻辑
-                if hasattr(self, "updateDG") and callable(getattr(self, "updateDG")):
-                    self.updateDG()
-
-    return wrapper
-
-
-def async_queued_task(func):
-    """
-    [魔法装饰器]
-    拦截函数的直接执行，将其打包为闭包任务推入队列，并通知 Maya 刷新。
-    """
-
-    @functools.wraps(func)
-    def wrapper(self, *args, **kwargs):
-        # 1. 使用 partial 将函数本体、self 以及所有参数“冻结”成一个待执行任务包
-        task = functools.partial(func, self, *args, **kwargs)
-
-        # 2. 塞进队列
-        with self.queue_lock:
-            self.stroke_queue.append(task)
-
-        # 3. 踢醒 Maya 的 deform
-        self.updateDG()
-
-    return wrapper
 
 
 class WeightsHandle:
@@ -91,9 +43,10 @@ class WeightsHandle:
     mObject_data : om1.MObject     = None # 包装了 VectorArray 的 Maya 数据实体
     mVectorArray : om1.MVectorArray= None # 指向 MObject 内部缓冲区的引用
 
-    memory       : BufferManager   = None # 权重数据的底层裸指针映射 (纯 Float 视图)
-    max_capacity : int             = -1   # 当前物理内存支持的最大 Float 存储量 (VectorLength * 6)
-    length       : int             = -1   # 当前逻辑数据的有效 Float 长度
+    memory        : BufferManager   = None # 权重数据的底层裸指针映射 (纯 Float 视图)
+    weights_memory: BufferManager   = None # 仅权重部分视图
+    max_capacity  : int             = -1   # 当前物理内存支持的最大 Float 存储量 (VectorLength * 6)
+    length        : int             = -1   # 当前逻辑数据的有效 Float 长度
     # fmt:on
 
     def __init__(self, mPlug: om1.MPlug, mDataHandle: om1.MDataHandle):
@@ -104,124 +57,6 @@ class WeightsHandle:
         self.mPlug = mPlug
         self.mDataHandle = mDataHandle
         self._setup_vector_buffer(self.mDataHandle)
-
-    @property
-    def is_valid(self) -> bool:
-        """检查内存映射是否有效且逻辑数据是否存在"""
-        # 1. 基础对象与内存引用检查
-        if self.mObject_data is None or self.mObject_data.isNull():
-            return False
-        if self.mVectorArray is None or self.memory is None:
-            return False
-        if self.memory.view is None:
-            return False
-
-        # 2. 获取表头数据
-        v_count = getattr(self, "vtx_count", 0)
-        i_count = getattr(self, "influence_count", 0)
-        
-        # 🚨 修正点 1：0 是合法的空图层状态！负数才是内存乱码
-        if v_count < 0 or i_count < 0:
-            return False
-            
-        # 3. 计算所需的 Float 容量
-        # 哪怕 v_count 和 i_count 都是 0，Header 依然存在 (占用 2 个坑位)
-        required_floats = 2 + i_count + (v_count * i_count)
-        
-        # 物理分配的总容量 (1 个 MVector = 3 个 double = 6 个 float)
-        actual_floats = self.mVectorArray.length() * 6 
-
-        # 🚨 修正点 2：如果表头读出了巨大的乱码，required_floats 会远超 actual_floats
-        if required_floats > actual_floats:
-            return False
-
-        return True
-
-    def _setup_vector_buffer(self, mDataHandle: om1.MDataHandle):
-        """
-        从 MDataHandle 解析并确立对 MVectorArray 内存块的绑定。
-        """
-        self.mObject_data = mDataHandle.data()
-        if self.mObject_data.isNull():
-            return
-
-        # 获取 MObject 内部数组的引用 (并非拷贝)
-        fn_vector_data = om1.MFnVectorArrayData(self.mObject_data)
-        self.mVectorArray = fn_vector_data.array()
-
-        # 刷新物理内存指针映射
-        self._remap_memory()
-
-    def _remap_memory(self):
-        """
-        核心方法：重新映射物理指针。
-        由于 setLength 会触发 C++ 内存重新分配，每次长度改变后必须刷新指针。
-        """
-        if self.mVectorArray is None or self.mVectorArray.length() <= 0:
-            return
-
-        # 1. 提取第 0 个元素的裸指针 (SWIG 代理地址)
-        _ptr = int(self.mVectorArray[0].this)
-        self.max_capacity = self.mVectorArray.length() * 6
-
-        # 2. 映射表头 (Header): 解析前两个 int32 (vtx_count, inf_count)
-        _header_memory = BufferManager.from_ptr(_ptr, "i", (2,))
-        self.vtx_count = _header_memory.view[0]
-        print("self.vtx_count",self.vtx_count)
-        self.influence_count = _header_memory.view[1]
-        print("self.influence_count",self.influence_count)
-
-        # 3. 计算并锁定逻辑数据视图长度
-        self.length = (2 + self.influence_count) + (self.vtx_count * self.influence_count)
-        print("self.length",self.length)
-
-        # 4. 生成 Float32 视图供 Cython 使用
-        self.memory = BufferManager.from_ptr(_ptr, "f", (self.length,))
-
-    def resize(self, length: int):
-        """
-        原地扩容底层物理内存。
-        通过修改 MVectorArray 长度，实现对 MObject 缓冲区的直接重塑。
-        """
-        # 如果当前容量足够，只需更新逻辑长度
-        if length <= self.max_capacity:
-            self.length = length
-            return False
-
-        # 1. 换算所需的 Vector 数量 (向上取整)
-        vector_count = (length + 5) // 6
-
-        # 2. 触发 C++ 原地扩容 (原地 realloc)
-        self.mVectorArray.setLength(vector_count)
-
-
-        return True
-
-    def commit(self):
-        """
-        [数据固化]
-        将当前内存里的 MObject 实体正式同步回节点的 MPlug。
-        这会触发 Maya 的存盘标记 (Scene Dirty) 并将数据存入 Internal Storage。
-        """
-        if self.mPlug and self.mObject_data and not self.mObject_data.isNull():
-            self.mPlug.setMObject(self.mObject_data)
-
-    def clear(self):
-        """
-        重置数据为默认状态 (1个元素的空壳)
-        """
-        empty_array = om1.MVectorArray()
-        empty_array.setLength(1)  # 保留1个元素防止 [0].this 崩溃
-
-        fn_data = om1.MFnVectorArrayData()
-        self.mObject_data = fn_data.create(empty_array)
-        self.mVectorArray = empty_array
-
-        if self.mDataHandle is not None:
-            self.mDataHandle.setMObject(self.mObject_data)
-
-        self._remap_memory()
-        return True
 
     @classmethod
     def from_attr_string(cls, attr_path: str):
@@ -236,6 +71,247 @@ class WeightsHandle:
         # 注意：外部调用时需自行提供对应的 DataHandle 或是通过 plug.asMDataHandle() 获取
         return cls(plug, plug.asMDataHandle())
 
+    def _setup_vector_buffer(self, mDataHandle: om1.MDataHandle):
+        """
+        从 MDataHandle 解析 MVectorArray
+
+        Updates:
+            - `self.mObject_data`
+            - `self.mVectorArray`
+            - `self.vtx_count`
+            - `self.influence_count`
+            - `self.length`
+            - `self.max_capacity`
+            - `self.memory`
+        """
+        self.mObject_data = mDataHandle.data()
+        if self.mObject_data.isNull():
+            om1.MGlobal.displayError(f"{self.mPlug.name()}'s dataHandle:{mDataHandle} is Null")
+
+        # 获取 MObject 内部数组的引用 (并非拷贝)
+        fn_vector_data = om1.MFnVectorArrayData(self.mObject_data)
+        self.mVectorArray = fn_vector_data.array()
+        self.max_capacity = self.mVectorArray.length() * 6
+
+        # 刷新物理内存指针映射
+        self._remap_memory()
+
+    def _remap_memory(self):
+        """
+        [物理层映射] 将底层 C++ VectorArray 内存地址映射为 Python 连续视图。
+        此函数仅客观圈定物理地盘，不负责数据安全性校验 (校验交由 is_valid 处理)。
+
+        Updates:
+            - `self.vtx_count`
+            - `self.influence_count`
+            - `self.length`
+            - `self.memory`
+            - `self.weights_memory` (带有 physical padding，用于 fill 格式化)
+        """
+        if self.mVectorArray is None:
+            self.memory = None
+            self.weights_memory = None
+            return
+
+        if self.mVectorArray.length() <= 0:
+            self.memory = None
+            self.weights_memory = None
+            return
+
+        _ptr = int(self.mVectorArray[0].this)
+        self.memory = BufferManager.from_ptr(_ptr, "f", (self.max_capacity,))
+
+        _int_view = self.memory.view.cast("B").cast("i")
+        self.vtx_count = _int_view[0]
+        self.influence_count = _int_view[1]
+
+        self.length = (2 + self.influence_count) + (self.vtx_count * self.influence_count)
+
+        if self.influence_count >= 0:
+            self.weights_memory = self.memory.slice(start=2 + self.influence_count)
+        else:
+            self.weights_memory = None
+
+    def resize(self, vtx_count: int, inf_count: int):
+        """
+        根据顶点和骨骼数量，原地扩容底层物理内存，并自动格式化为安全状态。
+
+        Updates:
+            - `self.vtx_count`
+            - `self.influence_count`
+            - `self.length`
+            - `self.memory`
+            - `self.weights_memory`
+        """
+        required_length = (2 + inf_count) + (vtx_count * inf_count)
+
+        # 1. 如果容量足够，复用内存
+        if required_length <= self.max_capacity:
+            self.length = required_length
+            self.vtx_count = vtx_count
+            self.influence_count = inf_count
+
+            _ptr = int(self.mVectorArray[0].this)
+            _header = BufferManager.from_ptr(_ptr, "i", (2,))
+            _header.view[0] = vtx_count
+            _header.view[1] = inf_count
+
+            self._remap_memory()
+
+            # 🚀 格式化复用内存的负载区，清除上一次图层遗留的错位旧数据
+            if self.weights_memory:
+                self.weights_memory.fill(0.0)
+
+            return False
+
+        # 2. 如果容量不足，触发底层物理扩容
+        vector_count = (required_length + 5) // 6
+        self.mVectorArray.setLength(vector_count)
+        self.max_capacity = vector_count * 6
+
+        # 3. 注入合法表头
+        _ptr = int(self.mVectorArray[0].this)
+        _header = BufferManager.from_ptr(_ptr, "i", (2,))
+        _header.view[0] = vtx_count
+        _header.view[1] = inf_count
+
+        # 4. 重新映射，切出完美的 weights_memory
+        self._remap_memory()
+
+        # 🚀 格式化新分配的物理内存，彻底绞杀底层 realloc 产生的 NaN 垃圾数据！
+        if self.weights_memory:
+            self.weights_memory.fill(0.0)
+
+        return True
+
+    def parse_raw_weights(self, raw_view=None):
+        """
+        解析符合内存布局协议的连续视图。
+
+        Args:
+            raw_view: 如果提供，则解析传入的视图 (用于 Undo 备份还原)；
+                            如果为 None，则默认解析自身的 self.memory.view (用于内部重映射)。
+        """
+        if raw_view is None:
+            if self.memory is None or self.memory.view is None:
+                return 0, 0, None, None
+            raw_view = self.memory.view
+
+        if len(raw_view) < 2:
+            return 0, 0, None, None
+
+        int_view = raw_view.cast("B").cast("i")
+        vtx_count = int_view[0]
+        influence_count = int_view[1]
+
+        if vtx_count <= 0 or influence_count <= 0:
+            return 0, 0, None, None
+
+        required_elements = (2 + influence_count) + (vtx_count * influence_count)
+
+        if required_elements > len(raw_view):
+            return 0, 0, None, None
+
+        header_size = 2 + influence_count
+        influence_indices_view = int_view[2:header_size]
+        weights_view = raw_view[header_size:required_elements]
+
+        return vtx_count, influence_count, influence_indices_view, weights_view
+
+    def clear(self):
+        """
+        重置数据为默认空壳状态。
+        :param shrink: 是否强制释放物理内存。如果为 False，则只做极速的逻辑清零。
+        """
+        if self.mVectorArray is None:
+            return False
+
+        self.mVectorArray.setLength(1)
+        self.max_capacity = 6
+
+        self.resize(0, 0)
+
+        return True
+
+    def commit(self):
+        """
+        [数据固化]
+        将当前内存里的 MObject 实体正式同步回节点的 MPlug。
+        这会触发 Maya 的存盘标记 (Scene Dirty) 并将数据存入 Internal Storage。
+        """
+        pass
+        # if (not self.mPlug 
+        #     or not self.mObject_data 
+        #     or self.mObject_data.isNull()):  # fmt:skip
+        #     return
+        # self.mPlug.setMObject(self.mObject_data)
+        # print(f"commit weights handle by mPlug: {self.mPlug.name()}")
+
+    @property
+    def is_null(self) -> bool:
+        """
+        物理级检查：是否完全没有绑定 Maya 数据实体。
+        (通常发生在新节点刚创建，或 plug 断开连接时)
+        """
+        return self.mObject_data is None or self.mObject_data.isNull() or self.mVectorArray is None
+
+    @property
+    def is_empty(self) -> bool:
+        """
+        业务级检查：是否是一个合法的“空图层”。
+        (没有顶点，或没有分配任何骨骼，属于正常业务状态)
+        """
+        if self.is_null:
+            return True
+        v_cnt = getattr(self, "vtx_count", 0)
+        i_cnt = getattr(self, "influence_count", 0)
+        return v_cnt == 0 or i_cnt == 0
+
+    @property
+    def is_corrupted(self) -> bool:
+        """
+        安全级检查：物理内存是否被脏数据污染，或存在越界风险。
+        """
+        if self.is_null:
+            return False  # 什么都没有，也就无所谓损坏
+
+        vtx_count = getattr(self, "vtx_count", 0)
+        inf_count = getattr(self, "influence_count", 0)
+
+        # 1. 负数拦截 (绝对的 C++ 脏内存现象)
+        if vtx_count < 0 or inf_count < 0:
+            return True
+
+        # 2. 物理越界拦截 (拦截几十亿的天文数字)
+        required_floats = (2 + inf_count) + (vtx_count * inf_count)
+        if required_floats > self.max_capacity:
+            return True
+
+        return False
+
+    @property
+    def is_valid(self) -> bool:
+        """
+        综合通行证：句柄是否处于绝对安全、可读写的健康状态。
+        """
+        return not self.is_null and not self.is_corrupted
+
+    @property
+    def view(self):
+        """
+        [语法糖] 安全获取底层的全量物理内存视图 (含 Header 和 Padding)。
+        自带判空防御，用于底层数据的整体 Copy 或 Undo 备份。
+        """
+        return self.memory.view if self.memory is not None else None
+
+    @property
+    def weights_view(self):
+        """
+        [语法糖] 安全获取纯净的权重负载区视图 (去除了 Header)。
+        自带判空防御，用于直接格式化 (fill) 或快速读取。
+        """
+        return self.weights_memory.view if self.weights_memory is not None else None
+
 
 class WeightsLayerItem:
     def __init__(self, cSkin: CythonSkinDeformer, mDataHandle: om1.MDataHandle, logical_idx: int = -1):
@@ -247,7 +323,7 @@ class WeightsLayerItem:
         _handle_enabled = mDataHandle.child(cSkin.aLayerEnabled)
 
         self.enabled = _handle_enabled.asBool()
-        self.weights = WeightsHandle(self.mPlug_mask, _handle_weights)
+        self.weights = WeightsHandle(self.mPlug_weights, _handle_weights)
         self.mask = WeightsHandle(self.mPlug_mask, _handle_mask)
 
     # ==========================================
@@ -273,11 +349,70 @@ class WeightsLayerItem:
         return mPlug
 
 
-class WeightsManager:
+class _DeferredTaskMixin:
+    """
+    专为 Maya 节点计算周期设计的任务调度器与刷新锁。
+    提供队列管理、并发锁以及 updateDG 的执行防抖。
+    """
+
+    def __init__(self):
+        # 全部声明为保护属性，向子类隐藏实现细节
+        self._deferred_tasks = deque()
+        self._tasks_lock = threading.Lock()
+        self._is_dg_updating = False
+
+    @staticmethod
+    def _update_dg(func):
+        """防抖锁：确保唯一次视口刷新"""
+
+        @functools.wraps(func)
+        def wrapper(self: WeightsManager, *args, **kwargs):
+            is_top_level = not getattr(self, "_is_dg_updating", False)
+            if is_top_level:
+                self._is_dg_updating = True
+            try:
+                return func(self, *args, **kwargs)
+            finally:
+                if is_top_level:
+                    self._is_dg_updating = False
+                    if hasattr(self, "updateDG") and callable(getattr(self, "updateDG")):
+                        self.updateDG()
+
+        return wrapper
+
+    @staticmethod
+    def _defer_task(func):
+        """延迟执行：推入队列并唤醒节点"""
+
+        @functools.wraps(func)
+        def wrapper(self: WeightsManager, *args, **kwargs):
+            task = functools.partial(func, self, *args, **kwargs)
+            with self._tasks_lock:
+                self._deferred_tasks.append(task)
+
+            if hasattr(self, "updateDG") and callable(getattr(self, "updateDG")):
+                self.updateDG()
+
+        return wrapper
+
+    def execute_deferred_tasks(self):
+        """[高内聚] 暴露给子类，用于消化队列"""
+        if not self._deferred_tasks:
+            return
+
+        with self._tasks_lock:
+            while self._deferred_tasks:
+                task = self._deferred_tasks.popleft()
+                task()
+
+
+class WeightsManager(_DeferredTaskMixin):
     weights: WeightsHandle = None
     layers: list[WeightsLayerItem] = None
 
     def __init__(self, cSkin: CythonSkinDeformer):
+        super().__init__()
+
         self.cSkin = cSkin
         self.mObj_node = cSkin.mObject
         self.mFnDep_node = cSkin.mFnDep
@@ -287,53 +422,37 @@ class WeightsManager:
 
         self.layers: dict[int, WeightsLayerItem] = {}
 
-        # 🚀 新增：把指令队列和锁封装在 Manager 内部
-        self.stroke_queue = deque()
-        self.queue_lock = threading.Lock()
-
-    def process_queued_strokes(self):
-        """
-        [内部专用] 消化队列里的任务。在 deform 周期内调用。
-        """
-        if not self.stroke_queue:
-            return
-
-        with self.queue_lock:
-            while self.stroke_queue:
-                # 弹出任务包
-                task = self.stroke_queue.popleft()
-                # 💥 闭眼直接调用它！它会自动把之前保存的参数全部传进去执行
-                task()
+    @property
+    def layer_indices(self) -> list[int]:
+        return list(self.layers.keys())
 
     @classmethod
-    def get_manager_from_cSkin(cls, cSkinNodeName: str):
-        cSkin: CythonSkinDeformer = SkinRegistry.from_instance_by_string(cSkinNodeName)
+    def from_node(cls, node_name: str):
+        cSkin: CythonSkinDeformer = SkinRegistry.from_instance_by_string(node_name)
         return cSkin.weights_manager
 
-    def update_data(self, mDataBlock: om1.MDataBlock):
+    def sync_layer_cache(self, mDataBlock: om1.MDataBlock):
         """
         [状态同步器]
         一次性扫描 Maya 节点，刷新所有 Plug 缓存与底层内存池。
         当你在 UI 层面添加、删除了图层，或改变了节点连接后，手动调用此函数。
         """
         # weights
-        weights_dataHandle = mDataBlock.inputValue(self.cSkin.aWeights)
-        plug_weights = om1.MPlug(self.cSkin.mObject, self.cSkin.aWeights)
-        self.weights = WeightsHandle(plug_weights, weights_dataHandle)
+        weights_dataHandle = mDataBlock.outputValue(self.cSkin.aWeights)
+        self.weights = WeightsHandle(self.plug_weights, weights_dataHandle)
 
         # layer
         self.layers.clear()
-        mArrayDataHandle: om1.MArrayDataHandle = mDataBlock.inputArrayValue(self.cSkin.aLayerCompound)
-        _count = mArrayDataHandle.elementCount()
-        for idx in range(_count):
+        mArrayDataHandle: om1.MArrayDataHandle = mDataBlock.outputArrayValue(self.cSkin.aLayerCompound)
+        for idx in range(mArrayDataHandle.elementCount()):
             mArrayDataHandle.jumpToArrayElement(idx)
             logical_idx = mArrayDataHandle.elementIndex()
-            element_handle: om1.MDataHandle = mArrayDataHandle.inputValue()
+            element_handle: om1.MDataHandle = mArrayDataHandle.outputValue()
+
             self.layers[logical_idx] = WeightsLayerItem(self.cSkin, element_handle, logical_idx)
 
-    @property
-    def layer_indices(self) -> list[int]:
-        return list(self.layers.keys())
+    def updateDG(self):
+        self.cSkin.setDirty()
 
     def get_layer(self, index: int, logicalIndex: bool = True) -> "WeightsLayerItem":
         """
@@ -370,87 +489,114 @@ class WeightsManager:
 
         return None
 
-    @staticmethod
-    def parse_raw_weights(raw_view):
+    def get_weights(
+        self,
+        layer_idx: int,
+        is_mask: bool,
+        vtx_indices=None,
+        bone_local_indices=None,
+    ):
         """
-        将连续内存拆解为逻辑视图。
+        [提取/复制权重] (统一高级接口)
+        提取指定范围的权重数据，并返回完整的上下文。
+        - 全量提取时：直接底层内存拷贝，实现极致零延迟。
+        - 局部提取时：调度 Cython 引擎进行极速精细抠取。
         """
-        if raw_view is None or len(raw_view) < 2:
-            return 0, 0, None, None
-
-        int_view = raw_view.cast("B").cast("i")
-
-        vtx_count = int_view[0]
-        influence_count = int_view[1]
-        header_size = 2 + influence_count
-
-        influence_indices_view = int_view[2:header_size]
-        weights_view = raw_view[header_size:]
-
-        return vtx_count, influence_count, influence_indices_view, weights_view
-
-    def get_raw_weights(self, layer_idx: int, is_mask: bool):
-        """
-        直接索要底层的物理内存地址视图，不做任何解析。
-        """
+        # 1. 直接获取句柄并进行绝对安全拦截
         handle = self.get_handle(layer_idx, is_mask)
         if handle is None or not handle.is_valid:
-            return None
-        return handle.memory.view
+            return 0, 0, array.array("i"), array.array("i"), array.array("i"), array.array("f")
 
-    def _create_processor(self, layer_idx: int, is_mask: bool):
+        # 2. 🚀 让句柄自己解析，直接拿到完美的 1D 权重视图
+        v_count, i_count, g_bones_view, w_1d_view = handle.parse_raw_weights()
+
+        # 拦截空图层
+        if v_count <= 0 or i_count <= 0 or w_1d_view is None:
+            return 0, 0, array.array("i"), array.array("i"), array.array("i"), array.array("f")
+
+        # 提取全局骨骼 ID 备份
+        global_bone_ids = array.array("i", g_bones_view) if g_bones_view else array.array("i")
+
+        # ---------------------------------------------------------------------
+        # 🚀 性能分支：全量提取 vs 局部提取
+        # ---------------------------------------------------------------------
+        if vtx_indices is None and bone_local_indices is None:
+            # 【分支 A：全量提取】(如 Undo 备份)
+            # 既然 handle 已经切出了完美的 w_1d_view，直接 C 级拷贝，跳过引擎启动！
+            weights_1d = array.array("f", w_1d_view)
+            out_vtx = array.array("i", range(v_count))
+            out_bone = array.array("i", range(i_count))
+        else:
+            # 【分支 B：局部提取】(如笔刷吸色 / 局部修改备份)
+            # 装配引擎，让 C++ 去做跳跃式的内存抓取
+            processor = self._create_processor(layer_idx, is_mask)
+            if not processor:
+                return v_count, i_count, global_bone_ids, array.array("i"), array.array("i"), array.array("f")
+
+            v_view = BufferManager.auto(vtx_indices, "i").view if vtx_indices is not None else None
+            b_view = BufferManager.auto(bone_local_indices, "i").view if bone_local_indices is not None else None
+
+            # Cython 极速返回局部 1D 纯净数据
+            weights_1d = processor.get_custom_array(v_view, b_view)
+
+            # 补全上下文索引
+            out_vtx = array.array("i", range(v_count)) if vtx_indices is None else array.array("i", v_view)
+            out_bone = array.array("i", range(i_count)) if bone_local_indices is None else array.array("i", b_view)
+
+        return v_count, i_count, global_bone_ids, out_vtx, out_bone, weights_1d
+
+    @contextlib.contextmanager
+    def _processor_session(self, layer_idx: int, is_mask: bool, backup: bool = True):
         """
-        - 提取指定图层的物理内存，并为创建 `SkinWeightProcessor`实例，可以根据`return`的实例进行操作。
-        - `SkinWeightProcessor` 本质是笔刷处理器，初始化权重笔刷，将权重数据与笔刷引擎托管给父类进行通用运算。
-        - 在这里可以用来快速设置权重，并且自动注册undo和redo快照(参考`set_sparse_data`函数)。
+        [引擎上下文管理器]
+        统管 Cython 算力引擎的获取、快照录制与撤销栈注册。
+        基于 RAII 思想，确保底层资源绝对安全。
         """
-        _raw_view = self.get_raw_weights(layer_idx, is_mask)
-        if _raw_view is None:
-            return None
-
-        vtx_count, inf_count, _, weights_1d = self.parse_raw_weights(_raw_view)
-        print(vtx_count, inf_count)
-
-        weights_2d = weights_1d.cast("B").cast("f", (vtx_count, inf_count))
-
-        tmp_idx = BufferManager.allocate("i", (vtx_count,))
-        tmp_bool = BufferManager.allocate("B", (vtx_count,))
-        tmp_locks = BufferManager.allocate("B", (inf_count,))
-
-        # 分配 Undo 内存 (先拉平为 1D，再利用 memoryview 强转为 2D)
-        _undo_buffer = BufferManager.allocate("f", (vtx_count, inf_count))
-
-        processor = cBrushCoreCython.SkinWeightProcessor(
-            weights_2d,
-            tmp_idx.view,  # 直接传入 view
-            tmp_bool.view,  # 直接传入 view
-            tmp_locks.view,  # 直接传入 view
-            _undo_buffer.view,  # 直接传入完美的 2D view！
-        )
-        return processor
-
-    @updateDG
-    def _set_sparse_data(self, layer_idx: int, is_mask: bool, vtx_indices, channel_indices, sparse_values):
-        """
-        专供 Undo / Redo 闭包调用。
-        直接使用 C 级覆盖能力还原快照，彻底告别 Python 循环！
-        """
+        # 1. 尝试获取算力引擎
         processor = self._create_processor(layer_idx, is_mask)
+
+        # 拦截空图层或坏句柄
         if not processor:
+            yield None
             return
 
-        # 撤销时不需要记录新的 Undo 快照，也不需要复杂的模式，直接暴力 Replace (blend_mode=2)
-        processor.set_custom_array(source_values=sparse_values, blend_mode=2, vertex_indices=vtx_indices, channel_indices=channel_indices)
+        # 2. 开启录制 (Setup)
+        if backup:
+            processor.begin_stroke()
 
-    @async_queued_task
+        try:
+            # 3. 将引擎实例递交给业务代码使用
+            yield processor
+
+        finally:
+            # 4. 收尾工作 (Teardown)：确保快照闭合与闭包注册
+            if backup:
+                undo_data = processor.end_stroke()
+                if undo_data:
+                    mod_vtx, mod_ch, old_sparse, new_sparse = undo_data
+
+                    def redo():
+                        self.set_sparse_weights(layer_idx, is_mask, mod_vtx, mod_ch, new_sparse)
+
+                    def undo():
+                        self.set_sparse_weights(layer_idx, is_mask, mod_vtx, mod_ch, old_sparse)
+
+                    # 注册进 Maya 的原生撤销栈
+                    apiundo.commit(redo, undo, execute=False)
+
+                handle = self.get_handle(layer_idx, is_mask)
+                if handle and handle.is_valid:
+                    handle.commit()
+
+    @_DeferredTaskMixin._defer_task
     def set_weights(
         self,
         layer_idx: int,
         is_mask: bool,
         vtx_indices,
         weights_1d,
-        locked_influence_indices=None,
-        blend_mode: int = 2,  # 0:Add, 1:Sub, 2:Replace, 3:Multiply
+        influence_indices=None,
+        blend_mode: int = 2,
         alpha: float = 1.0,
         falloff_weights=None,
         normalize=True,
@@ -460,53 +606,46 @@ class WeightsManager:
         将所有输入丢给 Cython 无头引擎，
         支持加减乘除、透明度混合、蒙版衰减、自动归一化与稀疏撤销。
         """
-        processor = self._create_processor(layer_idx, is_mask)
-        if not processor:
-            return False
+        # 开启引擎会话
+        with self._processor_session(layer_idx, is_mask, backup) as processor:
+            # 如果没拿到引擎，直接退出
+            if not processor:
+                return False
 
-        # 转为 Cython 认识的 memoryview
-        # fmt:off
-        v_view   = BufferManager.auto(vtx_indices              , "i").view    if vtx_indices              is not None else None
-        b_view   = BufferManager.auto(locked_influence_indices , "i").view    if locked_influence_indices is not None else None
-        src_view = BufferManager.auto(weights_1d               , "f").view
-        fal_view = BufferManager.auto(falloff_weights          , "f").view    if falloff_weights          is not None else None
-        # fmt:on
+            # --- 纯粹的数据转换与计算 ---
+            # fmt:off
+            v_view   = BufferManager.auto(vtx_indices              , "i").view    if vtx_indices              is not None else None
+            b_view   = BufferManager.auto(influence_indices        , "i").view    if influence_indices        is not None else None
+            src_view = BufferManager.auto(weights_1d               , "f").view
+            fal_view = BufferManager.auto(falloff_weights          , "f").view    if falloff_weights          is not None else None
+            # fmt:on
 
-        # 开启快照录制
-        if backup:
-            processor.begin_stroke()
+            # Cython 执行带混合模式的覆写
+            processor.set_custom_array( source_values   = src_view   ,
+                                        blend_mode      = blend_mode ,
+                                        vertex_indices  = v_view     ,
+                                        channel_indices = b_view     ,
+                                        alpha           = alpha      ,
+                                        falloff_weights = fal_view   )  # fmt:skip
 
-        # Cython 执行带混合模式的覆写
-        processor.set_custom_array( source_values   = src_view   ,
-                                    blend_mode      = blend_mode ,
-                                    vertex_indices  = v_view     ,
-                                    channel_indices = b_view     ,
-                                    alpha           = alpha      ,
-                                    falloff_weights = fal_view   )  # fmt:skip
-
-        # 如果不是mask，覆写后必须进行权重归一化！
-        if not is_mask and normalize:
-            priority = b_view[0] if (b_view is not None and len(b_view) > 0) else -1
-            processor._normalize_weights(v_view, priority)
-
-        #  从快照 提取Undo/Redo 数据
-        if backup:
-            undo_data = processor.end_stroke()
-            if undo_data:
-                mod_vtx, mod_ch, old_sparse, new_sparse = undo_data
-
-                def redo():
-                    self._set_sparse_data(layer_idx, is_mask, mod_vtx, mod_ch, new_sparse)
-
-                def undo():
-                    self._set_sparse_data(layer_idx, is_mask, mod_vtx, mod_ch, old_sparse)
-
-                apiundo.commit(redo, undo, execute=False)
+            # 权重归一化
+            if not is_mask and normalize:
+                priority = b_view[0] if (b_view is not None and len(b_view) > 0) else -1
+                processor._normalize_weights(v_view, priority)
 
         return True
 
-    @async_queued_task
-    def rebuild_layer(self, layer_idx, is_mask, vtx_count, inf_count, influence_indices, weights_1d, backup=True):
+    @_DeferredTaskMixin._defer_task
+    def init_handle_data(
+        self,
+        layer_idx,
+        is_mask,
+        vtx_count,
+        inf_count,
+        influence_indices,
+        weights_1d,
+        backup=True,
+    ):
         """
         [全量重建/覆盖图层]
         Python 负责重建 Maya 的底层物理内存和结构，然后移交 Cython 引擎进行纯数据的光速覆写。
@@ -524,10 +663,10 @@ class WeightsManager:
             safe_new_w = array.array("f", BufferManager.auto(weights_1d, "f").view)
 
             def redo():
-                self.rebuild_layer(layer_idx, is_mask, vtx_count, inf_count, safe_new_idx, safe_new_w, backup=False)
+                self.init_handle_data(layer_idx, is_mask, vtx_count, inf_count, safe_new_idx, safe_new_w, backup=False)
 
             def undo():
-                self.rebuild_layer(layer_idx, is_mask, old_v_cnt, old_i_cnt, old_g_bones, old_w_1d, backup=False)
+                self.init_handle_data(layer_idx, is_mask, old_v_cnt, old_i_cnt, old_g_bones, old_w_1d, backup=False)
 
             apiundo.commit(redo, undo, execute=False)
 
@@ -536,76 +675,79 @@ class WeightsManager:
             return True
 
         # --- [2. Python 负责重建底层物理内存与骨骼 Header (搭地基)] ---
-        total_size = (2 + len(influence_indices)) + (vtx_count * len(influence_indices))
-        handle.resize(total_size)
-        if not handle.is_valid:
-            return False
+        handle.resize(vtx_count, len(influence_indices))
 
-        _view = handle.memory.view
-        _int = _view.cast("B").cast("i")
-        _int[0], _int[1] = vtx_count, len(influence_indices)
         if influence_indices:
+            _view = handle.memory.view
+            _int = _view.cast("B").cast("i")
             _int[2 : 2 + len(influence_indices)] = BufferManager.auto(influence_indices, "i").view
 
-        processor = self._create_processor(layer_idx, is_mask)
-        if processor:
-            processor.set_custom_array(
-                source_values=BufferManager.auto(weights_1d, "f").view,
-                blend_mode=2,
-                vertex_indices=None,
-                channel_indices=None,
-            )
-
+        # 🚀 修复 2：召唤 Cython 引擎，执行全量底层 Replace 覆写
+        if weights_1d is not None:
+            processor = self._create_processor(layer_idx, is_mask)
+            if processor:
+                processor.set_custom_array(
+                    source_values=BufferManager.auto(weights_1d, "f").view,
+                    blend_mode=2,
+                    vertex_indices=None,
+                    channel_indices=None,
+                )
         return True
 
-    def get_weights(self, layer_idx: int, is_mask: bool, vtx_indices=None, bone_local_indices=None):
+    @_DeferredTaskMixin._update_dg
+    def set_sparse_weights(
+        self,
+        layer_idx: int,
+        is_mask: bool,
+        vtx_indices,
+        channel_indices,
+        sparse_values,
+    ):
         """
-        [提取/复制权重] (统一高级接口)
-        利用底层 Cython 引擎极速抠出指定范围的权重数据，并返回完整的上下文。
-        如果不传索引，默认提取全量数据。
-
-        Returns:
-            tuple: (
-                vtx_count: int,                # 1. 图层总顶点数
-                inf_count: int,                # 2. 图层总骨骼数
-                global_bone_ids: array.array,  # 3. 图层的全局骨骼ID (Header数据)
-                out_vtx_indices: array.array,  # 4. 本次提取对应的顶点局部索引
-                out_bone_indices: array.array, # 5. 本次提取对应的骨骼局部索引
-                weights_1d: array.array        # 6. 本次提取的 1D 纯净权重数据
-            )
+        专供 Undo / Redo 闭包调用。
+        直接使用 C 级覆盖能力还原快照，彻底告别 Python 循环！
         """
-        # 1. 解析基础 Header 结构信息 (顺便获取全局骨骼ID，供 set_weights_all 备份使用)
-        raw_view = self.get_raw_weights(layer_idx, is_mask)
-        if not raw_view:
-            return 0, 0, array.array("i"), array.array("i"), array.array("i"), array.array("f")
-
-        v_count, i_count, g_bones_view, _ = self.parse_raw_weights(raw_view)
-        global_bone_ids = array.array("i", g_bones_view) if g_bones_view else array.array("i")
-
-        # 2. 装配无头引擎，利用 C 语言极速提取 1D 权重数据
         processor = self._create_processor(layer_idx, is_mask)
         if not processor:
-            return v_count, i_count, global_bone_ids, array.array("i"), array.array("i"), array.array("f")
+            return
 
-        v_view = BufferManager.auto(vtx_indices, "i").view if vtx_indices is not None else None
-        b_view = BufferManager.auto(bone_local_indices, "i").view if bone_local_indices is not None else None
+        # 撤销时不需要记录新的 Undo 快照，也不需要复杂的模式，直接暴力 Replace (blend_mode=2)
+        processor.set_custom_array(
+            source_values=sparse_values,
+            blend_mode=2,
+            vertex_indices=vtx_indices,
+            channel_indices=channel_indices,
+        )
 
-        # Cython 极速返回 1D 纯净数据
-        weights_1d = processor.get_custom_array(v_view, b_view)
+    def _create_processor(self, layer_idx: int, is_mask: bool):
+        """
+        - 提取指定图层的物理内存，并为创建 `SkinWeightProcessor`实例，可以根据`return`的实例进行操作。
+        - `SkinWeightProcessor` 本质是笔刷处理器，初始化权重笔刷，将权重数据与笔刷引擎托管给父类进行通用运算。
+        - 在这里可以用来快速设置权重，并且自动注册undo和redo快照(参考`set_sparse_data`函数)。
+        """
+        handle = self.get_handle(layer_idx, is_mask)
 
-        # 3. 智能补全提取范围的上下文索引 (这是最贴心的一步)
-        # 如果你传了 None (要求全量提取)，系统自动帮你生成完整的物理索引数组
-        if vtx_indices is None:
-            out_vtx = array.array("i", range(v_count))
-        else:
-            out_vtx = array.array("i", v_view)
+        if handle is None or not handle.is_valid:
+            return None
 
-        if bone_local_indices is None:
-            out_bone = array.array("i", range(i_count))
-        else:
-            out_bone = array.array("i", b_view)
+        vtx_count, inf_count, _, weights_1d = handle.parse_raw_weights()
 
-        return v_count, i_count, global_bone_ids, out_vtx, out_bone, weights_1d
+        if vtx_count <= 0 or inf_count <= 0 or weights_1d is None:
+            return None
 
-    def updateDG(self):
-        self.cSkin.setDirty()
+        weights_2d = weights_1d.cast("B").cast("f", (vtx_count, inf_count))
+
+        tmp_idx = BufferManager.allocate("i", (vtx_count,))
+        tmp_bool = BufferManager.allocate("B", (vtx_count,))
+        tmp_locks = BufferManager.allocate("B", (inf_count,))
+
+        _undo_buffer = BufferManager.allocate("f", (vtx_count, inf_count))
+
+        processor = cBrushCoreCython.SkinWeightProcessor(
+            weights_2d,
+            tmp_idx.view,  # 直接传入 view
+            tmp_bool.view,  # 直接传入 view
+            tmp_locks.view,  # 直接传入 view
+            _undo_buffer.view,  # 直接传入完美的 2D view！
+        )
+        return processor

@@ -1,5 +1,3 @@
-# encoding=utf-8
-
 from __future__ import annotations
 import ctypes
 
@@ -15,7 +13,6 @@ from . import cTopologyCython as cTopology
 
 from .cSkinContext import MeshTopologyContext, BrushHitContext
 
-# from ._profile import MicroProfiler, DeepProfiler, maya_profile, MayaNativeProfiler
 from ._cProfilerCython import MayaNativeProfiler, maya_profile
 
 
@@ -391,34 +388,15 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
 
         with MayaNativeProfiler("Update Weights", 2):
             if self.isDirty_weights:
-                self.weights_manager.update_data(dataBlock)
-                self.weights_manager.process_queued_strokes()
-                handle = self.weights_manager.get_handle(-1, 0)
-                
-                data = dataBlock.inputValue(self.aWeights).data()
-                fn = om1.MFnVectorArrayData(data)
-                ary = fn.array()
-                print(ary.length())
-                
+                self.weights_manager.sync_layer_cache(dataBlock)
+                self.weights_manager.execute_deferred_tasks()
 
                 self.isDirty_weights = True
 
-            handle = self.weights_manager.get_handle(-1, 0)
-            fn = om1.MFnVectorArrayData(handle.mDataHandle.data())
-            ary = fn.array()
-            print(ary.length())
-
-            print(handle.mVectorArray.length())
-            print(handle.length)
-            if not handle.is_valid:
-                print("error")
-                return
-            _weightsView = self.weights_manager.get_raw_weights(-1, 0)
-            if _weightsView is None:
-                return
-            _, _, _, self._skinWeights = self.weights_manager.parse_raw_weights(_weightsView)
-
         with MayaNativeProfiler("Cython Cal matrix", 1):
+            _, _, _, self._skinWeights = self.weights_manager.get_handle(-1, 0).parse_raw_weights()
+            if self._skinWeights is None:
+                return
             cSkinDeformCython.compute_deform_matrices(
                 int(self._geo_matrix.this),
                 int(self._get_matrix_i.this),
@@ -462,11 +440,14 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         mAttr.setUsesArrayDataBuilder(True)
 
         # --- weights
-        CythonSkinDeformer.aWeights = tAttr.create("cWeights", "cw", om1.MFnData.kVectorArray)
-        a = om1.MVectorArray()
-        a.setLength(1)
-        tAttr.setDefault(om1.MFnVectorArrayData().create(om1.MVectorArray(a)))
+        default_vector_array = om1.MVectorArray()
+        default_vector_array.setLength(1)
+        default_vector_data = om1.MFnVectorArrayData().create(default_vector_array)
+
+        CythonSkinDeformer.aWeights = tAttr.create("cWeights", "cw", om1.MFnData.kVectorArray, default_vector_data)
         tAttr.setHidden(True)
+        tAttr.setStorable(True)
+        tAttr.hasObj(True)
 
         # --- layer weights children
         CythonSkinDeformer.aLayerEnabled = nAttr.create("layerEnabled", "le", om1.MFnNumericData.kBoolean, False)
