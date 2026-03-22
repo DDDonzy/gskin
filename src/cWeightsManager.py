@@ -38,15 +38,16 @@ class WeightsHandle:
     """
 
     # fmt:off
-    mDataHandle  : om1.MDataHandle = None # 变形器计算周期内的临时句柄
-    mPlug        : om1.MPlug       = None # 节点插座，用于数据持久化
-    mObject_data : om1.MObject     = None # 包装了 VectorArray 的 Maya 数据实体
-    mVectorArray : om1.MVectorArray= None # 指向 MObject 内部缓冲区的引用
+    mDataHandle  : om1.MDataHandle  # 变形器计算周期内的临时句柄
+    mPlug        : om1.MPlug        # 节点插座，用于数据持久化
+    mObject_data : om1.MObject      # 包装了 VectorArray 的 Maya 数据实体
+    mVectorArray : om1.MFnVectorArrayData # 指向 MObject 内部缓冲区的引用
 
-    memory        : BufferManager   = None # 权重数据的底层裸指针映射 (纯 Float 视图)
-    weights_memory: BufferManager   = None # 仅权重部分视图
-    max_capacity  : int             = -1   # 当前物理内存支持的最大 Float 存储量 (VectorLength * 6)
-    length        : int             = -1   # 当前逻辑数据的有效 Float 长度
+    memory        : BufferManager    # 权重数据的底层裸指针映射 (纯 Float 视图)
+    weights_memory: BufferManager    # 仅权重部分视图
+    max_capacity  : int              # 当前物理内存支持的最大 Float 存储量 (VectorLength * 6)
+    length        : int              # 当前逻辑数据的有效 Float 长度
+           
     # fmt:on
 
     def __init__(self, mPlug: om1.MPlug, mDataHandle: om1.MDataHandle):
@@ -54,8 +55,18 @@ class WeightsHandle:
         初始化装配器。
         注：由于 nodeInitializer 设置了默认值，此处假定 mDataHandle 必定包含合法的 VectorArray。
         """
-        self.mPlug = mPlug
-        self.mDataHandle = mDataHandle
+        # fmt:off
+        self.mPlug        = mPlug
+        self.mDataHandle  = mDataHandle
+
+        self.mObject_data   = None
+        self.mVectorArray   = None
+        self.memory         = None
+        self.weights_memory = None
+        self.max_capacity   = -1
+        self.length         = -1
+        # fmt:on
+
         self._setup_vector_buffer(self.mDataHandle)
 
     @classmethod
@@ -78,15 +89,14 @@ class WeightsHandle:
         Updates:
             - `self.mObject_data`
             - `self.mVectorArray`
-            - `self.vtx_count`
-            - `self.influence_count`
             - `self.length`
             - `self.max_capacity`
             - `self.memory`
         """
         self.mObject_data = mDataHandle.data()
         if self.mObject_data.isNull():
-            om1.MGlobal.displayError(f"{self.mPlug.name()}'s dataHandle:{mDataHandle} is Null")
+            # om1.MGlobal.displayError(f"{self.mPlug.name()}'s dataHandle:{mDataHandle} is Null")
+            return
 
         # 获取 MObject 内部数组的引用 (并非拷贝)
         fn_vector_data = om1.MFnVectorArrayData(self.mObject_data)
@@ -102,8 +112,6 @@ class WeightsHandle:
         此函数仅客观圈定物理地盘，不负责数据安全性校验 (校验交由 is_valid 处理)。
 
         Updates:
-            - `self.vtx_count`
-            - `self.influence_count`
             - `self.length`
             - `self.memory`
             - `self.weights_memory` (带有 physical padding，用于 fill 格式化)
@@ -122,13 +130,13 @@ class WeightsHandle:
         self.memory = BufferManager.from_ptr(_ptr, "f", (self.max_capacity,))
 
         _int_view = self.memory.view.cast("B").cast("i")
-        self.vtx_count = _int_view[0]
-        self.influence_count = _int_view[1]
+        vtx_count = _int_view[0]
+        influence_count = _int_view[1]
 
-        self.length = (2 + self.influence_count) + (self.vtx_count * self.influence_count)
+        self.length = (2 + influence_count) + (vtx_count * influence_count)
 
-        if self.influence_count >= 0:
-            self.weights_memory = self.memory.slice(start=2 + self.influence_count)
+        if influence_count >= 0:
+            self.weights_memory = self.memory.slice(start=2 + influence_count)
         else:
             self.weights_memory = None
 
@@ -137,19 +145,24 @@ class WeightsHandle:
         根据顶点和骨骼数量，原地扩容底层物理内存，并自动格式化为安全状态。
 
         Updates:
-            - `self.vtx_count`
-            - `self.influence_count`
             - `self.length`
             - `self.memory`
             - `self.weights_memory`
         """
+        if self.is_null:
+            ""
+            init_ary = om1.MVectorArray()
+            init_obj = om1.MFnVectorArrayData().create(init_ary)
+            self.mVectorArray = init_ary
+            self.mObject_data = init_obj
+            self.mDataHandle.setMObject(init_obj)
+            self._setup_vector_buffer(self.mDataHandle)
+
         required_length = (2 + inf_count) + (vtx_count * inf_count)
 
         # 1. 如果容量足够，复用内存
         if required_length <= self.max_capacity:
             self.length = required_length
-            self.vtx_count = vtx_count
-            self.influence_count = inf_count
 
             _ptr = int(self.mVectorArray[0].this)
             _header = BufferManager.from_ptr(_ptr, "i", (2,))
@@ -232,20 +245,6 @@ class WeightsHandle:
         self.resize(0, 0)
 
         return True
-
-    def commit(self):
-        """
-        [数据固化]
-        将当前内存里的 MObject 实体正式同步回节点的 MPlug。
-        这会触发 Maya 的存盘标记 (Scene Dirty) 并将数据存入 Internal Storage。
-        """
-        pass
-        # if (not self.mPlug 
-        #     or not self.mObject_data 
-        #     or self.mObject_data.isNull()):  # fmt:skip
-        #     return
-        # self.mPlug.setMObject(self.mObject_data)
-        # print(f"commit weights handle by mPlug: {self.mPlug.name()}")
 
     @property
     def is_null(self) -> bool:
@@ -407,20 +406,18 @@ class _DeferredTaskMixin:
 
 
 class WeightsManager(_DeferredTaskMixin):
-    weights: WeightsHandle = None
-    layers: list[WeightsLayerItem] = None
-
     def __init__(self, cSkin: CythonSkinDeformer):
         super().__init__()
 
         self.cSkin = cSkin
-        self.mObj_node = cSkin.mObject
-        self.mFnDep_node = cSkin.mFnDep
+        self.mObject_node = cSkin.mObject
+        self.mFnDepend_node = cSkin.mFnDep
+
+        self.weights: WeightsHandle = None
+        self.layers: dict[int, WeightsLayerItem] = {}
 
         self.plug_refresh: om1.MPlug = cSkin.plug_refresh
         self.plug_weights: om1.MPlug = om1.MPlug(cSkin.mObject, cSkin.aWeights)
-
-        self.layers: dict[int, WeightsLayerItem] = {}
 
     @property
     def layer_indices(self) -> list[int]:
@@ -586,15 +583,15 @@ class WeightsManager(_DeferredTaskMixin):
 
                 handle = self.get_handle(layer_idx, is_mask)
                 if handle and handle.is_valid:
-                    handle.commit()
+                    pass
 
     @_DeferredTaskMixin._defer_task
     def set_weights(
         self,
         layer_idx: int,
         is_mask: bool,
-        vtx_indices,
         weights_1d,
+        vtx_indices,
         influence_indices=None,
         blend_mode: int = 2,
         alpha: float = 1.0,
@@ -631,7 +628,7 @@ class WeightsManager(_DeferredTaskMixin):
             # 权重归一化
             if not is_mask and normalize:
                 priority = b_view[0] if (b_view is not None and len(b_view) > 0) else -1
-                processor._normalize_weights(v_view, priority)
+                processor.normalize_weights(v_view, priority)
 
         return True
 
@@ -692,6 +689,7 @@ class WeightsManager(_DeferredTaskMixin):
                     vertex_indices=None,
                     channel_indices=None,
                 )
+
         return True
 
     @_DeferredTaskMixin._update_dg

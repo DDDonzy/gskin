@@ -1814,7 +1814,7 @@ class SkinWeightProcessor(UtilBrushProcessor):
                 falloff_buffer=_fal_array,
             )
 
-            self._normalize_weights(hit_slice, priority_influence_idx)
+            self.normalize_weights(hit_slice, priority_influence_idx)
 
         return (_v_count, vertex_indices, self.modified_buffer)
 
@@ -1826,7 +1826,7 @@ class SkinWeightProcessor(UtilBrushProcessor):
     @cython.cdivision(True)
     @cython.initializedcheck(False)
     @cython.ccall
-    def _normalize_weights(
+    def normalize_weights(
         self,
         vertex_indices                 = None,  # ✨ 1. 去除强类型，允许 Python 安全传 None
         priority_influence: cython.int = -1,

@@ -266,32 +266,37 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         self.mesh_context.v2f_indices = BufferManager.from_ctypes(v2f_indices_ctypes)
         # fmt:on
 
-    def active_paint_weights(self) -> memoryview | None:
+    def get_active_paint_weights(self) -> memoryview | None:
         """
         直接从 manager 提取当前需要绘制的的权重视图。
 
         Returns:
             weightsView (memoryview | None): 返回针对特定骨骼切片后的视图。
         """
-        cSkin = self.cSkin
-        ctx = self.render_context
 
-        if not cSkin or cSkin.weights_manager is None:
+        if self.weights_manager is None:
             return None
 
-        # 1. 越过 handle，直接向 manager 索取解析好的全量数据
-        _, inf_count, _, safe_weights_view = cSkin.weights_manager.parse_raw_weights(
-            cSkin.weights_manager.get_raw_weights(ctx.paintLayerIndex, ctx.paintMask),
-        )
+        manager = self.weights_manager
 
-        # 如果没有骨骼或者视图为空，直接退出
-        if inf_count <= 0 or not safe_weights_view:
-            return None
+        # 获取用户输入数据
+        layer_index = self.mFnDep.findPlug(self.aCurrentPaintLayerIndex).asInt()
+        is_mask = self.mFnDep.findPlug(self.aCurrentPaintMaskBool).asBool()
+        influences_index = self.mFnDep.findPlug(self.aCurrentPaintInfluenceIndex).asInt() if not is_mask else 0
+
+        handle = manager.get_handle(layer_index, is_mask)
+        if handle is None:
+            return layer_index, is_mask, influences_index, None
+
+        _, inf_count, _, weights_view = handle.parse_raw_weights()
+
+        if inf_count <= 0 or not weights_view:
+            return layer_index, is_mask, influences_index, None
 
         # 2. 计算安全偏移量
-        safe_idx = max(0, min(ctx.paintInfluenceIndex, inf_count - 1))
+        safe_idx = max(0, min(influences_index, inf_count - 1))
 
-        return safe_weights_view[safe_idx::inf_count]
+        return layer_index, is_mask, influences_index, weights_view[safe_idx::inf_count]
 
     @maya_profile(0, "Compute")
     def compute(self, plug, dataBlock):
@@ -397,6 +402,7 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
             _, _, _, self._skinWeights = self.weights_manager.get_handle(-1, 0).parse_raw_weights()
             if self._skinWeights is None:
                 return
+
             cSkinDeformCython.compute_deform_matrices(
                 int(self._geo_matrix.this),
                 int(self._get_matrix_i.this),
@@ -416,6 +422,7 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
                 self._translateVector_buffer.view,
                 envelope,
             )
+        print("deform-end")
 
     @classmethod
     def nodeInitializer(cls):
@@ -440,25 +447,17 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         mAttr.setUsesArrayDataBuilder(True)
 
         # --- weights
-        default_vector_array = om1.MVectorArray()
-        default_vector_array.setLength(1)
-        default_vector_data = om1.MFnVectorArrayData().create(default_vector_array)
-
-        CythonSkinDeformer.aWeights = tAttr.create("cWeights", "cw", om1.MFnData.kVectorArray, default_vector_data)
+        CythonSkinDeformer.aWeights = tAttr.create("cWeights", "cw", om1.MFnData.kVectorArray)
         tAttr.setHidden(True)
-        tAttr.setStorable(True)
-        tAttr.hasObj(True)
 
         # --- layer weights children
         CythonSkinDeformer.aLayerEnabled = nAttr.create("layerEnabled", "le", om1.MFnNumericData.kBoolean, False)
         nAttr.setHidden(True)
 
         CythonSkinDeformer.aLayerWeights = tAttr.create("layerWeights", "lw", om1.MFnData.kVectorArray)
-        tAttr.setDefault(om1.MFnVectorArrayData().create(om1.MVectorArray()))
         tAttr.setHidden(True)
 
         CythonSkinDeformer.aLayerMask = tAttr.create("layerMask", "lm", om1.MFnData.kVectorArray)
-        tAttr.setDefault(om1.MFnVectorArrayData().create(om1.MVectorArray()))
         tAttr.setHidden(True)
 
         # --- layer comp

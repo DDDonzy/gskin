@@ -36,18 +36,8 @@ cmds.refresh()
 maya_weights, _ = get_skinWeights(sk_node)
 vertex_count = cmds.polyEvaluate(shape, vertex=True)
 influence_indices = cmds.getAttr(f"{sk_node}.matrix", mi=1)
-# --- 修正后的调用代码 ---
 manager = wm.WeightsManager.from_node("cSkinDeformer1")
-
-# 1. 正常调用重建 (这步会完成内存里的 0-Copy 覆写)
 manager.init_handle_data(-1, 0, vertex_count, len(influence_indices), influence_indices, list(maya_weights))
 
-# 2. 🌟 关键：手动执行固化同步！
-# 从 manager 拿到对应的 handle
-handle = manager.get_handle(-1, 0)
-
-# 3. 强制固化到 MPlug (将内存里的 mObject_data 拍进插座)
-handle.commit()
-
-# 4. 踢醒 Maya 刷新视口
-manager.updateDG()
+shape = cmds.createNode("triangleShape")
+cmds.connectAttr(f"{cSkin}.outputGeometry[0]",f"{shape}.inputMesh")
