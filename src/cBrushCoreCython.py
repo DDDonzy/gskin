@@ -5,7 +5,7 @@ High-Performance Cython Brush Engine for Maya Skin Weights
 ==============================================================================
 
 本模块利用 Cython 和 OpenMP 实现了极限性能的网格射线检测、拓扑寻路与权重运算。
-采用“数据与逻辑解耦”的架构设计 所有内存由上层 (Python/Maya API) 分配并持有 
+采用“数据与逻辑解耦”的架构设计 所有内存由上层 (Python/Maya API) 分配并持有
 本引擎仅接收内存视图 (MemoryView) 进行纯 C 级别的原地突变 (In-place Mutation)。
 
 【核心架构层级】
@@ -24,9 +24,14 @@ High-Performance Cython Brush Engine for Maya Skin Weights
 
 场景 A 交互式笔刷 (Interactive Stroke - 绑定在鼠标拖拽事件中)
 ------------------------------------------------------------------------------
+
     # 1. 初始化 (在插件加载或工具激活时执行一次)
+    # core 用于解析模型,raycast,计算笔刷衰减等
     core = CoreBrushEngine(vtx_pos_ary, tri_idx_ary, adj_offset, adj_idx, epochs, hit_idx, hit_w)
+
+    # processor 用于记录基本数据,执行绘制事件
     processor = SkinWeightProcessor(core, weights_ary, undo_idx, undo_mask, locks_ary, undo_pool)
+
 
     # 2. 鼠标按下 (Mouse Press)
     processor.begin_stroke()
@@ -53,7 +58,7 @@ High-Performance Cython Brush Engine for Maya Skin Weights
 
 场景 B UI 按钮一键调用 (API Direct Call - 如“一键平滑选中顶点”)
 ------------------------------------------------------------------------------
-    # 直接向引擎灌入指定的顶点索引 无需执行 raycast 
+    # 直接向引擎灌入指定的顶点索引 无需执行 raycast
     selected_verts = array.array('i', [15, 102, 334, 1056])
 
     # 瞬间完成 5 次平滑迭代 并自动执行 5 次归一化 生成完美 Undo 快照
@@ -107,13 +112,6 @@ def _clamp_float(
     clamp_min: cython.float,
     clamp_max: cython.float,
 ) -> cython.float:
-    """
-    极速标量截断函数 (Zero-overhead Inline Helper)。
-
-    由于该函数极其短小且没有任何 Python 对象交互 
-    底层 C 编译器会自动将其内联 (Inline) 展开到调用者的循环中 
-    转化为无分支的 CMOV 指令 实现零性能损耗。
-    """
     if val < clamp_min:
         return clamp_min
     if val > clamp_max:
@@ -215,13 +213,13 @@ def build_v2f_topology(
         temp_cursor[v2] += 1
 
 
-# ==============================================================================
-# 🧠 核心引擎 (内部自治 外部 2D 友好接口)
-# ==============================================================================
 
 
 @cython.cclass
 class CoreBrushEngine:
+    """
+    用于解析模型,raycast,计算笔刷衰减等
+    """
     # --- 1. 外部传入的绝对只读物理数据 (恢复 2D 格式) ---
     vtx_positions2D: cython.float[:, ::1]
     tri_indices2D: cython.int[:, ::1]
@@ -312,14 +310,12 @@ class CoreBrushEngine:
     @cython.wraparound(False)
     def update_vertex_positions(self, new_positions2D: cython.float[:, ::1]):
         self.vtx_positions2D = new_positions2D
-    
-    @property
-    def out_hit_indices(self):
+
+    def get_hit_indices(self):
         """将内部 C 级命中数组暴露给 Python 层"""
         return self.active_hit_indices.base
 
-    @property
-    def out_hit_falloff(self):
+    def get_hit_falloff(self):
         """将内部 C 级衰减数组暴露给 Python 层"""
         return self.active_hit_falloff.base
 
@@ -423,7 +419,7 @@ class CoreBrushEngine:
                 for j in range(edge_start, edge_end):
                     test_tri = self.v2f_indices[j]
 
-                    # 🌟 冗余防御 利用世代掩码 保证一帧内同一个面绝对只测试一次 
+                    # 🌟 冗余防御 利用世代掩码 保证一帧内同一个面绝对只测试一次    
                     if _f_epochs[test_tri] == _curr_r_epoch:
                         continue
                     _f_epochs[test_tri] = _curr_r_epoch
@@ -857,7 +853,6 @@ class BrushUndoRecorder:
     绝对不包含任何数学计算和业务逻辑 贯彻单一职责原则。
 
     Attributes:
-        core (CoreBrushEngine): 绑定的核心空间引擎实例。
         modified_buffer (cython.float[:, ::1]): 需要被修改的目标数据 2D shape(N, channel_count)。
         channel_count (cython.int): 数据的通道数/列宽 (如 XYZ = 3, 骨骼权重 = influencesCount)。
 
@@ -872,8 +867,8 @@ class BrushUndoRecorder:
             在鼠标按下时调用。开启一次新的笔刷行程 重置顶点的防重录标记与计数器。
         end_stroke:
             在鼠标松开时调用。结束当前行程 提取目标数据的最新状态作为 Redo 并打包返回完整的 Undo/Redo 稀疏数据切片。
-        _tick_undo_snapshot:
-            (内部受保护方法) 在运算前调用。接收命中结果 对首次触碰的顶点进行旧数据快照备份。
+        record_undo_snapshot:
+            在运算前调用。接收命中结果 对首次触碰的顶点进行旧数据快照备份。
     """
 
     modified_buffer: cython.float[:, ::1]
@@ -896,7 +891,6 @@ class BrushUndoRecorder:
         """初始化撤销系统。
 
         Args:
-            core (CoreBrushEngine): 笔刷引擎实例。作为唯一的数据源。
             modified_buffer (cython.float[:, ::1]): 需要被修改的目标数据矩阵 [N, channel_count]。
             modified_vtx_indices_buffer (cython.int[::1]): 当前行程 (Stroke) 涉及的所有被修改的顶点物理索引池。
             modified_vtx_bool_buffer (cython.uchar[::1]): 防重录掩码 记录顶点在当前行程中是否已生成过快照 [N]。
@@ -942,17 +936,18 @@ class BrushUndoRecorder:
     @cython.wraparound(False)
     @cython.initializedcheck(False)
     @cython.cfunc
-    def _tick_undo_snapshot(
+    def record_undo_snapshot(
         self,
         count: cython.int,
-        vertex_buffer=None,
+        hit_indices=None,
     ) -> cython.void:
         """
-        在运算前 抓取新命中的顶点进行快照备份。
+        在运算前调用
+        将收到顶点索引,立刻把对应的当前数据抄进 Undo 池
 
         Parameter:
             count (int): 命中点数量
-            vertex_buffer (cython.int[::1]): 点位置信息数组
+            vertex_buffer (cython.int[::1]): 点序号数组
         """
         # 2. 提取 Processor 本身的所有数据与视图到纯 C 局部变量
         _modified_buffer = self.modified_buffer
@@ -963,10 +958,10 @@ class BrushUndoRecorder:
         _modified_vtx_count: cython.int = self.modified_vtx_count
 
         use_all: cython.bint = True
-        if (vertex_buffer is not None) and (len(vertex_buffer) > 0):
+        if (hit_indices is not None) and (len(hit_indices) > 0):
             use_all = False
 
-        _vtx_view: cython.int[::1] = None if use_all else vertex_buffer
+        _vtx_view: cython.int[::1] = None if use_all else hit_indices
 
         i: cython.int  # 循环索引
         j: cython.int  # 通道遍历索引
@@ -1092,7 +1087,7 @@ class UtilBrushProcessor(BrushUndoRecorder):
     """通用笔刷数学运算处理类。
 
     继承 `BrushUndoRecorder` 将底层加减乘除平滑等数学运算进行统一封装。
-    能够针对任何 `shape(N, Channels)` 的二维数组进行运算 如顶点色、普通形变缓冲等  
+    能够针对任何 `shape(N, Channels)` 的二维数组进行运算 如顶点色、普通形变缓冲等
     并将运算影响的范围自动交由父类记录为 Undo/Redo 快照。
     """
 
@@ -1138,7 +1133,7 @@ class UtilBrushProcessor(BrushUndoRecorder):
         _vertex_buffer = _core.active_hit_indices
         _falloff_buffer = _core.active_hit_falloff
 
-        self._tick_undo_snapshot(_vertex_count, _vertex_buffer)
+        self.record_undo_snapshot(_vertex_count, _vertex_buffer)
 
         _iter: cython.int
         for _iter in range(iterations):
@@ -1174,7 +1169,7 @@ class UtilBrushProcessor(BrushUndoRecorder):
     ) -> cython.void:
         """
         Args:
-            brush_mode (cython.int): 笔刷运算模式枚举枚举值 
+            brush_mode (cython.int): 笔刷运算模式枚举枚举值
                 - 0 = Add (加法)
                 - 1 = Sub (减法)
                 - 2 = Replace (替换 / Lerp插值)
@@ -1225,7 +1220,7 @@ class UtilBrushProcessor(BrushUndoRecorder):
         """
         多通道加法运算 (二维数组, 纯数学行列数组视角)。
 
-        采用间接寻址 (LUT) 通过传入 channel_indices 数组 
+        采用间接寻址 (LUT) 通过传入 channel_indices 数组
         完美支持连续通道 (如 RGB [0,1,2]) 与极其稀疏的分散通道 (如骨骼 [15, 115]) 的同频合并计算。
 
         Args:
@@ -1594,7 +1589,7 @@ class UtilBrushProcessor(BrushUndoRecorder):
             return (0, vertex_indices, self.modified_buffer)
 
         # 把这套逻辑同样传递给快照 (它内部也会同样处理 None)
-        self._tick_undo_snapshot(_v_count, vertex_indices)
+        self.record_undo_snapshot(_v_count, vertex_indices)
 
         i: cython.int
         j: cython.int
@@ -1630,7 +1625,7 @@ class UtilBrushProcessor(BrushUndoRecorder):
 class SkinWeightProcessor(UtilBrushProcessor):
     """蒙皮权重专属笔刷处理器。
 
-    继承自 `UtilsBrushProcessor` 引入了骨骼锁定的前置判断逻辑 
+    继承自 `UtilsBrushProcessor` 引入了骨骼锁定的前置判断逻辑
     并将归一化过程完全剥离暴露为外部按需调用的独立接口。
 
     Attributes:
@@ -1689,7 +1684,7 @@ class SkinWeightProcessor(UtilBrushProcessor):
         单骨骼绘制的极速包装器 (Zero-cost Wrapper)。
 
         作为 `apply_weight` 的标量版本前置接口 专门优化日常绘制中最常见的“单笔刷/单骨骼”操作。
-        底层利用 C 语言函数栈 (Stack) 瞬间分配定长为 1 的物理数组并生成切片视图 
+        底层利用 C 语言函数栈 (Stack) 瞬间分配定长为 1 的物理数组并生成切片视图
         彻底绕过 Python 层面的 array 对象开销与 GC (垃圾回收) 负担 无缝路由至多通道主干 API。
 
         Args:
@@ -1745,7 +1740,7 @@ class SkinWeightProcessor(UtilBrushProcessor):
         2. 极值截断 强制在 0.0 到 1.0 的绝对物理空间内推挤权重。
         3. 自动归一化 在每一次运算迭代后 自动触发基于优先级的权重归一化修缮。
 
-        动态数据源路由机制 
+        动态数据源路由机制
         - 场景 A (交互绘制): 当 `vertex_indices` 为 `None` 时 自动读取底层射线引擎的高速命中缓存。
         - 场景 B (UI 一键调用): 当传入 `vertex_indices`  直接针对传入的顶点执行极限计算。
 
@@ -1780,7 +1775,7 @@ class SkinWeightProcessor(UtilBrushProcessor):
         if _v_count == 0:
             return (0, vertex_indices, self.modified_buffer)
 
-        # ✨ 终极拦截器 底层纯数学计算不兼容 NULL 数组。如果是全量 自动分配一个包含全部索引的虚拟数组 
+        # ✨ 终极拦截器 底层纯数学计算不兼容 NULL 数组。如果是全量 自动分配一个包含全部索引的虚拟数组
         _vertex_buffer: cython.int[::1]
         if is_all_v:  # noqa: SIM108
             _vertex_buffer = array.array("i", range(_v_count))
@@ -1796,7 +1791,7 @@ class SkinWeightProcessor(UtilBrushProcessor):
             _fal_array = array.array("f", [1.0]) * _v_count
 
         # 缓存快照 (传入绝对安全的实体内存)
-        self._tick_undo_snapshot(_v_count, _vertex_buffer)
+        self.record_undo_snapshot(_v_count, _vertex_buffer)
 
         _iter: cython.int
         priority_influence_idx: cython.int = channel_indices[0]
