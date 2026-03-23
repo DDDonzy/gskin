@@ -1,10 +1,10 @@
+import ctypes
+from contextlib import contextmanager
+
 import maya.api.OpenMaya as om
 import maya.api.OpenMayaUI as omui
 import maya.api.OpenMayaRender as omr
-import ctypes
-from contextlib import contextmanager  # 🌟 新增：用于打造 GPU 显存隔离门
 
-# 引入核心计算模块与注册表
 from gskin.src._cRegistry import SkinRegistry
 from gskin.src import cColorCython as cColor
 from gskin.src._cProfilerCython import MayaNativeProfiler, maya_profile
@@ -83,7 +83,7 @@ class RenderData:
         self.dirty_line_colors    = True
         self.dirty_point_colors   = True
 
-        # 🌟 架构升级：存储 compute 阶段拿到的计算上下文，供 update 阶段的 GPU 直写使用
+        # 🌟 架构升级:存储 compute 阶段拿到的计算上下文,供 update 阶段的 GPU 直写使用
         self.vtx_count = 0
         self.render_mode = 0
         self.is_mask = False
@@ -95,7 +95,7 @@ class RenderData:
         """
         绘制一个普通的三角面
         下面是需要用到的参数
-        在这里作为渲染的初始数据，
+        在这里作为渲染的初始数据,
         后续开发替换数据即可。
 
             - point_indices (vtx_count): 点索引信息
@@ -116,9 +116,9 @@ class RenderData:
 
         # 绘制的点 indices, 从 vertices_pos 读取位置信息
         self.point_indices = (ctypes.c_uint32 * 3)(0, 1, 2) 
-        # 绘制的三角面 indices, 从 vertices_pos 读取位置信息，数组是 tri_count * 3
+        # 绘制的三角面 indices, 从 vertices_pos 读取位置信息,数组是 tri_count * 3
         self.face_indices  = (ctypes.c_uint32 * 3)(0, 1, 2)
-        # 绘制的边 indices, 从 vertices_pos 读取位置信息，数组是 line_count * 2
+        # 绘制的边 indices, 从 vertices_pos 读取位置信息,数组是 line_count * 2
         self.line_indices  = (ctypes.c_uint32 * 6)(0, 1,
                                                    1, 2, 
                                                    2, 0)
@@ -147,7 +147,7 @@ class TriangleShapeUI(omui.MPxSurfaceShapeUI):
         return TriangleShapeUI()
 
 
-# 🌟 修改点 1：基类改为 om2.MPxSurfaceShape，并重命名为 TriangleShape
+# 🌟 修改点 1:基类改为 om2.MPxSurfaceShape,并重命名为 TriangleShape
 class TriangleShape(om.MPxSurfaceShape):
     TYPE_ID = om.MTypeId(0x80089)
     NODE_NAME = "triangleShape"
@@ -183,14 +183,14 @@ class TriangleShape(om.MPxSurfaceShape):
     defaultLineColorAttr = om.MObject()
     defaultPointColorAttr = om.MObject()
 
-    # 🌟 伪输出属性，专门用来触发 compute
+    # 🌟 伪输出属性,专门用来触发 compute
     outDummyAttr = om.MObject()
     # endregion
 
     def __init__(self):
         om.MPxSurfaceShape.__init__(self)
         self.render_data = RenderData()  # 挂载数据中心
-        # 预先储存好包围盒，避免每帧重复创建对象
+        # 预先储存好包围盒,避免每帧重复创建对象
         self._boundingBox = om.MBoundingBox(om.MPoint(-100, -100, -100), om.MPoint(100, 100, 100))
 
     @classmethod
@@ -199,7 +199,7 @@ class TriangleShape(om.MPxSurfaceShape):
 
     @classmethod
     def initialize(cls):
-        # 🌟 2. 创建真正的 Maya 节点属性，暴露在通道盒里！
+        # 🌟 2. 创建真正的 Maya 节点属性,暴露在通道盒里
         nAttr = om.MFnNumericAttribute()
         eAttr = om.MFnEnumAttribute()
         tAttr = om.MFnTypedAttribute()
@@ -211,7 +211,7 @@ class TriangleShape(om.MPxSurfaceShape):
         TriangleShape.addAttribute(TriangleShape.outDummyAttr)
 
         # region Input Attr
-        # 创建“输入网格”属性，用于替代以前的 message 连接查找 cSkinDeform
+        # 创建“输入网格”属性,用于替代以前的 message 连接查找 cSkinDeform
         TriangleShape.inMeshAttr = tAttr.create("inputMesh", "ipm", om.MFnData.kMesh)
         tAttr.storable = False
         tAttr.writable = True
@@ -329,8 +329,8 @@ class TriangleShape(om.MPxSurfaceShape):
         # endregion
 
     def compute(self, plug, dataBlock):
-        with MayaNativeProfiler("render-compute",1):
-            with MayaNativeProfiler("render-compute-get-attr",2):
+        with MayaNativeProfiler("render-compute", 1):
+            with MayaNativeProfiler("render-compute-get-attr", 2):
                 # fmt:off
                 self.render_data.line_width                      = dataBlock.inputValue(TriangleShape.lineWidthAttr).asFloat()
                 self.render_data.point_size                      = dataBlock.inputValue(TriangleShape.pointSizeAttr).asFloat()
@@ -361,23 +361,17 @@ class TriangleShape(om.MPxSurfaceShape):
                 # fmt:on
 
             # 2. 扁平化数据同步与渲染调用
-            with MayaNativeProfiler("render-compute-get-cSkinData",3):
+            with MayaNativeProfiler("render-compute-get-cSkinData", 3):
                 self._update_from_cSkin(dataBlock)
-            with MayaNativeProfiler("render-compute-get-setClean",4):
+            with MayaNativeProfiler("render-compute-get-setClean", 4):
                 dataBlock.outputValue(TriangleShape.outDummyAttr).setClean()
-        print("compute_end")
 
     def _update_from_cSkin(self, dataBlock):
-        """管线接线员：获取上游内存并刷新渲染上下文数据，使用前置判定消灭深层嵌套"""
+        """管线接线员:获取上游内存并刷新渲染上下文数据,使用前置判定消灭深层嵌套"""
 
-        with MayaNativeProfiler("render-update_cSkin_datablock",1):
-            try:
-                dataBlock.inputValue(TriangleShape.inMeshAttr)
-            except:
-                # 最好在这里 print 一下错误，确保你是连上了属性的
-                # print("Warning: 无法从 inMeshAttr 拉取网格数据，请检查节点连接！")
-                pass
-        
+        with MayaNativeProfiler("render-update_cSkin_datablock", 1):
+            dataBlock.inputValue(TriangleShape.inMeshAttr)
+
         # region Get cSkin
         cSkin_plug: om.MPlug = om.MPlug(self.thisMObject(), TriangleShape.inMeshAttr)
         if not cSkin_plug.isConnected:
@@ -426,7 +420,7 @@ class TriangleShape(om.MPxSurfaceShape):
         else:
             render_data.brush_hit_count = 0
 
-        # 全面打上脏标，通知 update 阶段去向 GPU 借用显存并直写
+        # 全面打上脏标,通知 update 阶段去向 GPU 借用显存并直写
         render_data.dirty_face_colors = True
         render_data.dirty_line_colors = True
         render_data.dirty_point_colors = True
@@ -440,7 +434,7 @@ class TriangleShape(om.MPxSurfaceShape):
 
 class TriangleOverride(omr.MPxSubSceneOverride):
     def __init__(self, obj):
-        super(TriangleOverride, self).__init__(obj)
+        super().__init__(obj)
         self.node_obj = obj
 
         self.item_name_face = "my_triangle_face"
@@ -451,21 +445,21 @@ class TriangleOverride(omr.MPxSubSceneOverride):
         self.item_name_default_line = "my_default_solid_line"
         self.item_name_default_point = "my_default_solid_point"
 
-        self.vertex_buffer:omr.MVertexBuffer = None
+        self.vertex_buffer: omr.MVertexBuffer = None
 
-        self.color_buffer_face:omr.MVertexBuffer = None
-        self.index_buffer_face:omr.MIndexBuffer = None
-        self.vertex_buffer_array_face:omr.MVertexBufferArray = None
+        self.color_buffer_face: omr.MVertexBuffer = None
+        self.index_buffer_face: omr.MIndexBuffer = None
+        self.vertex_buffer_array_face: omr.MVertexBufferArray = None
 
         # 为线和点准备独立的显存池
-        self.color_buffer_line:omr.MVertexBuffer = None
-        self.color_buffer_point:omr.MVertexBuffer = None
-        self.index_buffer_line:omr.MIndexBuffer = None
-        self.index_buffer_point:omr.MIndexBuffer = None
-        self.vertex_buffer_array_line:omr.MVertexBufferArray = None
-        self.vertex_buffer_array_point:omr.MVertexBufferArray = None
+        self.color_buffer_line: omr.MVertexBuffer = None
+        self.color_buffer_point: omr.MVertexBuffer = None
+        self.index_buffer_line: omr.MIndexBuffer = None
+        self.index_buffer_point: omr.MIndexBuffer = None
+        self.vertex_buffer_array_line: omr.MVertexBufferArray = None
+        self.vertex_buffer_array_point: omr.MVertexBufferArray = None
 
-        self.vertex_buffer_array_default:omr.MVertexBufferArray = None
+        self.vertex_buffer_array_default: omr.MVertexBufferArray = None
 
     @classmethod
     def creator(cls, obj):
@@ -566,11 +560,11 @@ class TriangleOverride(omr.MPxSubSceneOverride):
             self.vertex_buffer_array_point.append(self.vertex_buffer, "")
             self.vertex_buffer_array_point.append(self.color_buffer_point, "")
 
-            # 5. 纯坐标专属阵列打包 (为 default 单色项目准备，不挂载颜色缓冲)
+            # 5. 纯坐标专属阵列打包 (为 default 单色项目准备,不挂载颜色缓冲)
             self.vertex_buffer_array_default = omr.MVertexBufferArray()
             self.vertex_buffer_array_default.append(self.vertex_buffer, "")
 
-            # 此时的 GPU 缓冲是空的！必须强制将节点的阀门全部打开，保证基础数据能拷入新缓冲！
+            # 此时的 GPU 缓冲是空的 必须强制将节点的阀门全部打开,保证基础数据能拷入新缓冲
             render_data.dirty_vertices_pos = True
             render_data.dirty_face_colors = True
             render_data.dirty_line_colors = True
@@ -580,7 +574,7 @@ class TriangleOverride(omr.MPxSubSceneOverride):
             render_data.dirty_point_indices = True
 
     def _sync_topology_buffers(self, render_data: RenderData):
-        """负责同步客观物理数据（位置与索引）的显存"""
+        """负责同步客观物理数据 (位置与索引)的显存"""
         # --- 点位置显存同步 ---
         if render_data.dirty_vertices_pos:
             vertex_count = len(render_data.vertices_pos) // 3
@@ -619,7 +613,7 @@ class TriangleOverride(omr.MPxSubSceneOverride):
             render_data.dirty_point_indices = False
 
     def _calculate_colors_direct(self, render_data: RenderData, face_view, line_view, point_view):
-        """🌟 专门负责颜色计算与显存直写，由 update 阶段的指挥官直接调用"""
+        """🌟 专门负责颜色计算与显存直写,由 update 阶段的指挥官直接调用"""
         # 线和点基础底色填充
         if line_view is not None:
             cColor.render_fill(line_view, render_data.wire_color)
@@ -652,7 +646,7 @@ class TriangleOverride(omr.MPxSubSceneOverride):
                         face_view,
                     )
             else:
-                # 无数据输入，填充蓝底
+                # 无数据输入,填充蓝底
                 cColor.render_fill(face_view, (0.0, 0.0, 1.0, 1.0))
 
         # 笔刷高亮叠加直写
@@ -667,14 +661,14 @@ class TriangleOverride(omr.MPxSubSceneOverride):
             )
 
     def _sync_color_buffers(self, render_data: RenderData):
-        """利用 Context Manager 为GPU Buffer开锁，Cython 直接计算到GPU buffer"""
+        """利用 Context Manager 为GPU Buffer开锁,Cython 直接计算到GPU buffer"""
         vtx_count = render_data.vtx_count
         if vtx_count <= 0:
             return
 
         if render_data.dirty_face_colors:
             with gpu_write_session(self.color_buffer_face, vtx_count) as face_view:
-                # 只传 face_view，线和点传 None，计算引擎会自动跳过它们
+                # 只传 face_view,线和点传 None,计算引擎会自动跳过它们
                 self._calculate_colors_direct(render_data, face_view=face_view, line_view=None, point_view=None)
             render_data.dirty_face_colors = False
 
@@ -688,9 +682,9 @@ class TriangleOverride(omr.MPxSubSceneOverride):
                 self._calculate_colors_direct(render_data, face_view=None, line_view=None, point_view=point_view)
             render_data.dirty_point_colors = False
 
-    def _update_render_items_state(self, render_data:RenderData, container):
+    def _update_render_items_state(self, render_data: RenderData, container):
         """动态修改专属着色器参数及渲染开关"""
-        # 注意：现已改写为 GPU 缓冲，所以只要 vtx_count 足够，就不需要校验 len() 了
+        # 注意:现已改写为 GPU 缓冲,所以只要 vtx_count 足够,就不需要校验 len() 了
         vertex_count = render_data.vtx_count
         has_vertices = vertex_count > 0
 
@@ -702,8 +696,8 @@ class TriangleOverride(omr.MPxSubSceneOverride):
         render_item_default_line = container.find(self.item_name_default_line)
         render_item_default_point = container.find(self.item_name_default_point)
 
-        # 🛡️ 安全锁：颜色数组里的点数，必须大于等于顶点数组里的点数！
-        # (现已改为直写显存，GPU缓冲容量必然与点数一致，因此直接通过)
+        # 🛡️ 安全锁:颜色数组里的点数,必须大于等于顶点数组里的点数
+        # (现已改为直写显存,GPU缓冲容量必然与点数一致,因此直接通过)
         is_color_safe = True
 
         if render_item_face:
@@ -738,17 +732,16 @@ class TriangleOverride(omr.MPxSubSceneOverride):
             has_default_points = has_vertices and (len(render_data.point_indices) > 0)
             render_item_default_point.enable(render_data.draw_default_points and has_default_points)
 
-
     def update(self, container, frameContext):
-        with MayaNativeProfiler("render-update",2):
-            with MayaNativeProfiler("render-update-dg",4):
+        with MayaNativeProfiler("render-update", 2):
+            with MayaNativeProfiler("render-update-dg", 4):
                 # 1. 拉取 dummy 属性触发 DG 依赖脏标更新
                 om.MPlug(self.node_obj, TriangleShape.outDummyAttr).asInt()
-            with MayaNativeProfiler("render-update-userNode-data",4):
+            with MayaNativeProfiler("render-update-userNode-data", 4):
                 shape_inst: TriangleShape = om.MFnDependencyNode(self.node_obj).userNode()
                 render_data: RenderData = shape_inst.render_data
 
-            with MayaNativeProfiler("render-update-buffer",4):
+            with MayaNativeProfiler("render-update-buffer", 4):
                 # 2. 初始 RenderItem 与 GPU缓冲 创建
                 self._init_render_items(container, omr.MRenderer.getShaderManager())
                 self._init_gpu_buffers(render_data)
@@ -757,13 +750,13 @@ class TriangleOverride(omr.MPxSubSceneOverride):
             if render_data.vertices_pos is None or render_data.vtx_count <= 0:
                 return
 
-            with MayaNativeProfiler("render-update-set-data",4):
+            with MayaNativeProfiler("render-update-set-data", 4):
                 # 4. 核心任务分发 (领域解耦)
-                with MayaNativeProfiler("render-update-set-data-topology",5):
+                with MayaNativeProfiler("render-update-set-data-topology", 5):
                     self._sync_topology_buffers(render_data)
-                with MayaNativeProfiler("render-update-set-data-color",6):
+                with MayaNativeProfiler("render-update-set-data-color", 6):
                     self._sync_color_buffers(render_data)
-                with MayaNativeProfiler("render-update-set-data-items-state",7):
+                with MayaNativeProfiler("render-update-set-data-items-state", 7):
                     self._update_render_items_state(render_data, container)
 
             # 5. 绑定终极渲染状态通知
@@ -774,7 +767,6 @@ class TriangleOverride(omr.MPxSubSceneOverride):
             self.setGeometryForRenderItem(container.find(self.item_name_default_face), self.vertex_buffer_array_default, self.index_buffer_face, bbox)
             self.setGeometryForRenderItem(container.find(self.item_name_default_line), self.vertex_buffer_array_default, self.index_buffer_line, bbox)
             self.setGeometryForRenderItem(container.find(self.item_name_default_point), self.vertex_buffer_array_default, self.index_buffer_point, bbox)
-            print("update_end")
 
     def areControlsAllocated(self):
         return False
@@ -791,7 +783,7 @@ def initializePlugin(mObject: om.MObject):
         PLUGIN_API_VERSION,
     )
 
-    # 🌟 修改点 4：改为使用 registerShape，传入 UI 类和表面形状类型
+    # 🌟 修改点 4:改为使用 registerShape,传入 UI 类和表面形状类型
     plugin.registerShape(
         TriangleShape.NODE_NAME,
         TriangleShape.TYPE_ID,

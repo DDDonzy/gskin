@@ -14,8 +14,8 @@ def blend_layer_raw_view(
     vertex_indices        : cython.int[::1]   = None   
 ) -> None:
     """
-    直接接收 WeightsHandle 的完整连续内存视图，利用 C 指针强转进行原地数据合并。
-    100% 满级静态类型标注，无对象创建，绝对零 Python 循环开销。
+    直接接收 WeightsHandle 的完整连续内存视图,利用 C 指针强转进行原地数据合并。
+    100% 满级静态类型标注,无对象创建,绝对零 Python 循环开销。
 
     Parameters:
         output_raw_buffer : cython.float[::1]
@@ -26,14 +26,14 @@ def blend_layer_raw_view(
             当前图层 (输入源) 的完整内存视图。包含 Header 和 Weights。
             
         layer_mask_raw_buffer : cython.float[::1] 或 None
-            当前图层的遮罩内存视图。如果该图层没有绘制遮罩，必须传入 `None`。
+            当前图层的遮罩内存视图。如果该图层没有绘制遮罩,必须传入 `None`。
             
         layer_alpha : cython.float
-            当前图层的全局透明度乘数，取值范围通常为 0.0 ~ 1.0。
+            当前图层的全局透明度乘数,取值范围通常为 0.0 ~ 1.0。
             
         vertex_indices : cython.int[::1] 或 None
             稀疏更新的顶点 ID 列表。专供画刷的 Undo/Redo 或局部涂抹加速使用。
-            如果是全局全量烘焙，必须传入 `None` 以遍历所有顶点。
+            如果是全局全量烘焙,必须传入 `None` 以遍历所有顶点。
     """
     
     # ==========================================================
@@ -88,7 +88,7 @@ def blend_layer_raw_view(
     layer_int_ptr  = cython.cast(cython.p_int, layer_float_ptr)
 
     # ==========================================================
-    # 💥 3. 肢解内存，解析 Header 与 Weights
+    # 💥 3. 肢解内存,解析 Header 与 Weights
     # ==========================================================
     output_vertex_count      = output_int_ptr[0]
     output_influence_count   = output_int_ptr[1]
@@ -108,7 +108,7 @@ def blend_layer_raw_view(
     mask_weights = cython.NULL
 
     if has_mask:
-        # 只有在确认不是 None 时，才安全提取内存地址
+        # 只有在确认不是 None 时,才安全提取内存地址
         mask_float_ptr = cython.address(layer_mask_raw_buffer[0])
         mask_int_ptr   = cython.cast(cython.p_int, mask_float_ptr)
         mask_influence_count = mask_int_ptr[1]
@@ -122,7 +122,7 @@ def blend_layer_raw_view(
         malloc(layer_influence_count * cython.sizeof(cython.int))
     )
     if not layer_to_output_lut:
-        raise MemoryError("底层 malloc 分配 LUT 内存失败！")
+        raise MemoryError("底层 malloc 分配 LUT 内存失败")
     
     for layer_inf_idx in range(layer_influence_count):
         layer_to_output_lut[layer_inf_idx] = -1
@@ -136,23 +136,14 @@ def blend_layer_raw_view(
     # ==========================================================
     is_sparse = vertex_indices is not None
     
-    if is_sparse:
-        total_loop_vertices = cython.cast(cython.int, vertex_indices.shape[0])
-    else:
-        total_loop_vertices = output_vertex_count
+    total_loop_vertices = cython.cast(cython.int, vertex_indices.shape[0]) if is_sparse else output_vertex_count
 
     for loop_idx in range(total_loop_vertices):
-        # 严谨的 if-else 展开，拒绝三元运算符的隐式开销
-        if is_sparse:
-            vertex_id = vertex_indices[loop_idx]
-        else:
-            vertex_id = loop_idx
+        # 严谨的 if-else 展开,拒绝三元运算符的隐式开销
+        vertex_id = vertex_indices[loop_idx] if is_sparse else loop_idx
 
         # 遮罩与透明度混合
-        if has_mask:
-            mask_val = mask_weights[vertex_id] * layer_alpha
-        else:
-            mask_val = layer_alpha
+        mask_val = mask_weights[vertex_id] * layer_alpha if has_mask else layer_alpha
 
         if mask_val <= 0.0:
             continue
@@ -164,11 +155,11 @@ def blend_layer_raw_view(
         output_row_offset = vertex_id * output_influence_count
         layer_row_offset  = vertex_id * layer_influence_count
 
-        # 阶段 A：衰减底层
+        # 衰减底层
         for output_inf_idx in range(output_influence_count):
             output_weights[output_row_offset + output_inf_idx] *= inv_mask
 
-        # 阶段 B：叠加当前层
+        # 叠加当前层
         for layer_inf_idx in range(layer_influence_count):
             output_col_index = layer_to_output_lut[layer_inf_idx]
             if output_col_index >= 0:

@@ -37,16 +37,16 @@ def _compute_deform_matrices(
     Final: cython.double[4][4] = cython.declare(cython.double[4][4])
 
     for b in range(influences_count):
-        # 👑 通道 A：极限狂飙通道 (99%的情况，模型 Transform 为空)
+        # 👑 通道 A 极限狂飙通道 (99%的情况 模型 Transform 为空)
         if is_geo_identity:
-            # 既然 Geo 和 GeoInv 都是空气，直接 Final = BindPre * BoneWorld
+            # 既然 Geo 和 GeoInv 都是空气 直接 Final = BindPre * BoneWorld
             for i in range(4):
                 for j in range(4):
                     Final[i][j] = 0.0
                     for k in range(4):
                         Final[i][j] += bind_arr[b * 16 + i * 4 + k] * influences_arr[b * 16 + k * 4 + j]
 
-        # 🐌 通道 B：全能兼容通道 (模型 Transform 被瞎挪动了，必须严谨计算)
+        # 🐌 通道 B 全能兼容通道 (模型 Transform 被瞎挪动了 必须严谨计算)
         else:
             # 1. T1 = Geo * Bind
             for i in range(4):
@@ -134,20 +134,20 @@ def _run_skinning_core(
 
 
 # =====================================================================
-# 2. Python 接口包装器 (智能提纯：接收视图 -> 提取指针 -> 喂给内核)
+# 2. Python 接口包装器 (智能提纯 接收视图 -> 提取指针 -> 喂给内核)
 # =====================================================================
 def compute_deform_matrices(
-    geo_matrix: cython.Py_ssize_t,     
-    geo_matrix_i: cython.Py_ssize_t,  
+    geo_matrix: cython.Py_ssize_t,
+    geo_matrix_i: cython.Py_ssize_t,
     bind_view: cython.double[:, :],
     dyn_view: cython.double[:, :],
     rot_view: cython.float[:, :],
     trans_view: cython.float[:, :],
     geo_matrix_is_identity: cython.bint,
 ):
-    """供 Python 调用的矩阵混合入口，完全基于 MemoryView"""
+    """供 Python 调用的矩阵混合入口 完全基于 MemoryView"""
 
-    # 自动从视图获取长度，无需手动传参
+    # 自动从视图获取长度 无需手动传参
     num_bones: cython.int = bind_view.shape[0]
 
     # 获取底层原生 C 指针
@@ -179,7 +179,7 @@ def run_skinning_core(
     trans_view: cython.float[:, :],
     envelope: cython.float,
 ):
-    """供 Python 调用的蒙皮核心解算入口，完全基于 MemoryView"""
+    """供 Python 调用的蒙皮核心解算入口 完全基于 MemoryView"""
 
     # 自动从视图获取顶点和骨骼数
     num_verts: cython.int = ori_pts_view.shape[0] // 3

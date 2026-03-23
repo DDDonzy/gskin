@@ -25,10 +25,10 @@ class WeightsHandle:
     """
     权重数据装配器 (MVectorArray 0拷贝黑客版)
 
-    架构方案：
-    1. 物理伪装：将 32-bit Float 强行塞入 64-bit MVectorArray 中。
-    2. 原地扩容：通过 MVectorArray.setLength() 触发底层 C++ realloc，避免频繁销毁重建 MObject。
-    3. 内存布局：
+    架构方案:
+    1. 物理伪装:将 32-bit Float 强行塞入 64-bit MVectorArray 中。
+    2. 原地扩容:通过 MVectorArray.setLength() 触发底层 C++ realloc,避免频繁销毁重建 MObject。
+    3. 内存布局:
         ```
         ----------------------------------------------------------------------------------
         | vtx_count (int) | inf_count (int) | bone_indices... (int) | Weights... (float) |
@@ -39,21 +39,20 @@ class WeightsHandle:
 
     # fmt:off
     mDataHandle  : om1.MDataHandle  # 变形器计算周期内的临时句柄
-    mPlug        : om1.MPlug        # 节点插座，用于数据持久化
+    mPlug        : om1.MPlug        # 节点插座,用于数据持久化
     mObject_data : om1.MObject      # 包装了 VectorArray 的 Maya 数据实体
     mVectorArray : om1.MFnVectorArrayData # 指向 MObject 内部缓冲区的引用
 
     memory        : BufferManager    # 权重数据的底层裸指针映射 (纯 Float 视图)
     weights_memory: BufferManager    # 仅权重部分视图
     max_capacity  : int              # 当前物理内存支持的最大 Float 存储量 (VectorLength * 6)
-    length        : int              # 当前逻辑数据的有效 Float 长度
-           
+    length        : int              # 当前逻辑数据的有效 Float 长度  
     # fmt:on
 
     def __init__(self, mPlug: om1.MPlug, mDataHandle: om1.MDataHandle):
         """
         初始化装配器。
-        注：由于 nodeInitializer 设置了默认值，此处假定 mDataHandle 必定包含合法的 VectorArray。
+        注:由于 nodeInitializer 设置了默认值,此处假定 mDataHandle 必定包含合法的 VectorArray。
         """
         # fmt:off
         self.mPlug        = mPlug
@@ -71,15 +70,15 @@ class WeightsHandle:
 
     @classmethod
     def from_attr_string(cls, attr_path: str):
-        """工具方法：从字符串路径("node.attr")快速构建"""
+        """工具方法:从字符串路径("node.attr")快速构建"""
         sel = om1.MSelectionList()
         try:
             sel.add(attr_path)
-        except RuntimeError:
-            raise ValueError(f"Attribute path not found: {attr_path}")
+        except RuntimeError as e:
+            raise ValueError(f"Attribute path not found: {attr_path}") from e
         plug = om1.MPlug()
         sel.getPlug(0, plug)
-        # 注意：外部调用时需自行提供对应的 DataHandle 或是通过 plug.asMDataHandle() 获取
+        # 注意:外部调用时需自行提供对应的 DataHandle 或是通过 plug.asMDataHandle() 获取
         return cls(plug, plug.asMDataHandle())
 
     def _setup_vector_buffer(self, mDataHandle: om1.MDataHandle):
@@ -109,12 +108,12 @@ class WeightsHandle:
     def _remap_memory(self):
         """
         [物理层映射] 将底层 C++ VectorArray 内存地址映射为 Python 连续视图。
-        此函数仅客观圈定物理地盘，不负责数据安全性校验 (校验交由 is_valid 处理)。
+        此函数仅客观圈定物理地盘,不负责数据安全性校验 (校验交由 is_valid 处理)。
 
         Updates:
             - `self.length`
             - `self.memory`
-            - `self.weights_memory` (带有 physical padding，用于 fill 格式化)
+            - `self.weights_memory` (带有 physical padding,用于 fill 格式化)
         """
         if self.mVectorArray is None:
             self.memory = None
@@ -142,7 +141,7 @@ class WeightsHandle:
 
     def resize(self, vtx_count: int, inf_count: int):
         """
-        根据顶点和骨骼数量，原地扩容底层物理内存，并自动格式化为安全状态。
+        根据顶点和骨骼数量,原地扩容底层物理内存,并自动格式化为安全状态。
 
         Updates:
             - `self.length`
@@ -160,7 +159,7 @@ class WeightsHandle:
 
         required_length = (2 + inf_count) + (vtx_count * inf_count)
 
-        # 1. 如果容量足够，复用内存
+        # 1. 如果容量足够,复用内存
         if required_length <= self.max_capacity:
             self.length = required_length
 
@@ -171,13 +170,13 @@ class WeightsHandle:
 
             self._remap_memory()
 
-            # 🚀 格式化复用内存的负载区，清除上一次图层遗留的错位旧数据
+            # 🚀 格式化复用内存的负载区,清除上一次图层遗留的错位旧数据
             if self.weights_memory:
                 self.weights_memory.fill(0.0)
 
             return False
 
-        # 2. 如果容量不足，触发底层物理扩容
+        # 2. 如果容量不足,触发底层物理扩容
         vector_count = (required_length + 5) // 6
         self.mVectorArray.setLength(vector_count)
         self.max_capacity = vector_count * 6
@@ -188,10 +187,10 @@ class WeightsHandle:
         _header.view[0] = vtx_count
         _header.view[1] = inf_count
 
-        # 4. 重新映射，切出完美的 weights_memory
+        # 4. 重新映射,切出完美的 weights_memory
         self._remap_memory()
 
-        # 🚀 格式化新分配的物理内存，彻底绞杀底层 realloc 产生的 NaN 垃圾数据！
+        # 🚀 格式化新分配的物理内存,彻底绞杀底层 realloc 产生的 NaN 垃圾数据
         if self.weights_memory:
             self.weights_memory.fill(0.0)
 
@@ -202,8 +201,8 @@ class WeightsHandle:
         解析符合内存布局协议的连续视图。
 
         Args:
-            raw_view: 如果提供，则解析传入的视图 (用于 Undo 备份还原)；
-                            如果为 None，则默认解析自身的 self.memory.view (用于内部重映射)。
+            raw_view: 如果提供,则解析传入的视图 (用于 Undo 备份还原)
+                            如果为 None,则默认解析自身的 self.memory.view (用于内部重映射)
         """
         if raw_view is None:
             if self.memory is None or self.memory.view is None:
@@ -234,7 +233,7 @@ class WeightsHandle:
     def clear(self):
         """
         重置数据为默认空壳状态。
-        :param shrink: 是否强制释放物理内存。如果为 False，则只做极速的逻辑清零。
+        :param shrink: 是否强制释放物理内存。如果为 False,则只做极速的逻辑清零。
         """
         if self.mVectorArray is None:
             return False
@@ -249,16 +248,16 @@ class WeightsHandle:
     @property
     def is_null(self) -> bool:
         """
-        物理级检查：是否完全没有绑定 Maya 数据实体。
-        (通常发生在新节点刚创建，或 plug 断开连接时)
+        物理级检查:是否完全没有绑定 Maya 数据实体。
+        (通常发生在新节点刚创建,或 plug 断开连接时)
         """
         return self.mObject_data is None or self.mObject_data.isNull() or self.mVectorArray is None
 
     @property
     def is_empty(self) -> bool:
         """
-        业务级检查：是否是一个合法的“空图层”。
-        (没有顶点，或没有分配任何骨骼，属于正常业务状态)
+        业务级检查:是否是一个合法的“空图层”。
+        (没有顶点,或没有分配任何骨骼,属于正常业务状态)
         """
         if self.is_null:
             return True
@@ -269,10 +268,10 @@ class WeightsHandle:
     @property
     def is_corrupted(self) -> bool:
         """
-        安全级检查：物理内存是否被脏数据污染，或存在越界风险。
+        安全级检查:物理内存是否被脏数据污染,或存在越界风险。
         """
         if self.is_null:
-            return False  # 什么都没有，也就无所谓损坏
+            return False  # 什么都没有,也就无所谓损坏
 
         vtx_count = getattr(self, "vtx_count", 0)
         inf_count = getattr(self, "influence_count", 0)
@@ -283,15 +282,12 @@ class WeightsHandle:
 
         # 2. 物理越界拦截 (拦截几十亿的天文数字)
         required_floats = (2 + inf_count) + (vtx_count * inf_count)
-        if required_floats > self.max_capacity:
-            return True
-
-        return False
+        return required_floats > self.max_capacity
 
     @property
     def is_valid(self) -> bool:
         """
-        综合通行证：句柄是否处于绝对安全、可读写的健康状态。
+        综合通行证:句柄是否处于绝对安全、可读写的健康状态。
         """
         return not self.is_null and not self.is_corrupted
 
@@ -299,7 +295,7 @@ class WeightsHandle:
     def view(self):
         """
         [语法糖] 安全获取底层的全量物理内存视图 (含 Header 和 Padding)。
-        自带判空防御，用于底层数据的整体 Copy 或 Undo 备份。
+        自带判空防御,用于底层数据的整体 Copy 或 Undo 备份。
         """
         return self.memory.view if self.memory is not None else None
 
@@ -307,7 +303,7 @@ class WeightsHandle:
     def weights_view(self):
         """
         [语法糖] 安全获取纯净的权重负载区视图 (去除了 Header)。
-        自带判空防御，用于直接格式化 (fill) 或快速读取。
+        自带判空防御,用于直接格式化 (fill) 或快速读取。
         """
         return self.weights_memory.view if self.weights_memory is not None else None
 
@@ -326,7 +322,7 @@ class WeightsLayerItem:
         self.mask = WeightsHandle(self.mPlug_mask, _handle_mask)
 
     # ==========================================
-    # 安全的属性获取：直接找 cSkin 要 MObject，完全不碰短命的 MDataHandle
+    # 安全的属性获取:直接找 cSkin 要 MObject,完全不碰短命的 MDataHandle
     # ==========================================
     @property
     def mPlug_weights(self):
@@ -355,14 +351,14 @@ class _DeferredTaskMixin:
     """
 
     def __init__(self):
-        # 全部声明为保护属性，向子类隐藏实现细节
+        # 全部声明为保护属性,向子类隐藏实现细节
         self._deferred_tasks = deque()
         self._tasks_lock = threading.Lock()
         self._is_dg_updating = False
 
     @staticmethod
     def _update_dg(func):
-        """防抖锁：确保唯一次视口刷新"""
+        """防抖锁:确保唯一次视口刷新"""
 
         @functools.wraps(func)
         def wrapper(self: WeightsManager, *args, **kwargs):
@@ -374,14 +370,14 @@ class _DeferredTaskMixin:
             finally:
                 if is_top_level:
                     self._is_dg_updating = False
-                    if hasattr(self, "updateDG") and callable(getattr(self, "updateDG")):
+                    if hasattr(self, "updateDG") and callable(self.updateDG):
                         self.updateDG()
 
         return wrapper
 
     @staticmethod
     def _defer_task(func):
-        """延迟执行：推入队列并唤醒节点"""
+        """延迟执行:推入队列并唤醒节点"""
 
         @functools.wraps(func)
         def wrapper(self: WeightsManager, *args, **kwargs):
@@ -389,13 +385,13 @@ class _DeferredTaskMixin:
             with self._tasks_lock:
                 self._deferred_tasks.append(task)
 
-            if hasattr(self, "updateDG") and callable(getattr(self, "updateDG")):
+            if hasattr(self, "updateDG") and callable(self.updateDG):
                 self.updateDG()
 
         return wrapper
 
     def execute_deferred_tasks(self):
-        """[高内聚] 暴露给子类，用于消化队列"""
+        """[高内聚] 暴露给子类,用于消化队列"""
         if not self._deferred_tasks:
             return
 
@@ -431,8 +427,8 @@ class WeightsManager(_DeferredTaskMixin):
     def sync_layer_cache(self, mDataBlock: om1.MDataBlock):
         """
         [状态同步器]
-        一次性扫描 Maya 节点，刷新所有 Plug 缓存与底层内存池。
-        当你在 UI 层面添加、删除了图层，或改变了节点连接后，手动调用此函数。
+        一次性扫描 Maya 节点,刷新所有 Plug 缓存与底层内存池。
+        当你在 UI 层面添加、删除了图层,或改变了节点连接后,手动调用此函数。
         """
         # weights
         weights_dataHandle = mDataBlock.outputValue(self.cSkin.aWeights)
@@ -451,23 +447,22 @@ class WeightsManager(_DeferredTaskMixin):
     def updateDG(self):
         self.cSkin.setDirty()
 
-    def get_layer(self, index: int, logicalIndex: bool = True) -> "WeightsLayerItem":
+    def get_layer(self, index: int, logicalIndex: bool = True) -> WeightsLayerItem:
         """
-        获取图层实例，支持通过逻辑索引或物理索引进行查询。
+        获取图层实例,支持通过逻辑索引或物理索引进行查询。
 
         Args:
             index (int): 图层的索引值
-            logicalIndex (bool): True 表示按逻辑索引查询，False 表示按物理顺序查询。
+            logicalIndex (bool): True 表示按逻辑索引查询,False 表示按物理顺序查询。
         Returns:
-            WeightsLayerItem: 找到的图层实例，如果越界或找不到则返回 None。
+            WeightsLayerItem: 找到的图层实例,如果越界或找不到则返回 None。
         """
         if logicalIndex:
             return self.layers.get(index, None)
-        else:
-            try:
-                return list(self.layers.values())[index]
-            except IndexError:
-                return None
+        try:
+            return list(self.layers.values())[index]
+        except IndexError:
+            return None
 
     def get_handle(self, layer_logical_idx, isMask: bool = False) -> WeightsHandle:
         """
@@ -475,14 +470,15 @@ class WeightsManager(_DeferredTaskMixin):
         """
         # 基础权重
         if layer_logical_idx == -1:
+            if isMask:
+                return None
             return self.weights
         # layer 权重
         if layer_logical_idx in self.layers:
             layer_item = self.layers[layer_logical_idx]
             if isMask:
                 return layer_item.mask
-            else:
-                return layer_item.weights
+            return layer_item.weights
 
         return None
 
@@ -495,16 +491,16 @@ class WeightsManager(_DeferredTaskMixin):
     ):
         """
         [提取/复制权重] (统一高级接口)
-        提取指定范围的权重数据，并返回完整的上下文。
-        - 全量提取时：直接底层内存拷贝，实现极致零延迟。
-        - 局部提取时：调度 Cython 引擎进行极速精细抠取。
+        提取指定范围的权重数据,并返回完整的上下文。
+        - 全量提取时:直接底层内存拷贝,实现极致零延迟。
+        - 局部提取时:调度 Cython 引擎进行极速精细抠取。
         """
         # 1. 直接获取句柄并进行绝对安全拦截
         handle = self.get_handle(layer_idx, is_mask)
         if handle is None or not handle.is_valid:
             return 0, 0, array.array("i"), array.array("i"), array.array("i"), array.array("f")
 
-        # 2. 🚀 让句柄自己解析，直接拿到完美的 1D 权重视图
+        # 2. 🚀 让句柄自己解析,直接拿到完美的 1D 权重视图
         v_count, i_count, g_bones_view, w_1d_view = handle.parse_raw_weights()
 
         # 拦截空图层
@@ -515,17 +511,17 @@ class WeightsManager(_DeferredTaskMixin):
         global_bone_ids = array.array("i", g_bones_view) if g_bones_view else array.array("i")
 
         # ---------------------------------------------------------------------
-        # 🚀 性能分支：全量提取 vs 局部提取
+        # 🚀 性能分支:全量提取 vs 局部提取
         # ---------------------------------------------------------------------
         if vtx_indices is None and bone_local_indices is None:
-            # 【分支 A：全量提取】(如 Undo 备份)
-            # 既然 handle 已经切出了完美的 w_1d_view，直接 C 级拷贝，跳过引擎启动！
+            # 【分支 A:全量提取】(如 Undo 备份)
+            # 既然 handle 已经切出了完美的 w_1d_view,直接 C 级拷贝,跳过引擎启动
             weights_1d = array.array("f", w_1d_view)
             out_vtx = array.array("i", range(v_count))
             out_bone = array.array("i", range(i_count))
         else:
-            # 【分支 B：局部提取】(如笔刷吸色 / 局部修改备份)
-            # 装配引擎，让 C++ 去做跳跃式的内存抓取
+            # 【分支 B:局部提取】(如笔刷吸色 / 局部修改备份)
+            # 装配引擎,让 C++ 去做跳跃式的内存抓取
             processor = self._create_processor(layer_idx, is_mask)
             if not processor:
                 return v_count, i_count, global_bone_ids, array.array("i"), array.array("i"), array.array("f")
@@ -547,7 +543,6 @@ class WeightsManager(_DeferredTaskMixin):
         """
         [引擎上下文管理器]
         统管 Cython 算力引擎的获取、快照录制与撤销栈注册。
-        基于 RAII 思想，确保底层资源绝对安全。
         """
         # 1. 尝试获取算力引擎
         processor = self._create_processor(layer_idx, is_mask)
@@ -566,7 +561,7 @@ class WeightsManager(_DeferredTaskMixin):
             yield processor
 
         finally:
-            # 4. 收尾工作 (Teardown)：确保快照闭合与闭包注册
+            # 4. 收尾工作 (Teardown):确保快照闭合与闭包注册
             if backup:
                 undo_data = processor.end_stroke()
                 if undo_data:
@@ -600,12 +595,12 @@ class WeightsManager(_DeferredTaskMixin):
         backup: bool = True,
     ):
         """
-        将所有输入丢给 Cython 无头引擎，
+        将所有输入丢给 Cython 无头引擎,
         支持加减乘除、透明度混合、蒙版衰减、自动归一化与稀疏撤销。
         """
         # 开启引擎会话
         with self._processor_session(layer_idx, is_mask, backup) as processor:
-            # 如果没拿到引擎，直接退出
+            # 如果没拿到引擎,直接退出
             if not processor:
                 return False
 
@@ -645,7 +640,7 @@ class WeightsManager(_DeferredTaskMixin):
     ):
         """
         [全量重建/覆盖图层]
-        Python 负责重建 Maya 的底层物理内存和结构，然后移交 Cython 引擎进行纯数据的光速覆写。
+        Python 负责重建 Maya 的底层物理内存和结构,然后移交 Cython 引擎进行纯数据的光速覆写。
         """
         handle = self.get_handle(layer_idx, is_mask)
         if handle is None:
@@ -653,9 +648,9 @@ class WeightsManager(_DeferredTaskMixin):
 
         # --- [1. 记录图层全量结构快照] ---
         if backup:
-            old_v_cnt, old_i_cnt, old_g_bones, _, _, old_w_1d = self.get_weights(layer_idx, is_mask)  # get weights 是拷贝，无需再次拷贝
+            old_v_cnt, old_i_cnt, old_g_bones, _, _, old_w_1d = self.get_weights(layer_idx, is_mask)  # get weights 是拷贝,无需再次拷贝
 
-            # 传入进来的数据可能是引用，这个数据要用来处理 redo, 一定要拷贝数据
+            # 传入进来的数据可能是引用,这个数据要用来处理 redo, 一定要拷贝数据
             safe_new_idx = array.array("i", BufferManager.auto(influence_indices, "i").view)
             safe_new_w = array.array("f", BufferManager.auto(weights_1d, "f").view)
 
@@ -679,7 +674,7 @@ class WeightsManager(_DeferredTaskMixin):
             _int = _view.cast("B").cast("i")
             _int[2 : 2 + len(influence_indices)] = BufferManager.auto(influence_indices, "i").view
 
-        # 🚀 修复 2：召唤 Cython 引擎，执行全量底层 Replace 覆写
+        # 🚀 修复 2:召唤 Cython 引擎,执行全量底层 Replace 覆写
         if weights_1d is not None:
             processor = self._create_processor(layer_idx, is_mask)
             if processor:
@@ -703,13 +698,13 @@ class WeightsManager(_DeferredTaskMixin):
     ):
         """
         专供 Undo / Redo 闭包调用。
-        直接使用 C 级覆盖能力还原快照，彻底告别 Python 循环！
-        """
+        直接使用 C 级覆盖能力还原快照,彻底告别 Python 循环！
+        """  # noqa: RUF002
         processor = self._create_processor(layer_idx, is_mask)
         if not processor:
             return
 
-        # 撤销时不需要记录新的 Undo 快照，也不需要复杂的模式，直接暴力 Replace (blend_mode=2)
+        # 撤销时不需要记录新的 Undo 快照,也不需要复杂的模式,直接暴力 Replace (blend_mode=2)
         processor.set_custom_array(
             source_values=sparse_values,
             blend_mode=2,
@@ -719,9 +714,9 @@ class WeightsManager(_DeferredTaskMixin):
 
     def _create_processor(self, layer_idx: int, is_mask: bool):
         """
-        - 提取指定图层的物理内存，并为创建 `SkinWeightProcessor`实例，可以根据`return`的实例进行操作。
-        - `SkinWeightProcessor` 本质是笔刷处理器，初始化权重笔刷，将权重数据与笔刷引擎托管给父类进行通用运算。
-        - 在这里可以用来快速设置权重，并且自动注册undo和redo快照(参考`set_sparse_data`函数)。
+        - 提取指定图层的物理内存,并为创建 `SkinWeightProcessor`实例,可以根据`return`的实例进行操作。
+        - `SkinWeightProcessor` 本质是笔刷处理器,初始化权重笔刷,将权重数据与笔刷引擎托管给父类进行通用运算。
+        - 在这里可以用来快速设置权重,并且自动注册undo和redo快照(参考`set_sparse_data`函数)。
         """
         handle = self.get_handle(layer_idx, is_mask)
 
@@ -741,11 +736,10 @@ class WeightsManager(_DeferredTaskMixin):
 
         _undo_buffer = BufferManager.allocate("f", (vtx_count, inf_count))
 
-        processor = cBrushCoreCython.SkinWeightProcessor(
+        return cBrushCoreCython.SkinWeightProcessor(
             weights_2d,
             tmp_idx.view,  # 直接传入 view
             tmp_bool.view,  # 直接传入 view
             tmp_locks.view,  # 直接传入 view
-            _undo_buffer.view,  # 直接传入完美的 2D view！
+            _undo_buffer.view,  # 直接传入完美的 2D view
         )
-        return processor

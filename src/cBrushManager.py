@@ -32,12 +32,12 @@ class BrushSettings:
 
 
 # ==============================================================================
-# 🧠 笔刷管理器 (纯算法装配车间，彻底无状态)
+# 🧠 笔刷管理器 (纯算法装配车间 彻底无状态)
 # ==============================================================================
 class WeightBrushManager:
     """
     负责将 Maya Shape 中的网格数据与底层 Cython 计算引擎组装在一起。
-    管理完整的 Stroke (绘制行程) 生命周期，并接管 Undo/Redo 内存池。
+    管理完整的 Stroke (绘制行程) 生命周期 并接管 Undo/Redo 内存池。
     """
 
     @maya_profile(7, "init")
@@ -53,7 +53,7 @@ class WeightBrushManager:
         tri_count = len(self.mesh_ctx.triangle_indices.view) // 3
 
         # =================================================================
-        # 🚀 1. 极简实例化：只喂给引擎最基础的物理数据，剩下的全交到底层黑盒！
+        # 🚀 1. 极简实例化 只喂给引擎最基础的物理数据 剩下的全交到底层黑盒 
         # =================================================================
         self.engine = cBrushCoreCython.CoreBrushEngine(
             self.mesh_ctx.vertex_positions.reshape((vtx_count, 3)).view,
@@ -62,8 +62,8 @@ class WeightBrushManager:
         )
 
         # =================================================================
-        # 🚀 2. 反向提取：引擎在底层造好了内存，我们把它“挂”到上下文里供全局使用
-        # 这样就能保证 Python 层和 C 层读写的绝对是同一块物理内存！
+        # 🚀 2. 反向提取 引擎在底层造好了内存 我们把它“挂”到上下文里供全局使用
+        # 这样就能保证 Python 层和 C 层读写的绝对是同一块物理内存 
         # =================================================================
         self.brush_ctx.hit_indices = self.engine.out_hit_indices
         self.brush_ctx.hit_weights = self.engine.out_hit_falloff
@@ -76,7 +76,7 @@ class WeightBrushManager:
         self.modified_vtx_bool_mgr = cBufferManager.BufferManager.allocate("B", (vtx_count,))
         self.modified_vtx_indices_mgr = cBufferManager.BufferManager.allocate("i", (vtx_count,))
         self.undo_buffer_mgr = cBufferManager.BufferManager.allocate("f", (vtx_count, inf_count))
-        """ 撤销内存池 [i, j]：一次性预分配全量权重快照空间，用于备份刷写前的原始权重 """
+        """ 撤销内存池 [i, j] 一次性预分配全量权重快照空间 用于备份刷写前的原始权重 """
 
         # Stroke 状态
         self.active_processor: cBrushCoreCython.SkinWeightProcessor = None
@@ -110,8 +110,8 @@ class WeightBrushManager:
             return None
 
         # ----------------------------------------------------------------------------------
-        # deform 输出的 点位置信息不一定是同一个内存地址的，在并行模式下，可能多个内存地址切换
-        # 所以每次tick的时候，要更新笔刷底层的点位置信息，直接传入内存地址即可。
+        # deform 输出的 点位置信息不一定是同一个内存地址的 在并行模式下 可能多个内存地址切换
+        # 所以每次tick的时候 要更新笔刷底层的点位置信息 直接传入内存地址即可。
         vtx_count = self.mesh_ctx.vertex_count
         new_view = self.mesh_ctx.vertex_positions.reshape((vtx_count, 3)).view
         self.engine.update_vertex_positions(new_view)
@@ -139,12 +139,12 @@ class WeightBrushManager:
                 self.brush_ctx.hit_count = hit_count
                 self.brush_ctx.hit_center_position = hit_pos
 
-        # 4. 动作分发：如果是按下或拖拽，执行核心涂抹运算
+        # 4. 动作分发 如果是按下或拖拽 执行核心涂抹运算
         if action in ("press", "drag"):
             self.update_stroke()
             self.cSkin.setDirty()
 
-        # 5. 返回局部坐标和法线，供 UI 层转换世界坐标画圈
+        # 5. 返回局部坐标和法线 供 UI 层转换世界坐标画圈
 
         return (hit_pos, hit_normal)
 
@@ -155,7 +155,7 @@ class WeightBrushManager:
     def begin_stroke(self):
         """
         鼠标按下
-        解析 UI 目标 (Layer/Mask/Influence)，提取对应内存并装配 Processor。
+        解析 UI 目标 (Layer/Mask/Influence) 提取对应内存并装配 Processor。
         """
         weights_manager = self.cSkin.weights_manager
         render_ctx = self.shape.render_context
@@ -187,13 +187,13 @@ class WeightBrushManager:
             self.undo_buffer_mgr.view,
         )
 
-        # 通知 Processor 清空掩码，开始记录历史
+        # 通知 Processor 清空掩码 开始记录历史
         self.active_processor.begin_stroke()
 
     @maya_profile(3, "update_stroke")
     def update_stroke(self) -> bool:
         """
-        按下鼠标持续拖拽Tick，计算内存权重
+        按下鼠标持续拖拽Tick 计算内存权重
         """
         if not self.active_processor or self.brush_ctx.hit_count == 0:
             return False
@@ -213,7 +213,7 @@ class WeightBrushManager:
     def end_stroke(self):
         """
         鼠标松开
-        提取 Undo 历史，并向 Maya 正式提交这一笔的所有修改。
+        提取 Undo 历史 并向 Maya 正式提交这一笔的所有修改。
         """
         if not self.active_processor:
             return
@@ -224,12 +224,12 @@ class WeightBrushManager:
         if undo_redo_pack:
             mod_vtx_idx, mod_ch_idx, old_sparse, new_sparse = undo_redo_pack
 
-            # 提前提取引用，防止闭包晚绑定陷阱
+            # 提前提取引用 防止闭包晚绑定陷阱
             wm = self.cSkin.weights_manager
             layer = self.layer_idx
             mask = self.is_mask
 
-            # ✨ 核心改变：使用专用的稀疏状态还原器，强行覆盖，绝对精准！
+            # ✨ 核心改变 使用专用的稀疏状态还原器 强行覆盖 绝对精准 
             def undo():
                 wm.set_sparse_weights(layer, mask, mod_vtx_idx, mod_ch_idx, old_sparse)
 

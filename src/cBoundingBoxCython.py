@@ -10,15 +10,15 @@ def compute_bbox_fast(
     num_verts: cython.int       # 💥 顶点总数
 ):
     """
-    极速核心：遍历一维连续顶点数组，寻找最小和最大边界点 (纯 Python 语法模式)
+    极速核心 遍历一维连续顶点数组 寻找最小和最大边界点 (纯 Python 语法模式)
     """
     # ==========================================
     # 静态类型声明区
     # ==========================================
-    i: cython.int = 0
+    _i: cython.int = 0
     idx: cython.int = 0
     
-    # 初始包围盒极值 (正负极颠倒，用于确保第一次比较时必定被覆写)
+    # 初始包围盒极值 (正负极颠倒 用于确保第一次比较时必定被覆写)
     min_x: cython.float = 9999999.0
     min_y: cython.float = 9999999.0
     min_z: cython.float = 9999999.0
@@ -34,7 +34,7 @@ def compute_bbox_fast(
     # ==========================================
     # 纯 C 级别的极速循环区
     # ==========================================
-    for i in range(num_verts):
+    for _i in range(num_verts):
         # 提取当前顶点的 XYZ
         x = points[idx]
         y = points[idx + 1]
@@ -59,5 +59,5 @@ def compute_bbox_fast(
         elif z > max_z:
             max_z = z
 
-    # 循环结束后，打包成两个普通的 Python Tuple 返回给外界
+    # 循环结束后 打包成两个普通的 Python Tuple 返回给外界
     return (min_x, min_y, min_z), (max_x, max_y, max_z)

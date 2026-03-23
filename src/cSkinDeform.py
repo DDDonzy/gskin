@@ -6,18 +6,71 @@ import maya.OpenMayaMPx as ompx  # type:ignore
 
 from . import _cRegistry
 from . import cSkinDeformCython
+from . import cTopologyCython as cTopology
 from .cBufferManager import BufferManager
 from .cWeightsManager import WeightsManager
-from . import cTopologyCython as cTopology
-
-
-from .cSkinContext import MeshTopologyContext, BrushHitContext
 
 from ._cProfilerCython import MayaNativeProfiler, maya_profile
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .cSkinContext import BrushHitContext
+
+
+class MeshTopologyContext:
+    """
+    统一的数据结构 包含变形/渲染所需的所有网格数据。
+    严格区分了动态的顶点位置与静态的拓扑/邻接表 方便 BufferManager 统一管理生命周期。
+    """
+
+    __slots__ = ("vertex_count",  # noqa: RUF023
+                 "edge_count",
+                 "polygon_count",
+                 "triangle_count",
+                 "vertex_positions",
+                 "triangle_indices",
+                 "edge_indices",
+                 "quad_edge_indices",
+                 "v2v_offsets",
+                 "v2v_indices",
+                 "v2f_offsets",
+                 "v2f_indices")  # fmt:skip
+
+    def __init__(self):
+        self.vertex_count: int = 0
+        self.edge_count: int = 0
+        self.polygon_count: int = 0
+        self.triangle_count: int = 0
+        # 点位置 Buffer
+        self.vertex_positions: BufferManager = None
+        # 基础拓扑 Buffer
+        self.triangle_indices: BufferManager = None
+        self.edge_indices: BufferManager = None
+        self.quad_edge_indices: BufferManager = None
+        # v2v CSR Buffer
+        self.v2v_offsets: BufferManager = None
+        self.v2v_indices: BufferManager = None
+        # v2f CSR Buffer
+        self.v2f_offsets: BufferManager = None
+        self.v2f_indices: BufferManager = None
+
+    def clear(self):
+        # fmt:off
+        """可选的清理方法 用于显式释放底层的连续内存"""
+        self.vertex_positions  = None
+        self.triangle_indices  = None
+        self.edge_indices      = None
+        self.quad_edge_indices = None
+        self.v2v_offsets       = None
+        self.v2v_indices       = None
+        self.v2f_offsets       = None
+        self.v2f_indices       = None
+        # fmt:on
+
 
 class CythonSkinDeformer(ompx.MPxDeformerNode):
-    __slots__ = (# 基础属性与 API 对象 (Base & API Objects)
+    __slots__ = (# 基础属性与 API 对象 (Base & API Objects) # noqa: RUF023
                  "hashCode",
                  "mObject",
                  "mFnDep",
@@ -27,10 +80,8 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
                  "mesh_context",
                  "brush_context",
                  # 核心数据与缓存池 (Data & Buffers)
-                 "vertex_count",
                  "influences_count",
                  "influences_locks_buffer",
-                 "rawPoints_output_buffer",
                  # 脏标记体系 (Dirty Flags)
                  "isDirty",
                  "isDirty_weights",
@@ -64,7 +115,7 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
     # fmt:on
 
     def __init__(self):
-        super(CythonSkinDeformer, self).__init__()
+        super().__init__()
 
         # fmt:off
         # --- maya
@@ -78,11 +129,9 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         self.mesh_context    : MeshTopologyContext = None
         self.brush_context   : BrushHitContext     = None
 
-        # --- data
-        self.vertex_count            : int           = 0
+        # --- influences
         self.influences_count        : int           = 0
         self.influences_locks_buffer : BufferManager = None
-        self.rawPoints_output_buffer : BufferManager = None
 
         # --- dirty
         self.isDirty                  : bool = True
@@ -107,8 +156,8 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
 
     def postConstructor(self):
         """
-        - 节点创建后，立刻通过api获取这些常用api对象，避免后续频繁调用api开销
-        - 绑定节点实例，注册到全局，方便别的节点调用。
+        - 节点创建后 立刻通过api获取这些常用api对象 避免后续频繁调用api开销
+        - 绑定节点实例 注册到全局 方便别的节点调用。
         """
         # fmt:off
         # --- maya
@@ -126,13 +175,13 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
 
     def setDirty(self):
         """
-        - 用于笔刷调用，提醒 `Deform`，更新权重
+        - 用于笔刷调用 提醒 `Deform` 更新权重
         """
-        self.plug_refresh.setInt((self.plug_refresh.asInt() + 1))
+        self.plug_refresh.setInt(self.plug_refresh.asInt() + 1)
         self.isDirty_weights = True
 
     def setDependentsDirty(self, plug: om1.MPlug, dirtyPlugArray: om1.MPlugArray):
-        """DG模式下脏数据标签，性能优化"""
+        """DG模式下脏数据标签 性能优化"""
         # --- weights
         if plug in (self.aWeights,
                     self.aLayerCompound,
@@ -142,36 +191,36 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
                     self.aRefresh):  # fmt:skip
             self.isDirty = True
             self.isDirty_weights = True
-
+        # envelope
+        elif plug == ompx.cvar.MPxGeometryFilter_envelope:
+            self.isDirty = True
         # --- matrix
         elif plug == self.aInfluenceMatrix:
             self.isDirty = True
             self.isDirty_influencesMatrix = True
-
         # --- bind pre matrix
         elif plug == self.aBindPreMatrix:
             self.isDirty = True
             self.isDirty_bindPreMatrix = True
-
         # --- geo transform matrix
         elif plug == self.aGeomMatrix:
             self.isDirty = True
             self.isDirty_geoMatrix = True
-
         # --- input geometry
         elif plug == ompx.cvar.MPxGeometryFilter_inputGeom or \
              plug == ompx.cvar.MPxGeometryFilter_input:  # fmt:skip
             self.isDirty = True
             self.isDirty_inputGeometry = True
 
-        return super(CythonSkinDeformer, self).setDependentsDirty(plug, dirtyPlugArray)
+        return super().setDependentsDirty(plug, dirtyPlugArray)
 
     def preEvaluation(self, context: om1.MDGContext, evaluationNode: om1.MEvaluationNode):
-        """并行模式下脏数据标签，性能优化"""
+        """并行模式下脏数据标签 性能优化"""
         if context.isNormal():
             # --- input geometry
-            if evaluationNode.dirtyPlugExists(ompx.cvar.MPxGeometryFilter_inputGeom) or\
-               evaluationNode.dirtyPlugExists(ompx.cvar.MPxGeometryFilter_input):  # fmt:skip
+            if (evaluationNode.dirtyPlugExists(ompx.cvar.MPxGeometryFilter_inputGeom)
+                or evaluationNode.dirtyPlugExists(ompx.cvar.MPxGeometryFilter_input)
+                or evaluationNode.dirtyPlugExists(ompx.cvar.MPxGeometryFilter_envelope)):  # fmt:skip
                 self.isDirty = True
                 self.isDirty_inputGeometry = True
 
@@ -200,13 +249,13 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
                 self.isDirty = True
                 self.isDirty_weights = True
 
-        return super(CythonSkinDeformer, self).preEvaluation(context, evaluationNode)
+        return super().preEvaluation(context, evaluationNode)
 
     def update_topology(self, mFnMesh: om1.MFnMesh):
         """
         提取并更新基础物理拓扑数据与 CSR 邻接表。
 
-        仅在首次解算或模型拓扑（点数/面数）发生变化时执行，
+        仅在首次解算或模型拓扑 点数/面数 发生变化时执行
         为笔刷、渲染及平滑解算提供静态的拓扑数据结构。
 
         Args:
@@ -215,9 +264,8 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         Modifies:
             全面更新 self.mesh_context 中的所有计数器、基础索引和 CSR 邻接表缓存。
         """
-        # fmt:off
-        current_vertex_count  = mFnMesh.numVertices()
-        current_edge_count    = mFnMesh.numEdges()
+        current_vertex_count = mFnMesh.numVertices()
+        current_edge_count = mFnMesh.numEdges()
         current_polygon_count = mFnMesh.numPolygons()
 
         # CHECK
@@ -225,7 +273,7 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
             self.mesh_context.edge_count    == current_edge_count   and
             self.mesh_context.polygon_count == current_polygon_count and
             self.mesh_context.v2v_offsets is not None):  # fmt:skip
-            # 通过检查，证明topology没有变化，直接跳过
+            # 通过检查 证明topology没有变化 直接跳过
             return
 
         # UPDATE TOPOLOGY
@@ -247,7 +295,7 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         ptr = util.asInt2Ptr()
         for i in range(current_edge_count):
             mFnMesh.getEdgeVertices(i, ptr)
-            quad_edge_list[i * 2]     = om1.MScriptUtil.getInt2ArrayItem(ptr, 0, 0)
+            quad_edge_list[i * 2] = om1.MScriptUtil.getInt2ArrayItem(ptr, 0, 0)
             quad_edge_list[i * 2 + 1] = om1.MScriptUtil.getInt2ArrayItem(ptr, 0, 1)
         self.mesh_context.quad_edge_indices = BufferManager.from_list(quad_edge_list, "i")
 
@@ -264,7 +312,6 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         v2f_offsets_ctypes, v2f_indices_ctypes = cTopology.build_v2f_adjacency(self.mesh_context.vertex_count, self.mesh_context.triangle_indices.view)
         self.mesh_context.v2f_offsets = BufferManager.from_ctypes(v2f_offsets_ctypes)
         self.mesh_context.v2f_indices = BufferManager.from_ctypes(v2f_indices_ctypes)
-        # fmt:on
 
     def get_active_paint_weights(self) -> memoryview | None:
         """
@@ -301,25 +348,23 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
     @maya_profile(0, "Compute")
     def compute(self, plug, dataBlock):
         """
-        很蛋疼的是`DG`模式下，如果`.outputGeometry[i]`输出给多个模型，
-        每个模型求值都会触发一次 `Deform` 函数，非常消耗性能，尤其是在绘制权重的时候，
-        一个输出给 maya geometry，一个输出给 权重颜色显示模型，会导致deform函数执行两次。
-        所以前面配置了`setDependentsDirty`标记，只有在input的数据改变的时候，才会触发 `Deform` 函数。
-        后续获取蒙皮后的模型数据，可以用任意方法求值，不会造成多余的 `Deform` 函数调用，以节约资源。
+        很蛋疼的是`DG`模式下 如果`.outputGeometry[i]`输出给多个模型
+        每个模型求值都会触发一次 `Deform` 函数 非常消耗性能 尤其是在绘制权重的时候
+        一个输出给 maya geometry 一个输出给 权重颜色显示模型 会导致deform函数执行两次。
+        所以前面配置了`setDependentsDirty`标记 只有在input的数据改变的时候 才会触发 `Deform` 函数。
+        后续获取蒙皮后的模型数据 可以用任意方法求值 不会造成多余的 `Deform` 函数调用 以节约资源。
         """
         if not self.isDirty:
-            return
+            return None
 
         res = super().compute(plug, dataBlock)
         self.isDirty = False
         return res
 
     @maya_profile(0, "Deform")
-    def deform(self, dataBlock: om1.MDataBlock, geoIter, localToWorldMatrix, multiIndex):
-        with MayaNativeProfiler("Envelop", 1):
-            envelope = dataBlock.inputValue(ompx.cvar.MPxGeometryFilter_envelope).asFloat()
-            if envelope == 0.0:
-                return
+    def deform(self, dataBlock: om1.MDataBlock, geoIter, localToWorldMatrix, multiIndex):  # noqa: ARG002
+        print("deform-start")
+        envelope = dataBlock.inputValue(ompx.cvar.MPxGeometryFilter_envelope).asFloat()
 
         with MayaNativeProfiler("in-geo-object", 2):
             input_handle = dataBlock.outputArrayValue(ompx.cvar.MPxGeometryFilter_input)
@@ -338,14 +383,14 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
 
         with MayaNativeProfiler("fnMesh-in", 3):
             mFnMesh_in = om1.MFnMesh(input_geom_obj)
-            self.vertex_count = mFnMesh_in.numVertices()
-            rawPoints_original_mgr = BufferManager.from_ptr(int(mFnMesh_in.getRawPoints()), "f", (self.vertex_count * 3,))
+            vertex_count = mFnMesh_in.numVertices()
+            rawPoints_original_mgr = BufferManager.from_ptr(int(mFnMesh_in.getRawPoints()), "f", (vertex_count * 3,))
         with MayaNativeProfiler("update-topology", 3):
             self.update_topology(mFnMesh_in)
 
         with MayaNativeProfiler("out-fnMesh", 6):
             mFnMesh_out = om1.MFnMesh(output_geom_obj)
-            self.rawPoints_output = BufferManager.from_ptr(int(mFnMesh_out.getRawPoints()), "f", (self.vertex_count * 3,))
+            self.rawPoints_output = BufferManager.from_ptr(int(mFnMesh_out.getRawPoints()), "f", (vertex_count * 3,))
             # --- mesh_context.vertex_positions
             self.mesh_context.vertex_positions = self.rawPoints_output
 
@@ -362,16 +407,16 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
                         self._influencesMatrix_buffer.view[b, i] = 1.0 if (i % 5 == 0) else 0.0
 
         with MayaNativeProfiler("influences matrix", 5):
-            if self.isDirty_influencesMatrix:
-                if influences_count > 0:
-                    dest_base_addr = self._influencesMatrix_buffer.ptr
-                    for i in range(influences_count):
-                        influences_handle.jumpToArrayElement(i)
-                        influence_idx = influences_handle.elementIndex()
-                        src_addr = int(influences_handle.inputValue().asMatrix().this)
-                        dest_addr = dest_base_addr + (influence_idx * 128)
-                        ctypes.memmove(dest_addr, src_addr, 128)
-                    self.isDirty_influencesMatrix = False
+            if (self.isDirty_influencesMatrix
+                and influences_count > 0):  # fmt:skip
+                dest_base_addr = self._influencesMatrix_buffer.ptr
+                for i in range(influences_count):
+                    influences_handle.jumpToArrayElement(i)
+                    influence_idx = influences_handle.elementIndex()
+                    src_addr = int(influences_handle.inputValue().asMatrix().this)
+                    dest_addr = dest_base_addr + (influence_idx * 128)
+                    ctypes.memmove(dest_addr, src_addr, 128)
+                self.isDirty_influencesMatrix = False
 
         with MayaNativeProfiler("influences bind matrix", 6):
             if self.isDirty_bindPreMatrix:
@@ -435,31 +480,24 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         CythonSkinDeformer.aGeomMatrix = mAttr.create("geomMatrix", "gm")
         mAttr.setHidden(True)
         mAttr.setKeyable(False)
-
         # --- bind pre matrix
         CythonSkinDeformer.aBindPreMatrix = tAttr.create("bindPreMatrixArray", "bpm", om1.MFnData.kMatrixArray)
         tAttr.setHidden(True)
-
         # --- influences matrix
         CythonSkinDeformer.aInfluenceMatrix = mAttr.create("matrix", "bm")
         mAttr.setArray(True)
         mAttr.setHidden(True)
         mAttr.setUsesArrayDataBuilder(True)
-
         # --- weights
         CythonSkinDeformer.aWeights = tAttr.create("cWeights", "cw", om1.MFnData.kVectorArray)
         tAttr.setHidden(True)
-
         # --- layer weights children
         CythonSkinDeformer.aLayerEnabled = nAttr.create("layerEnabled", "le", om1.MFnNumericData.kBoolean, False)
         nAttr.setHidden(True)
-
         CythonSkinDeformer.aLayerWeights = tAttr.create("layerWeights", "lw", om1.MFnData.kVectorArray)
         tAttr.setHidden(True)
-
         CythonSkinDeformer.aLayerMask = tAttr.create("layerMask", "lm", om1.MFnData.kVectorArray)
         tAttr.setHidden(True)
-
         # --- layer comp
         CythonSkinDeformer.aLayerCompound = cAttr.create("layers", "lays")
         cAttr.setArray(True)
@@ -468,31 +506,29 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         cAttr.addChild(CythonSkinDeformer.aLayerEnabled)
         cAttr.addChild(CythonSkinDeformer.aLayerWeights)
         cAttr.addChild(CythonSkinDeformer.aLayerMask)
-
         # --- refresh
         CythonSkinDeformer.aRefresh = nAttr.create("cRefresh", "cr", om1.MFnNumericData.kInt, False)
         nAttr.setKeyable(False)
         nAttr.setStorable(False)
         nAttr.setCached(False)
-
+        # --- Paint current weights
+        CythonSkinDeformer.aCurrentPaintLayerIndex = nAttr.create("currentPaintLayer", "cpl", om1.MFnNumericData.kInt, -1)
+        nAttr.setMin(-1)
+        nAttr.setKeyable(True)
+        CythonSkinDeformer.aCurrentPaintInfluenceIndex = nAttr.create("currentPaintInfluence", "cpi", om1.MFnNumericData.kInt, 0)
+        nAttr.setMin(0)
+        nAttr.setKeyable(True)
+        CythonSkinDeformer.aCurrentPaintMaskBool = nAttr.create("currentPaintMask", "cpm", om1.MFnNumericData.kBoolean, False)
+        nAttr.setKeyable(True)
         # ====================================
         for attr in  (CythonSkinDeformer.aGeomMatrix, 
                       CythonSkinDeformer.aBindPreMatrix, 
                       CythonSkinDeformer.aInfluenceMatrix, 
                       CythonSkinDeformer.aWeights, 
                       CythonSkinDeformer.aLayerCompound, 
-                      CythonSkinDeformer.aRefresh):  # fmt:skip
+                      CythonSkinDeformer.aRefresh,
+                      CythonSkinDeformer.aCurrentPaintLayerIndex,
+                      CythonSkinDeformer.aCurrentPaintInfluenceIndex,
+                      CythonSkinDeformer.aCurrentPaintMaskBool):  # fmt:skip
             CythonSkinDeformer.addAttribute(attr)
             CythonSkinDeformer.attributeAffects(attr, ompx.cvar.MPxGeometryFilter_outputGeom)
-
-        # --- Paint
-        CythonSkinDeformer.aCurrentPaintLayerIndex = nAttr.create("currentPaintLayer", "cpl", om1.MFnNumericData.kInt, -1)
-        nAttr.setMin(-1)
-        nAttr.setHidden(True)
-        CythonSkinDeformer.aCurrentPaintInfluenceIndex = nAttr.create("currentPaintInfluence", "cpi", om1.MFnNumericData.kInt, 0)
-        nAttr.setHidden(True)
-        CythonSkinDeformer.aCurrentPaintMaskBool = nAttr.create("currentPaintMask", "cpm", om1.MFnNumericData.kBoolean, False)
-        nAttr.setHidden(True)
-        CythonSkinDeformer.addAttribute(CythonSkinDeformer.aCurrentPaintLayerIndex)
-        CythonSkinDeformer.addAttribute(CythonSkinDeformer.aCurrentPaintInfluenceIndex)
-        CythonSkinDeformer.addAttribute(CythonSkinDeformer.aCurrentPaintMaskBool)
