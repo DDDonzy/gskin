@@ -1,83 +1,3 @@
-"""
-==============================================================================
-High-Performance Cython Brush Engine for Maya Skin Weights
-高性能 Maya 蒙皮权重笔刷与拓扑运算引擎 (纯 C 级底层核心)
-==============================================================================
-
-本模块利用 Cython 和 OpenMP 实现了极限性能的网格射线检测、拓扑寻路与权重运算。
-采用“数据与逻辑解耦”的架构设计，所有内存由上层 (Python/Maya API) 分配并持有。
-本引擎仅接收内存视图 (MemoryView) 进行纯 C 级别的原地突变 (In-place Mutation)。
-
-【核心架构层级】 (采用组合模式进行高度解耦)
-    1. CoreBrushEngine     : 空间引擎。负责 BVH/AABB 射线检测、M-T 算法交点计算、BFS 拓扑衰减。
-    2. BrushUndoRecorder   : 快照引擎。负责极限压缩的双向稀疏 Undo/Redo 数据流。
-    3. BrushMathEngine     : 数学引擎。提供纯函数式的加减乘除、平滑、拉普拉斯锐化等矩阵运算。
-    4. UtilBrushProcessor  : 通用调度器。利用组合模式统筹空间、快照与数学引擎，处理通用数组。
-    5. SkinWeightProcessor : 业务管线调度器。掌控流水线，强校验骨骼锁定与权重归一化物理法则。
-
-【内存分配规范 (铁律)】
-    所有传入 `__init__` 的 `buffer` 参数，必须在外部由 `numpy` 或 Python 原生 `array` 提前分配妥当。
-    本引擎内部绝对不会调用任何 `malloc` 或生成新数组，确保 100FPS 的零 GC 延迟。
-
-==============================================================================
-使用指南 (Usage Examples)
-==============================================================================
-
-场景 A 交互式笔刷 (Interactive Stroke - 绑定在鼠标拖拽事件中)
-------------------------------------------------------------------------------
-
-    # 1. 初始化 (在插件加载或工具激活时执行一次)
-    # core 用于解析模型,raycast,计算笔刷衰减等
-    core = CoreBrushEngine(vtx_pos_ary, tri_idx_ary, adj_offset, adj_idx, epochs, hit_idx, hit_w)
-
-    # processor 用于记录基本数据,执行绘制事件 (组合了 core)
-    processor = SkinWeightProcessor(core, weights_ary, undo_idx, undo_mask, locks_ary, undo_pool)
-
-
-    # 2. 鼠标按下 (Mouse Press)
-    processor.begin_stroke()
-
-    # 3. 鼠标拖拽 (Mouse Drag - 每帧执行)
-    is_hit, hit_pos, normal, tri_idx, t, u, v = core.raycast(ray_pos, ray_dir)
-    if is_hit:
-        # 计算空间拓扑衰减 (结果存入 core 的内存中)
-        core.calc_brush_weights(hit_pos, tri_idx, radius=5.0, falloff_mode=1, use_surface=True)
-
-        # 执行权重运算与归一化 (自动读取 core 缓存 并存入 Undo 队列)
-        processor.apply_weight(
-            brush_mode=0,                  # 0: Add
-            values=array.array('f', [0.1]),# 笔刷强度
-            channel_indices=target_bones   # 当前绘制的骨骼 ID 数组
-        )
-
-    # 4. 鼠标松开 (Mouse Release)
-    undo_data = processor.end_stroke()
-    if undo_data:
-        vtx_idx, ch_idx, old_vals, new_vals = undo_data
-        # 将解包后的稀疏数据推入 Maya 原生的 MPxCommand 撤销栈...
-
-
-场景 B UI 按钮一键调用 (API Direct Call - 如“一键平滑选中顶点”)
-------------------------------------------------------------------------------
-    # 直接向引擎灌入指定的顶点索引 无需执行 raycast
-    selected_verts = array.array('i', [15, 102, 334, 1056])
-
-    # 瞬间完成 5 次平滑迭代 并自动执行 5 次归一化 生成完美 Undo 快照
-    processor.apply_weight(
-        brush_mode=4,                           # 4: Smooth
-        values=array.array('f', [1.0]),         # 100% 平滑力度
-        channel_indices=target_bones,           # 目标骨骼
-        iterations=5,                           # 迭代 5 次以扩大拓扑蔓延
-        vertex_indices=selected_verts           # 显式传入目标顶点 (绕过射线引擎)
-        # falloff_weights 留空 底层将自动生成全 1.0 的满强度衰减
-    )
-
-    # 获取撤销数据并推入栈
-    undo_data = processor.end_stroke()
-
-==============================================================================
-"""
-
 import ctypes
 import array
 import cython
@@ -122,100 +42,6 @@ def _clamp_float(
     return val
 
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
-@cython.cdivision(True)
-def build_csr_topology(
-    num_verts: cython.int,
-    edge_indices1D: cython.int[::1],  # 这里保持 1D 因为你传进来的是 1D
-    out_offsets: cython.int[::1],
-    out_indices: cython.int[::1],
-    temp_cursor: cython.int[::1],
-):
-    """构建 V2V (顶点到顶点) CSR 邻接表"""
-    num_edges: cython.int = edge_indices1D.shape[0] // 2
-    i: cython.int
-    v1: cython.int
-    v2: cython.int
-
-    for i in range(num_verts + 1):
-        out_offsets[i] = 0
-
-    for i in range(num_edges):
-        v1 = edge_indices1D[i * 2 + 0]
-        v2 = edge_indices1D[i * 2 + 1]
-        out_offsets[v1 + 1] += 1
-        out_offsets[v2 + 1] += 1
-
-    for i in range(num_verts):
-        out_offsets[i + 1] += out_offsets[i]
-        temp_cursor[i] = out_offsets[i]
-
-    idx: cython.int
-    for i in range(num_edges):
-        v1 = edge_indices1D[i * 2 + 0]
-        v2 = edge_indices1D[i * 2 + 1]
-
-        idx = temp_cursor[v1]
-        out_indices[idx] = v2
-        temp_cursor[v1] += 1
-
-        idx = temp_cursor[v2]
-        out_indices[idx] = v1
-        temp_cursor[v2] += 1
-
-
-@cython.boundscheck(False)
-@cython.wraparound(False)
-@cython.cdivision(True)
-def build_v2f_topology(
-    num_verts: cython.int,
-    tri_indices2D: cython.int[:, ::1],  # 🌟 改回 2D 矩阵读取
-    out_offsets: cython.int[::1],
-    out_indices: cython.int[::1],
-    temp_cursor: cython.int[::1],
-):
-    """构建 V2F (顶点到面) CSR 邻接表"""
-    num_tris: cython.int = tri_indices2D.shape[0]
-    i: cython.int
-    v0: cython.int
-    v1: cython.int
-    v2: cython.int
-
-    for i in range(num_verts + 1):
-        out_offsets[i] = 0
-
-    for i in range(num_tris):
-        v0 = tri_indices2D[i, 0]
-        v1 = tri_indices2D[i, 1]
-        v2 = tri_indices2D[i, 2]
-        out_offsets[v0 + 1] += 1
-        out_offsets[v1 + 1] += 1
-        out_offsets[v2 + 1] += 1
-
-    for i in range(num_verts):
-        out_offsets[i + 1] += out_offsets[i]
-        temp_cursor[i] = out_offsets[i]
-
-    idx: cython.int
-    for i in range(num_tris):
-        v0 = tri_indices2D[i, 0]
-        v1 = tri_indices2D[i, 1]
-        v2 = tri_indices2D[i, 2]
-
-        idx = temp_cursor[v0]
-        out_indices[idx] = i
-        temp_cursor[v0] += 1
-
-        idx = temp_cursor[v1]
-        out_indices[idx] = i
-        temp_cursor[v1] += 1
-
-        idx = temp_cursor[v2]
-        out_indices[idx] = i
-        temp_cursor[v2] += 1
-
-
 @cython.cclass
 class CoreBrushEngine:
     """
@@ -245,8 +71,11 @@ class CoreBrushEngine:
     def __init__(
         self,
         vtx_positions2D: cython.float[:, ::1],
-        tri_indices2D: cython.int[:, ::1],
-        edge_indices1D: cython.int[::1],
+        triangle_indices2D: cython.int[:, ::1],
+        v2v_offset: cython.int[::1],
+        v2v_indices: cython.int[::1],
+        v2f_offset: cython.int[::1],
+        v2f_indices: cython.int[::1],
     ):
         """初始化核心引擎 并绑定底层物理内存视图。
 
@@ -258,7 +87,7 @@ class CoreBrushEngine:
                 - 示例: `[[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], ...]`
                   代表 0号点在(0,1,0) 1号点在(1,0,0)。
 
-            tri_indices2D (cython.int[:, ::1]):
+            triangle_indices2D (cython.int[:, ::1]):
                 网格三角面顶点索引矩阵 (Triangle Vertex Indices)。
                 - 形状: [M, 3] 其中 M 为网格的三角面总数。
                 - 说明: 它是 3D 拓扑结构的核心 里面的数字并不是坐标 而是指向 `vtx_positions2D` 的“行号 (ID)”。
@@ -266,21 +95,19 @@ class CoreBrushEngine:
                 - 示例: 如果某一行是 `[5, 12, 8]` 则意味着这个三角面是由第 5 号、第 12 号、第 8 号顶点连接而成的一张皮。
                   在 M-T 射线算法中 我们会用这 3 个 ID 去 `vtx_positions2D` 里查出真正的空间坐标来进行相交测试。
 
-            edge_indices1D (cython.int[::1]):
-                网格边缘的扁平化索引数组 (Flattened Edge Indices)。
-                - 形状: [E * 2] 其中 E 为网格的无向边总数。
-                - 说明: 因为每条边由 2 个顶点构成 在 1D 数组中它们是“成对 (Pair)”相邻存放的。
-                  索引 `[i * 2]` 和 `[i * 2 + 1]` 就是第 i 条边的起点 ID 和终点 ID。
-                - 示例: `[4, 7, 12, 9, ...]` 代表系统中有两条边 第一条连接 4号和7号点 第二条连接 12号和9号点。
-                  主要用于在初始化时构建 V2V (顶点到顶点) 的 CSR 空间扩散拓扑表。
         """
 
         self.vtx_positions2D = vtx_positions2D
-        self.tri_indices2D = tri_indices2D
+        self.tri_indices2D = triangle_indices2D
+
+        self.adj_offsets = v2v_offset
+        self.adj_indices = v2v_indices
+
+        self.v2f_offsets = v2f_offset
+        self.v2f_indices = v2f_indices
 
         num_verts: cython.int = vtx_positions2D.shape[0]
-        num_tris: cython.int = tri_indices2D.shape[0]
-        num_edges: cython.int = edge_indices1D.shape[0] // 2
+        num_tris: cython.int = triangle_indices2D.shape[0]
 
         # 👑 内部自动分配所有 1D 数组 直接丢给 MemoryView 锚定
         self.vertices_epochs = array.array("i", [0]) * num_verts
@@ -288,32 +115,10 @@ class CoreBrushEngine:
         self.active_hit_indices = array.array("i", [0]) * num_verts
         self.active_hit_falloff = array.array("f", [0.0]) * num_verts
 
-        # 拓扑表内存分配
-        self.adj_offsets = array.array("i", [0]) * (num_verts + 1)
-        self.adj_indices = array.array("i", [0]) * (num_edges * 2)
-
-        self.v2f_offsets = array.array("i", [0]) * (num_verts + 1)
-        self.v2f_indices = array.array("i", [0]) * (num_tris * 3)
-
-        # 构建 CSR 拓扑表
-        _temp_cursor = array.array("i", [0]) * num_verts
-        build_csr_topology(
-            num_verts, edge_indices1D, self.adj_offsets, self.adj_indices, _temp_cursor
-        )
-
-        # 重置游标并构建 V2F 拓扑表
-        for i in range(num_verts):
-            _temp_cursor[i] = 0
-        build_v2f_topology(
-            num_verts, tri_indices2D, self.v2f_offsets, self.v2f_indices, _temp_cursor
-        )
-
         self.brush_epoch = 1
         self.raycast_epoch = 1
         self.active_hit_count = 0
 
-    @cython.boundscheck(False)
-    @cython.wraparound(False)
     def update_vertex_positions(self, new_positions2D: cython.float[:, ::1]):
         self.vtx_positions2D = new_positions2D
 
@@ -514,9 +319,7 @@ class CoreBrushEngine:
             tid: cython.int  # 线程 ID
 
             # 🌟 调度策略切换回 guided 用于 Profiler 性能测试对比
-            for i in prange(
-                num_tris, schedule="guided", num_threads=active_threads, nogil=True
-            ):
+            for i in prange(num_tris, schedule="guided", num_threads=active_threads, nogil=True):
                 tid = omp_get_thread_num()
                 if tid >= 128:
                     tid = 0
@@ -599,9 +402,7 @@ class CoreBrushEngine:
             raw_nz: cython.float = edge1_x * edge2_y - edge1_y * edge2_x  # 法线叉积 Z
 
             # 获取法线模长 (调用 C 标准库 sqrt 极限提速)
-            norm_len: cython.float = sqrt(
-                raw_nx * raw_nx + raw_ny * raw_ny + raw_nz * raw_nz
-            )
+            norm_len: cython.float = sqrt(raw_nx * raw_nx + raw_ny * raw_ny + raw_nz * raw_nz)
 
             nx: cython.float = raw_nx / norm_len if norm_len > 0.000001 else 0.0
             ny: cython.float = raw_ny / norm_len if norm_len > 0.000001 else 0.0
@@ -929,9 +730,7 @@ class BrushUndoRecorder:
         if undo_buffer is None:
             flat_size = vtx_count * self.channel_count
             c_undo_arr = (ctypes.c_float * flat_size)()
-            self.undo_buffer = memoryview(c_undo_arr).cast(
-                "f", shape=(vtx_count, self.channel_count)
-            )
+            self.undo_buffer = memoryview(c_undo_arr).cast("f", shape=(vtx_count, self.channel_count))
         else:
             self.undo_buffer = undo_buffer
 
@@ -974,7 +773,7 @@ class BrushUndoRecorder:
         Args:
             record_indices (cython.int[::1]): 要记录数据的indices,如果为`None`则记录全部数据
         """
-        # 为提高性能，将类属性提取到局部变量
+        # 为提高性能 将类属性提取到局部变量
         _mod_buf = self.modified_buffer
         _undo_buf = self.undo_buffer
         _mask = self.modified_vtx_bool_buffer
@@ -985,7 +784,7 @@ class BrushUndoRecorder:
         # 确定是全量处理还是部分处理
         use_all: cython.bint = record_indices is None
         final_count: cython.int
-        if use_all:
+        if use_all:  # noqa: SIM108
             final_count = _mod_buf.shape[0]
         else:
             final_count = record_indices.shape[0]
@@ -999,7 +798,7 @@ class BrushUndoRecorder:
             # 获取顶点索引
             vtx_idx = i if use_all else record_indices[i]
 
-            # 检查是否已记录，避免重复工作
+            # 检查是否已记录 避免重复工作
             if _mask[vtx_idx] == 0:
                 _mask[vtx_idx] = 1  # 标记为已记录
 
@@ -1052,12 +851,10 @@ class BrushUndoRecorder:
         diff: cython.float
 
         # --- 通道压缩 ---
-        # 1. 分配临时内存，标记被修改过的通道
-        channel_is_dirty: cython.p_char = cython.cast(
-            cython.p_char, calloc(_channel_count, cython.sizeof(cython.char))
-        )
+        # 1. 分配临时内存 标记被修改过的通道
+        channel_is_dirty: cython.p_char = cython.cast(cython.p_char, calloc(_channel_count, cython.sizeof(cython.char)))
 
-        # 2. 遍历已记录的顶点，比较新旧数据差异
+        # 2. 遍历已记录的顶点 比较新旧数据差异
         modified_channel_count: cython.int = 0
         for i in range(_modified_vtx_count):
             vtx_idx = _indices[i]
@@ -1068,7 +865,7 @@ class BrushUndoRecorder:
                         channel_is_dirty[j] = 1
                         modified_channel_count += 1
 
-        # 3. 如果没有任何通道被修改，则提前退出
+        # 3. 如果没有任何通道被修改 则提前退出
         if modified_channel_count == 0:
             free(channel_is_dirty)
             return None
@@ -1124,383 +921,321 @@ class BrushUndoRecorder:
     # endregion
 
 
+# fmt:off
+@cython.cclass
+class BrushMathContext:
+    """笔刷数学运算上下文 封装所有计算所需的局部环境变量"""
+
+    # 1. 输入数据
+    values: cython.float[::1]
+    channel_indices: cython.int[::1]
+
+    # 2. 限制条件
+    clamp_min: cython.float
+    clamp_max: cython.float
+
+    # 3. 命中范围数据
+    vertex_count: cython.int
+    vertex_buffer: cython.int[::1]
+    falloff_buffer: cython.float[::1]
+
+    def __init__(
+        self,
+        values: cython.float[::1],           
+        channel_indices: cython.int[::1],    
+        clamp_min: cython.float,             
+        clamp_max: cython.float,             
+        vertex_count: cython.int,            
+        vertex_buffer: cython.int[::1],      
+        falloff_buffer: cython.float[::1]    
+    ):
+        self.values          = values
+        self.channel_indices = channel_indices
+        self.clamp_min       = clamp_min
+        self.clamp_max       = clamp_max
+        self.vertex_count    = vertex_count
+        self.vertex_buffer   = vertex_buffer
+        self.falloff_buffer  = falloff_buffer
+# fmt:on
+
+# 用于自动收集操作映射的装饰器
+_BRUSH_OPS = {}
+
+
+def registry_operation(mode_id):
+    def decorator(func):
+        _BRUSH_OPS[mode_id] = func.__name__
+        return func
+
+    return decorator
+
+
 @cython.cclass
 class BrushMathEngine:
-    """通用笔刷数学运算处理引擎 (纯逻辑层)。
+    """通用笔刷数学运算处理引擎 (纯 Python 模式)。
 
-    作为组合模式的组件之一，它不再包含任何状态记录或撤销逻辑。
-    只负责接收顶点、衰减、目标数组，并执行纯函数式的加减乘除与拓扑平滑等原地内存运算。
+    只负责接收顶点、衰减、目标数组并执行纯逻辑运算。
+    通过 _op_map 字典实现动态函数分发。
     """
 
-    core: CoreBrushEngine
+    # 类成员变量声明 (C 级字段)
+    adj_offsets: cython.int[::1]
+    adj_indices: cython.int[::1]
     modified_buffer: cython.float[:, ::1]
+    _op_map: dict
 
-    def __init__(self, core: CoreBrushEngine, modified_buffer: cython.float[:, ::1]):
-        self.core = core
-        self.modified_buffer = modified_buffer
-
-    # region ---------- Execute Math
-    @cython.boundscheck(False)
-    @cython.wraparound(False)
-    @cython.cfunc
-    def _execute_math_step(
+    def __init__(
         self,
-        brush_mode: cython.int,
-        values: cython.float[::1],
-        channel_indices: cython.int[::1],
-        clamp_min: cython.float,
-        clamp_max: cython.float,
-        vertex_count: cython.int,
-        vertex_buffer: cython.int[::1],
-        falloff_buffer: cython.float[::1],
-    ) -> cython.void:
-        """
-        执行具体的数学步进运算。
-        """
-        if brush_mode == 0:
-            self._math_add(
-                values,
-                channel_indices,
-                clamp_min,
-                clamp_max,
-                vertex_count,
-                vertex_buffer,
-                falloff_buffer,
-            )
-        elif brush_mode == 1:
-            self._math_sub(
-                values,
-                channel_indices,
-                clamp_min,
-                clamp_max,
-                vertex_count,
-                vertex_buffer,
-                falloff_buffer,
-            )
-        elif brush_mode == 2:
-            self._math_replace(
-                values,
-                channel_indices,
-                clamp_min,
-                clamp_max,
-                vertex_count,
-                vertex_buffer,
-                falloff_buffer,
-            )
-        elif brush_mode == 3:
-            self._math_multiply(
-                values,
-                channel_indices,
-                clamp_min,
-                clamp_max,
-                vertex_count,
-                vertex_buffer,
-                falloff_buffer,
-            )
-        elif brush_mode == 4:
-            self._math_smooth(
-                values,
-                channel_indices,
-                clamp_min,
-                clamp_max,
-                vertex_count,
-                vertex_buffer,
-                falloff_buffer,
-            )
-        elif brush_mode == 5:
-            self._math_sharp(
-                values,
-                channel_indices,
-                clamp_min,
-                clamp_max,
-                vertex_count,
-                vertex_buffer,
-                falloff_buffer,
-            )
+        modified_buffer: cython.float[:, ::1],
+        adj_offsets: cython.int[::1] = None,
+        adj_indices: cython.int[::1] = None,
+    ):
+
+        self.modified_buffer = modified_buffer
+        self.adj_offsets = adj_offsets
+        self.adj_indices = adj_indices
+
+        # 显式建立映射表 这些方法在类内部被视为 ccall 在字典中作为 Python 对象存储
+        self._op_map = {k: getattr(self, v) for k, v in _BRUSH_OPS.items()}
+
+    # region ---------- Exec Math
+    @cython.cfunc
+    def _execute_math_step(self, brush_mode: cython.int, ctx: BrushMathContext) -> cython.void:
+        """根据模式从映射表中获取函数并执行"""
+        func = self._op_map.get(brush_mode)
+        if func is not None:
+            func(ctx)
+        else:
+            print(f"Warning: Brush mode {brush_mode} not found in MathEngine.")
 
     # endregion
 
     # region ---------- Add
+    @registry_operation(0)  # Add
     @cython.boundscheck(False)
     @cython.wraparound(False)
     @cython.initializedcheck(False)
-    @cython.cfunc
-    def _math_add(
-        self,
-        values: cython.float[::1],
-        channel_indices: cython.int[::1],
-        clamp_min: cython.float,
-        clamp_max: cython.float,
-        vertex_count: cython.int,
-        vertex_buffer: cython.int[::1],
-        falloff_buffer: cython.float[::1],
-    ) -> cython.void:
-        """多通道加法运算 (二维数组, 纯数学行列数组视角)。"""
-        # fmt:off
-        _array       = self.modified_buffer         # 目标二维数组 shape(N, C)
-        num_cols: cython.int = channel_indices.shape[0]
+    @cython.ccall
+    def _math_add(self, ctx: BrushMathContext) -> cython.void:
+        i: cython.int = 0
+        j: cython.int = 0
+        row: cython.int = 0
+        col: cython.int = 0
+        fal: cython.float = 0.0
 
-        # 3. 纯数学循环变量声明
-        i  : cython.int      # 行迭代器
-        j  : cython.int      # 列迭代器
-        row: cython.int      # 目标数组的真实行号
-        col: cython.int      # 目标数组的真实列号
-        fal: cython.float    # 第 i 行的权重 (Falloff of row i)
-        v_j: cython.float    # 第 j 列的强度 (Strength of col j)
-        val: cython.float   
-        # fmt:on
+        _array = self.modified_buffer
+        _v_buf = ctx.vertex_buffer
+        _f_buf = ctx.falloff_buffer
+        _vals = ctx.values
+        _ch_idx = ctx.channel_indices
 
-        for i in range(vertex_count):
-            fal = falloff_buffer[i]
-            row = vertex_buffer[i]
+        v_count: cython.int = ctx.vertex_count
+        c_count: cython.int = _ch_idx.shape[0]
+        _min: cython.float = ctx.clamp_min
+        _max: cython.float = ctx.clamp_max
 
-            for j in range(num_cols):
-                col = channel_indices[j]
-                v_j = values[j]
-                val = _array[row, col] + (fal * v_j)
-                _array[row, col] = _clamp_float(val, clamp_min, clamp_max)
+        for i in range(v_count):
+            row = _v_buf[i]
+            fal = _f_buf[i]
+            for j in range(c_count):
+                col = _ch_idx[j]
+                _array[row, col] = _clamp_float(_array[row, col] + (fal * _vals[j]), _min, _max)
 
     # endregion
-
-    # region ---------- sub
+    # region ---------- Sub
+    @registry_operation(1)  # Sub
     @cython.boundscheck(False)
     @cython.wraparound(False)
     @cython.initializedcheck(False)
-    @cython.cfunc
-    def _math_sub(
-        self,
-        values: cython.float[::1],
-        channel_indices: cython.int[::1],
-        clamp_min: cython.float,
-        clamp_max: cython.float,
-        vertex_count: cython.int,
-        vertex_buffer: cython.int[::1],
-        falloff_buffer: cython.float[::1],
-    ) -> cython.void:
-        # fmt:off
-        _array       = self.modified_buffer         # 目标二维数组 shape(N, C)
-        num_cols: cython.int = channel_indices.shape[0]
+    @cython.ccall
+    def _math_sub(self, ctx: BrushMathContext) -> cython.void:
+        i: cython.int = 0
+        j: cython.int = 0
+        row: cython.int = 0
+        col: cython.int = 0
+        fal: cython.float = 0.0
 
-        i  : cython.int     
-        j  : cython.int     
-        row: cython.int     
-        col: cython.int     
-        fal: cython.float   
-        v_j: cython.float   
-        val: cython.float    
-        # fmt:on
+        _array = self.modified_buffer
+        _v_buf = ctx.vertex_buffer
+        _f_buf = ctx.falloff_buffer
+        _vals = ctx.values
+        _ch_idx = ctx.channel_indices
 
-        for i in range(vertex_count):
-            fal = falloff_buffer[i]
-            row = vertex_buffer[i]
+        v_count: cython.int = ctx.vertex_count
+        c_count: cython.int = _ch_idx.shape[0]
+        _min: cython.float = ctx.clamp_min
+        _max: cython.float = ctx.clamp_max
 
-            for j in range(num_cols):
-                col = channel_indices[j]
-                v_j = values[j]
-                val = _array[row, col] - (fal * v_j)
-                _array[row, col] = _clamp_float(val, clamp_min, clamp_max)
+        for i in range(v_count):
+            row = _v_buf[i]
+            fal = _f_buf[i]
+            for j in range(c_count):
+                col = _ch_idx[j]
+                _array[row, col] = _clamp_float(_array[row, col] - (fal * _vals[j]), _min, _max)
 
     # endregion
-
-    # region ---------- replace
+    # region ---------- Replace
+    @registry_operation(2)  # replace
     @cython.boundscheck(False)
     @cython.wraparound(False)
     @cython.initializedcheck(False)
-    @cython.cfunc
-    def _math_replace(
-        self,
-        values: cython.float[::1],
-        channel_indices: cython.int[::1],
-        clamp_min: cython.float,
-        clamp_max: cython.float,
-        vertex_count: cython.int,
-        vertex_buffer: cython.int[::1],
-        falloff_buffer: cython.float[::1],
-    ) -> cython.void:
-        """替换运算 (线性逼近插值 Lerp)"""
-        # fmt:off
-        _array       = self.modified_buffer         # 目标二维数组 shape(N, C)
-        num_cols: cython.int = channel_indices.shape[0]
+    @cython.ccall
+    def _math_replace(self, ctx: BrushMathContext) -> cython.void:
+        i: cython.int = 0
+        j: cython.int = 0
+        row: cython.int = 0
+        col: cython.int = 0
+        fal: cython.float = 0.0
+        cur: cython.float = 0.0
 
-        i  : cython.int      
-        j  : cython.int      
-        row: cython.int      
-        col: cython.int      
-        fal: cython.float    
-        v_j: cython.float    
-        val: cython.float
-        # fmt:on
+        _array = self.modified_buffer
+        _v_buf = ctx.vertex_buffer
+        _f_buf = ctx.falloff_buffer
+        _vals = ctx.values
+        _ch_idx = ctx.channel_indices
 
-        for i in range(vertex_count):
-            fal = falloff_buffer[i]
-            row = vertex_buffer[i]
+        v_count: cython.int = ctx.vertex_count
+        c_count: cython.int = _ch_idx.shape[0]
+        _min: cython.float = ctx.clamp_min
+        _max: cython.float = ctx.clamp_max
 
-            for j in range(num_cols):
-                col = channel_indices[j]
-                v_j = values[j]
-                val = _array[row, col] + (
-                    (v_j - _array[row, col]) * fal
-                )  # (目标值 - 当前值) * 行权重
-                _array[row, col] = _clamp_float(val, clamp_min, clamp_max)
+        for i in range(v_count):
+            row = _v_buf[i]
+            fal = _f_buf[i]
+            for j in range(c_count):
+                col = _ch_idx[j]
+                cur = _array[row, col]
+                _array[row, col] = _clamp_float(cur + (_vals[j] - cur) * fal, _min, _max)
 
     # endregion
-
-    # region ---------- Mult
+    # region ---------- Mul
+    @registry_operation(3)  # mul
     @cython.boundscheck(False)
     @cython.wraparound(False)
     @cython.initializedcheck(False)
-    @cython.cfunc
-    def _math_multiply(
-        self,
-        values: cython.float[::1],
-        channel_indices: cython.int[::1],
-        clamp_min: cython.float,
-        clamp_max: cython.float,
-        vertex_count: cython.int,
-        vertex_buffer: cython.int[::1],
-        falloff_buffer: cython.float[::1],
-    ) -> cython.void:
-        """乘法运算"""
-        # fmt:off
-        _array       = self.modified_buffer         # 目标二维数组 shape(N, C)
-        num_cols: cython.int = channel_indices.shape[0]
+    @cython.ccall
+    def _math_multiply(self, ctx: BrushMathContext) -> cython.void:
+        i: cython.int = 0
+        j: cython.int = 0
+        row: cython.int = 0
+        col: cython.int = 0
+        fal: cython.float = 0.0
+        cur: cython.float = 0.0
 
-        i  : cython.int      
-        j  : cython.int      
-        row: cython.int      
-        col: cython.int      
-        fal: cython.float    
-        v_j: cython.float    
-        val: cython.float
-        # fmt:on
+        _array = self.modified_buffer
+        _v_buf = ctx.vertex_buffer
+        _f_buf = ctx.falloff_buffer
+        _vals = ctx.values
+        _ch_idx = ctx.channel_indices
 
-        for i in range(vertex_count):
-            fal = falloff_buffer[i]
-            row = vertex_buffer[i]
+        v_count: cython.int = ctx.vertex_count
+        c_count: cython.int = _ch_idx.shape[0]
+        _min: cython.float = ctx.clamp_min
+        _max: cython.float = ctx.clamp_max
 
-            for j in range(num_cols):
-                col = channel_indices[j]
-                v_j = values[j]
-                val = (
-                    _array[row, col] + (_array[row, col] * v_j - _array[row, col]) * fal
-                )
-                _array[row, col] = _clamp_float(val, clamp_min, clamp_max)
+        for i in range(v_count):
+            row = _v_buf[i]
+            fal = _f_buf[i]
+            for j in range(c_count):
+                col = _ch_idx[j]
+                cur = _array[row, col]
+                _array[row, col] = _clamp_float(cur + (cur * _vals[j] - cur) * fal, _min, _max)
 
     # endregion
-
     # region ---------- Smooth
+    @registry_operation(4)  # smooth
     @cython.boundscheck(False)
     @cython.wraparound(False)
     @cython.cdivision(True)
     @cython.initializedcheck(False)
-    @cython.cfunc
-    def _math_smooth(
-        self,
-        values: cython.float[::1],
-        channel_indices: cython.int[::1],
-        clamp_min: cython.float,
-        clamp_max: cython.float,
-        vertex_count: cython.int,
-        vertex_buffer: cython.int[::1],
-        falloff_buffer: cython.float[::1],
-    ) -> cython.void:
-        """拓扑平滑运算 (Topological Laplacian Smooth)"""
-        # fmt:off
-        _core = self.core
-        _array       = self.modified_buffer         # 目标二维数组 shape(N, C)
+    @cython.ccall
+    def _math_smooth(self, ctx: BrushMathContext) -> cython.void:
+        if self.adj_offsets is None or self.adj_indices is None:
+            raise RuntimeError("Smooth Error: Topology (adj_offsets/indices) is not initialized.")
 
-        # 提取拓扑数据视图 (CSR)
-        _adj_offset  = _core.adj_offsets            # 邻接表偏移
-        _adj_idx     = _core.adj_indices            # 邻接表目标顶点
-        num_cols: cython.int = channel_indices.shape[0]
+        # 拓扑专用变量声明
+        i: cython.int = 0
+        j: cython.int = 0
+        n: cython.int = 0
+        row: cython.int = 0
+        col: cython.int = 0
+        n_idx: cython.int = 0
+        edge_start: cython.int = 0
+        edge_end: cython.int = 0
+        n_count: cython.int = 0
+        fal: cython.float = 0.0
+        n_sum: cython.float = 0.0
+        avg: cython.float = 0.0
 
-        i    : cython.int    
-        j    : cython.int    
-        n    : cython.int    
-        row  : cython.int    
-        col  : cython.int    
-        fal  : cython.float  
-        v_j  : cython.float  
+        _array = self.modified_buffer
+        _v_buf = ctx.vertex_buffer
+        _f_buf = ctx.falloff_buffer
+        _vals = ctx.values
+        _ch_idx = ctx.channel_indices
+        _adj_off = self.adj_offsets
+        _adj_idx = self.adj_indices
 
-        edge_start: cython.int
-        edge_end  : cython.int
-        n_count   : cython.int
-        n_idx     : cython.int
-        n_sum     : cython.float
-        avg       : cython.float
-        val       : cython.float
-        # fmt:on
+        v_count: cython.int = ctx.vertex_count
+        c_count: cython.int = _ch_idx.shape[0]
+        _min: cython.float = ctx.clamp_min
+        _max: cython.float = ctx.clamp_max
 
-        for i in range(vertex_count):
-            fal = falloff_buffer[i]
-            row = vertex_buffer[i]
-
-            # 针对当前行(顶点) 查找它相连的所有邻居边界
-            edge_start = _adj_offset[row]  # fmt:skip
-            edge_end   = _adj_offset[row + 1]  # fmt:skip
-            n_count    = edge_end - edge_start  # fmt:skip
+        for i in range(v_count):
+            row = _v_buf[i]
+            fal = _f_buf[i]
+            edge_start = _adj_off[row]
+            edge_end = _adj_off[row + 1]
+            n_count = edge_end - edge_start
 
             if n_count > 0:
-                for j in range(num_cols):
-                    col = channel_indices[j]
-                    v_j = values[j]
-
-                    # 遍历邻居 计算当前列(通道)的周围总和
+                for j in range(c_count):
+                    col = _ch_idx[j]
                     n_sum = 0.0
                     for n in range(edge_start, edge_end):
                         n_idx = _adj_idx[n]
                         n_sum += _array[n_idx, col]
 
-                    # 朝着周围邻居的平均值进行平滑插值 (Lerp)
                     avg = n_sum / n_count
-                    val = _array[row, col] + (avg - _array[row, col]) * (v_j * fal)
-                    _array[row, col] = _clamp_float(val, clamp_min, clamp_max)
+                    _array[row, col] = _clamp_float(_array[row, col] + (avg - _array[row, col]) * (_vals[j] * fal), _min, _max)
 
     # endregion
-
     # region ---------- Sharp
+    @registry_operation(5)  # sharp
     @cython.boundscheck(False)
     @cython.wraparound(False)
-    @cython.cdivision(True)
     @cython.initializedcheck(False)
-    @cython.cfunc
-    def _math_sharp(
-        self,
-        values: cython.float[::1],
-        channel_indices: cython.int[::1],
-        clamp_min: cython.float,
-        clamp_max: cython.float,
-        vertex_count: cython.int,
-        vertex_buffer: cython.int[::1],
-        falloff_buffer: cython.float[::1],
-    ) -> cython.void:
+    @cython.ccall
+    def _math_sharp(self, ctx: BrushMathContext) -> cython.void:
+        i: cython.int = 0
+        j: cython.int = 0
+        row: cython.int = 0
+        col: cython.int = 0
+        fal: cython.float = 0.0
+        val: cython.float = 0.0
+
         _array = self.modified_buffer
-        num_cols: cython.int = channel_indices.shape[0]
+        _v_buf = ctx.vertex_buffer
+        _f_buf = ctx.falloff_buffer
+        _vals = ctx.values
+        _ch_idx = ctx.channel_indices
 
-        i: cython.int
-        j: cython.int
-        row: cython.int
-        col: cython.int
-        fal: cython.float
-        v_j: cython.float
-        val: cython.float
+        v_count: cython.int = ctx.vertex_count
+        c_count: cython.int = _ch_idx.shape[0]
+        _min: cython.float = ctx.clamp_min
+        _max: cython.float = ctx.clamp_max
 
-        for i in range(vertex_count):
-            fal = falloff_buffer[i]
-            row = vertex_buffer[i]
-
-            for j in range(num_cols):
-                col = channel_indices[j]
-                v_j = values[j]
+        for i in range(v_count):
+            row = _v_buf[i]
+            fal = _f_buf[i]
+            for j in range(c_count):
+                col = _ch_idx[j]
                 val = _array[row, col]
-
-                val += (val - 0.5) * (v_j * fal) * 2.0
-
-                _array[row, col] = _clamp_float(val, clamp_min, clamp_max)
+                val += (val - 0.5) * (_vals[j] * fal) * 2.0
+                _array[row, col] = _clamp_float(val, _min, _max)
 
     # endregion
 
-    # region ---------- Get Custom Array (Copy)
+    # region ---------- Get (Copy)
     @cython.boundscheck(False)
     @cython.wraparound(False)
     @cython.ccall
@@ -1509,7 +1244,21 @@ class BrushMathEngine:
         vertex_indices=None,
         channel_indices=None,
     ) -> array.array:
-        """从内存中提取指定数组副本"""
+        """
+        从原始缓冲区中提取特定行列,并“压扁”为 1D 副本。
+
+        该函数常用于:
+        1. UI 展示:只提取当前选中的顶点数据进行显示。
+        2. 数据导出:将计算结果导出为 Python 标准 array 供外部模块如 JSON 使用。
+        3. 性能优化:通过将非连续的内存块汇聚到连续的 1D 数组中,方便后续的快速处理。
+
+        Args:
+            vertex_indices  : 目标顶点行号序列。None 表示全量。
+            channel_indices : 目标通道列号序列。None 表示全量。
+
+        Returns:
+            array.array: 一个全新的、包含提取数据的 1D 浮点数组 (Copy)
+        """
         _array = self.modified_buffer
 
         use_all_v: cython.bint = True
@@ -1552,7 +1301,7 @@ class BrushMathEngine:
 
     # endregion
 
-    # region ---------- Apply Custom Array (Paste) - Pure Math Only
+    # region ---------- Set(Paste)
     @cython.boundscheck(False)
     @cython.wraparound(False)
     @cython.ccall
@@ -1567,7 +1316,30 @@ class BrushMathEngine:
         clamp_min       : cython.float      = 0.0 ,
         clamp_max       : cython.float      = 1.0 ,
     ) -> tuple:  # fmt: skip
-        """将外部数组数据写入内存 (纯写入，不包含撤销。撤销由调度器调用)"""
+        """
+        将外部传入的 1D 数组数据高效写回(粘贴)到内部 2D 缓冲区中。
+
+        该函数是 get_custom_array 的逆向操作,主要用于 Undo/Redo 数据应用、
+        从外部脚本强制同步权重数据等场景。支持全量写入或基于索引的稀疏写入。
+
+        逻辑链路:
+        1. 自动识别输入模式(全量/稀疏/带权重)。
+        2. 基于指定的混合模式(Blend Mode)将 source_values 与原数据融合。
+        3. 自动执行数值限制(Clamping)。
+
+        Args:
+            source_values   : 待写入的扁平化(1D)浮点数组,长度应为 len(V) * len(C)。
+            alpha           : 全局强度系数,影响最终混合的贡献度。
+            blend_mode      : 混合模式 (0:加法, 1:减法, 2:替换, 3:乘法),默认为2替换模式
+            vertex_indices  : 目标顶点索引序列。若为 None,则视为对所有顶点操作。
+            channel_indices : 目标通道索引序列。若为 None,则视为对所有通道操作。
+            falloff_weights : 顶点级别的权重数组(1D)。若提供,将与 alpha 相乘作为最终权重。
+            clamp_min       : 数值安全边界限制。
+            clamp_max       : 数值安全边界限制。
+
+        Returns:
+            tuple : (处理的顶点数, 传入的索引, 修改后的缓冲区引用)
+        """
         _array = self.modified_buffer
 
         use_all_v: cython.bint = True
@@ -1624,8 +1396,7 @@ class BrushMathEngine:
 class UtilBrushProcessor:
     """通用笔刷调度中心 (基类)。
 
-    采用混合架构：它本身组合了 Core, Recorder, MathEngine 三大独立引擎。
-    同时作为基类，供更复杂的业务笔刷 (如蒙皮笔刷) 继承。
+    协调 Core (物理查询)、Recorder (历史快照) 与 MathEngine (核心算法)。
     """
 
     core: CoreBrushEngine
@@ -1637,37 +1408,43 @@ class UtilBrushProcessor:
         self,
         core: CoreBrushEngine,
         modified_buffer: cython.float[:, ::1],
-        modified_vtx_indices_buffer: cython.int[::1] = None,
-        modified_vtx_bool_buffer: cython.uchar[::1] = None,
+        modified_indices_buffer: cython.int[::1] = None,
+        modified_bool_buffer: cython.uchar[::1] = None,
         undo_buffer: cython.float[:, ::1] = None,
     ):
         self.core = core
         self.modified_buffer = modified_buffer
+
+        # 1. 初始化 Recorder (撤销重做管理器)
         self.recorder = BrushUndoRecorder(
             modified_buffer,
-            modified_vtx_indices_buffer,
-            modified_vtx_bool_buffer,
+            modified_indices_buffer,
+            modified_bool_buffer,
             undo_buffer,
         )
-        self.math_engine = BrushMathEngine(core, modified_buffer)
 
-    @cython.boundscheck(False)
-    @cython.wraparound(False)
+        # 2. 初始化 MathEngine (将 Core 的拓扑数据直接桥接给数学引擎)
+        self.math_engine = BrushMathEngine(
+            modified_buffer,
+            adj_offsets=core.adj_offsets,
+            adj_indices=core.adj_indices,
+        )
+
     @cython.ccall
     def begin_stroke(self) -> tuple:
+        """重置记录器掩码,准备新一轮绘画"""
         return self.recorder.begin_stroke()
 
-    @cython.boundscheck(False)
-    @cython.wraparound(False)
     @cython.ccall
     def end_stroke(self) -> tuple:
+        """完成绘画,返回所有增量修改数据(用于 Undo 系统)"""
         return self.recorder.end_stroke()
 
-    # region ---------- Apply Brush Operation
+    # region ---------- Apply Brush
     @cython.boundscheck(False)
     @cython.wraparound(False)
     @cython.ccall
-    def apply_brush_operation(
+    def process_stroke(
         self,
         brush_mode: cython.int,
         values: cython.float[::1],
@@ -1677,48 +1454,49 @@ class UtilBrushProcessor:
         iterations: cython.int = 1,
     ) -> tuple:
         """
-        为外部普通调用。
-        命中检测 -> Undo快照调度 -> 多循环迭代调度 -> 写回内存缓冲区。
+        统一笔刷计算入口。
+        命中检测 -> 构造上下文 -> 记录快照 -> 数学迭代。
         """
         _core = self.core
+
+        # 1. 命中检测拦截
         if _core.active_hit_count == 0:
             return (0, _core.active_hit_indices, self.modified_buffer)
 
-        _vertex_count = _core.active_hit_count
-        _vertex_buffer = _core.active_hit_indices
-        _falloff_buffer = _core.active_hit_falloff
+        # 2. 调度快照引擎:在修改前备份受影响顶点的原始数据
+        self.recorder.record_snapshot(_core.active_hit_indices)
 
-        # 1. 调度快照引擎记录历史
-        self.recorder.record_snapshot(_vertex_buffer)
+        # 3. 构造算上下文 (Context)
+        ctx = BrushMathContext(
+            values=values,
+            channel_indices=channel_indices,
+            clamp_min=clamp_min,
+            clamp_max=clamp_max,
+            vertex_count=_core.active_hit_count,
+            vertex_buffer=_core.active_hit_indices,
+            falloff_buffer=_core.active_hit_falloff,
+        )
 
-        # 2. 调度数学引擎执行运算
-        _iter: cython.int
+        # 4. 执行数学运算迭代
+        _iter: cython.int = 0
         for _iter in range(iterations):
-            self.math_engine._execute_math_step(
-                brush_mode,
-                values,
-                channel_indices,
-                clamp_min,
-                clamp_max,
-                _vertex_count,
-                _vertex_buffer,
-                _falloff_buffer,
-            )
+            # 衔接新的 MathEngine 分发接口
+            self.math_engine._execute_math_step(brush_mode, ctx)
 
-        return (_core.active_hit_count, _core.active_hit_indices, self.modified_buffer)
+        return (
+            _core.active_hit_count,
+            _core.active_hit_indices,
+            self.modified_buffer,
+        )
 
     # endregion
 
-    @cython.boundscheck(False)
-    @cython.wraparound(False)
+    # region ---------- Brush Get/Set
     @cython.ccall
-    def get_custom_array(
-        self, vertex_indices=None, channel_indices=None
-    ) -> array.array:
+    def get_custom_array(self, vertex_indices=None, channel_indices=None) -> array.array:
+        """提取指定范围的数据副本。"""
         return self.math_engine.get_custom_array(vertex_indices, channel_indices)
 
-    @cython.boundscheck(False)
-    @cython.wraparound(False)
     @cython.ccall
     def set_custom_array(
         self,
@@ -1731,17 +1509,9 @@ class UtilBrushProcessor:
         clamp_min=0.0,
         clamp_max=1.0,
     ) -> tuple:
-        use_all_v: cython.bint = True
-        if (vertex_indices is not None) and (len(vertex_indices) > 0):
-            use_all_v = False
-
-        _vtx_view: cython.int[::1] = None if use_all_v else vertex_indices
-        _v_count: cython.int = (
-            self.modified_buffer.shape[0] if use_all_v else _vtx_view.shape[0]
-        )
-
-        if _v_count > 0:
-            self.recorder.record_snapshot(vertex_indices)
+        """执行稀疏或全量数据的直接写回。"""
+        # 记录快照逻辑保持在调度层,确保 set 操作也能被撤销
+        self.recorder.record_snapshot(vertex_indices)
 
         return self.math_engine.set_custom_array(
             source_values,
@@ -1754,13 +1524,14 @@ class UtilBrushProcessor:
             clamp_max,
         )
 
+    # endregion
 
 
 @cython.cclass
 class SkinWeightProcessor(UtilBrushProcessor):
     """蒙皮权重专属笔刷处理器。
 
-    继承自 `UtilBrushProcessor`，直接复用其底层引用的 Core, Recorder 和 MathEngine。
+    继承自 `UtilBrushProcessor` 直接复用其底层引用的 Core, Recorder 和 MathEngine。
     以及免费继承了 begin_stroke, end_stroke 等基础方法。
     只专注于添加骨骼锁定和归一化的特有逻辑。
     """
@@ -1778,7 +1549,7 @@ class SkinWeightProcessor(UtilBrushProcessor):
         influences_locks_buffer: cython.uchar[::1],
         undo_buffer: cython.float[:, ::1],
     ):
-        """初始化权重笔刷，通过 super() 调用父类完成底层引擎的组装。"""
+        """初始化权重笔刷 通过 super() 调用父类完成底层引擎的组装。"""
         super().__init__(
             core,
             modified_buffer,
@@ -1791,100 +1562,42 @@ class SkinWeightProcessor(UtilBrushProcessor):
 
     # endregion
 
-    # region ---------------------- Apply Weights Single
-    @cython.boundscheck(False)
-    @cython.wraparound(False)
-    @cython.ccall
-    def apply_weight_single(
-        self,
-        brush_mode     : cython.int,
-        value          : cython.float,
-        channel_index  : cython.int,
-        vertex_count   : cython.int      = -1,
-        vertex_indices                   = None,
-        falloff_weights                  = None,
-        iterations     : cython.int      = 1,
-    ) -> tuple:  # fmt:skip
-        """单骨骼绘制的极速包装器"""
-        _value_ary = array.array("f", [value])
-        _channel_ary = array.array("i", [channel_index])
-        return self.apply_weight(
-            brush_mode      = brush_mode,
-            values          = _value_ary,   
-            channel_indices = _channel_ary,  
-            vertex_count    = vertex_count,
-            vertex_indices  = vertex_indices,
-            iterations      = iterations,
-            falloff_weights = falloff_weights,
-        )  # fmt:skip
-
-    # endregion
-
     # region ---------------------- Apply Weight
-    @cython.boundscheck(False)
-    @cython.wraparound(False)
     @cython.ccall
-    def apply_weight(
+    def process_stroke(
         self,
         brush_mode: cython.int,
-        values: cython.float[::1],
-        channel_indices: cython.int[::1],
-        vertex_count: cython.int = -1,
-        vertex_indices=None,
-        falloff_weights=None,
+        weights_value: cython.float[::1],  # 保持为 view外部传入时包装
+        influences_indices: cython.int[::1],
+        clamp_min: cython.float = 0.0,
+        clamp_max: cython.float = 1.0,
         iterations: cython.int = 1,
     ) -> tuple:
-        """执行蒙皮权重专属运算"""
-        _v_count: cython.int = vertex_count
+        """执行蒙皮权重运算 支持单骨骼或多骨骼统一调度。"""
 
-        is_all_v: cython.bint = False
-        if (vertex_indices is None) or (len(vertex_indices) == 0):
-            is_all_v = True
+        # 1. 调用父类核心逻辑
+        # 无论是一根骨骼还是多根骨骼 MathEngine 都能通过 channel_indices 处理
+        res = super().process_stroke(
+            brush_mode,
+            weights_value,
+            influences_indices,
+            clamp_min,
+            clamp_max,
+            iterations,
+        )
 
-        if _v_count < 0:
-            if is_all_v:  # noqa: SIM108
-                _v_count = self.modified_buffer.shape[0]
-            else:
-                _v_count = len(vertex_indices)
+        # 2. 判定有效修改并执行归一化
+        if res[0] > 0:
+            # 以 influences_indices 的第一个元素作为“抢占优先级”骨骼
+            priority_idx: cython.int = influences_indices[0]
 
-        if _v_count == 0:
-            return (0, vertex_indices, self.modified_buffer)
+            # 只对命中的顶点切片进行归一化
+            hit_indices_view = res[1][: res[0]]
 
-        _vertex_buffer: cython.int[::1]
-        if is_all_v:  # noqa: SIM108
-            _vertex_buffer = array.array("i", range(_v_count))
-        else:
-            _vertex_buffer = vertex_indices
+            # 执行归一化
+            self.normalize_weights(hit_indices_view, priority_idx)
 
-        _fal_array: cython.float[::1]
-        if (falloff_weights is not None) and (len(falloff_weights) > 0):  # noqa: SIM108
-            _fal_array = falloff_weights
-        else:
-            _fal_array = array.array("f", [1.0]) * _v_count
-
-        # 1. 调度继承来的快照引擎记录缓存
-        self.recorder.record_snapshot(_vertex_buffer)
-
-        _iter: cython.int
-        priority_influence_idx: cython.int = channel_indices[0]
-        hit_slice = _vertex_buffer[:_v_count]
-
-        # 2. 调度继承来的数学引擎执行运算
-        for _iter in range(iterations):
-            self.math_engine._execute_math_step(
-                brush_mode=brush_mode,
-                values=values,
-                channel_indices=channel_indices,
-                clamp_min=0.0,
-                clamp_max=1.0,
-                vertex_count=_v_count,
-                vertex_buffer=_vertex_buffer,
-                falloff_buffer=_fal_array,
-            )
-            # 执行自身特有的归一化
-            self.normalize_weights(hit_slice, priority_influence_idx)
-
-        return (_v_count, vertex_indices, self.modified_buffer)
+        return res
 
     # endregion
 

@@ -1,17 +1,18 @@
 from __future__ import annotations
 
-import typing
+import array
+
 from dataclasses import dataclass
 
 # 统一使用相对路径和模块导入
 from . import cBufferManager
-from . import cBrushCoreCython as cBrushCoreCython
+from . import cBrushCoreCython2 as cBrushCoreCython
 from . import apiundo
 
-from ._cProfilerCython import MayaNativeProfiler, maya_profile
+import typing
 
 if typing.TYPE_CHECKING:
-    from . import cDisplayNode
+    from .cSkinDeform import CythonSkinDeformer
 
 
 # ==============================================================================
@@ -40,38 +41,32 @@ class WeightBrushManager:
     管理完整的 Stroke (绘制行程) 生命周期 并接管 Undo/Redo 内存池。
     """
 
-    @maya_profile(7, "init")
-    def __init__(self, preview_shape: cDisplayNode.WeightPreviewShape):
-        self.shape = preview_shape
-        self.cSkin = preview_shape.cSkin
+    def __init__(self, cSkin: CythonSkinDeformer):
+        self.cSkin = cSkin
         self.settings = BrushSettings
 
-        # 提取基础上下文
-        self.mesh_ctx = preview_shape.mesh_context
-        self.brush_ctx = preview_shape.brush_context
-        vtx_count = self.mesh_ctx.vertex_count
-        tri_count = len(self.mesh_ctx.triangle_indices.view) // 3
+        # sync context
+        self.mesh_ctx = cSkin.mesh_context
+        self.brush_ctx = cSkin.brush_context
 
-        # =================================================================
-        # 🚀 1. 极简实例化 只喂给引擎最基础的物理数据 剩下的全交到底层黑盒 
-        # =================================================================
+        # instance core brush engine
         self.engine = cBrushCoreCython.CoreBrushEngine(
-            self.mesh_ctx.vertex_positions.reshape((vtx_count, 3)).view,
-            self.mesh_ctx.triangle_indices.reshape((tri_count, 3)).view,
-            self.mesh_ctx.edge_indices.view,  # 传入 1D 的边缘数组
+            self.mesh_ctx.vertex_positions,
+            self.mesh_ctx.triangle_indices,
+            self.mesh_ctx.v2v_offsets,
+            self.mesh_ctx.v2v_indices,
+            self.mesh_ctx.v2f_offsets,
+            self.mesh_ctx.v2f_indices,
         )
 
-        # =================================================================
-        # 🚀 2. 反向提取 引擎在底层造好了内存 我们把它“挂”到上下文里供全局使用
-        # 这样就能保证 Python 层和 C 层读写的绝对是同一块物理内存 
-        # =================================================================
-        self.brush_ctx.hit_indices = self.engine.out_hit_indices
-        self.brush_ctx.hit_weights = self.engine.out_hit_falloff
+        # 引擎在底层造好了内存 我们把它“挂”到上下文里供全局使用
+        # 这样就能保证 Python 层和 C 层读写的绝对是同一块物理内存
+        self.brush_ctx.hit_indices = self.engine.get_hit_indices()
+        self.brush_ctx.hit_weights = self.engine.get_hit_falloff()
         self.brush_ctx.hit_count = 0  # 初始命中数为 0
 
-        # =================================================================
-        # 🛡️ 3. 预分配 Undo/Redo 撤销系统内存池
-        # =================================================================
+        # 预分配 Undo/Redo 撤销系统内存池
+        vtx_count = self.mesh_ctx.vertex_count
         inf_count = self.cSkin.influences_count if self.cSkin else 1
         self.modified_vtx_bool_mgr = cBufferManager.BufferManager.allocate("B", (vtx_count,))
         self.modified_vtx_indices_mgr = cBufferManager.BufferManager.allocate("i", (vtx_count,))
@@ -94,7 +89,6 @@ class WeightBrushManager:
         self.active_processor = None
         self.active_handle = None
 
-    @maya_profile(0, "raycast")
     def process_stroke(self, ray_source: tuple, ray_dir: tuple, action: str) -> tuple:
         """
         封装射线投射、范围检测和笔刷涂抹的完整过程。
@@ -116,9 +110,8 @@ class WeightBrushManager:
         new_view = self.mesh_ctx.vertex_positions.reshape((vtx_count, 3)).view
         self.engine.update_vertex_positions(new_view)
         # ----------------------------------------------------------------------------------
-        with MayaNativeProfiler("Raycast", 6):
-            # ray cast
-            hit_success, hit_pos, hit_normal, hit_tri, _, _, _ = self.engine.raycast(ray_source, ray_dir)
+        # ray cast
+        hit_success, hit_pos, hit_normal, hit_tri, _, _, _ = self.engine.raycast(ray_source, ray_dir)
 
         # 未命中处理
         if not hit_success:
@@ -126,46 +119,39 @@ class WeightBrushManager:
             self.clear_hit_state()
             return None
 
-        with MayaNativeProfiler("Falloff", 5):
-            # 命中处理
-            if self.mesh_ctx and self.mesh_ctx.vertex_positions:
-                hit_count, _, _ = self.engine.calc_brush_falloff(
-                    hit_pos,
-                    hit_tri,
-                    self.settings.radius,
-                    self.settings.falloff_type,
-                    self.settings.use_surface,
-                )
-                self.brush_ctx.hit_count = hit_count
-                self.brush_ctx.hit_center_position = hit_pos
+        # 命中处理
+        if self.mesh_ctx and self.mesh_ctx.vertex_positions:
+            hit_count, _, _ = self.engine.calc_brush_falloff(
+                hit_pos,
+                hit_tri,
+                self.settings.radius,
+                self.settings.falloff_type,
+                self.settings.use_surface,
+            )
+            self.brush_ctx.hit_count = hit_count
+            self.brush_ctx.hit_center_position = hit_pos
 
-        # 4. 动作分发 如果是按下或拖拽 执行核心涂抹运算
+        # 如果是按下或拖拽 执行核心涂抹运算
         if action in ("press", "drag"):
             self.update_stroke()
             self.cSkin.setDirty()
 
-        # 5. 返回局部坐标和法线 供 UI 层转换世界坐标画圈
-
+        # 返回局部坐标和法线 供 UI 层转换世界坐标画圈
         return (hit_pos, hit_normal)
 
-    # ==============================================================================
-    # 🖌️ Stroke 生命周期管理 (按下 -> 拖拽 -> 松开)
-    # ==============================================================================
-    @maya_profile(2, "begin_stroke")
+    # Stroke (按下 -> 拖拽 -> 松开)
     def begin_stroke(self):
         """
         鼠标按下
         解析 UI 目标 (Layer/Mask/Influence) 提取对应内存并装配 Processor。
         """
         weights_manager = self.cSkin.weights_manager
-        render_ctx = self.shape.render_context
 
-        layer_idx = render_ctx.paintLayerIndex  # layer
-        is_mask = render_ctx.paintMask  # mask
+        layer_idx, is_mask, active_influence_idx, _ = self.cSkin.get_active_paint_weights()
 
         self.layer_idx = layer_idx  # layer
         self.is_mask = is_mask  # layer
-        self.active_influence_idx = render_ctx.paintInfluenceIndex  # influence index
+        self.active_influence_idx = active_influence_idx  # influence index
 
         handle = weights_manager.get_handle(layer_idx, is_mask)
         if not handle.is_valid:
@@ -180,6 +166,7 @@ class WeightBrushManager:
         self._temp_locks_mgr = cBufferManager.BufferManager.allocate("B", (influences_count,))
 
         self.active_processor = cBrushCoreCython.SkinWeightProcessor(
+            self.engine,
             weights_2d,
             self.modified_vtx_indices_mgr.view,
             self.modified_vtx_bool_mgr.view,
@@ -190,26 +177,23 @@ class WeightBrushManager:
         # 通知 Processor 清空掩码 开始记录历史
         self.active_processor.begin_stroke()
 
-    @maya_profile(3, "update_stroke")
     def update_stroke(self) -> bool:
-        """
-        按下鼠标持续拖拽Tick 计算内存权重
-        """
         if not self.active_processor or self.brush_ctx.hit_count == 0:
             return False
 
-        self.active_processor.apply_weight_single(
-            brush_mode      = self.settings.mode,
-            value           = self.settings.strength,
-            channel_index   = self.active_influence_idx,
-            vertex_count    = self.brush_ctx.hit_count,          # 传入点数
-            vertex_indices  = self.brush_ctx.hit_indices,   # 传入顶点数组
-            falloff_weights = self.brush_ctx.hit_weights,    # 入衰减权重数组
-            iterations      = self.settings.iter,
-        )  # fmt:skip
+        val_ary = array.array("f", [self.settings.strength])
+        idx_ary = array.array("i", [self.active_influence_idx])
+
+        self.active_processor.process_stroke(
+            brush_mode=self.settings.mode,
+            weights_value=val_ary,
+            influences_indices=idx_ary,
+            clamp_min=0.0,
+            clamp_max=1.0,
+            iterations=self.settings.iter,
+        )
         return True
 
-    @maya_profile(5, "end_stroke")
     def end_stroke(self):
         """
         鼠标松开
@@ -229,7 +213,7 @@ class WeightBrushManager:
             layer = self.layer_idx
             mask = self.is_mask
 
-            # ✨ 核心改变 使用专用的稀疏状态还原器 强行覆盖 绝对精准 
+            # ✨ 核心改变 使用专用的稀疏状态还原器 强行覆盖 绝对精准
             def undo():
                 wm.set_sparse_weights(layer, mask, mod_vtx_idx, mod_ch_idx, old_sparse)
 

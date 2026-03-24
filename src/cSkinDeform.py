@@ -9,13 +9,14 @@ from . import cSkinDeformCython
 from . import cTopologyCython as cTopology
 from .cBufferManager import BufferManager
 from .cWeightsManager import WeightsManager
+from .cBrushCore2Cython import CoreBrushEngine
 
 from ._cProfilerCython import MayaNativeProfiler, maya_profile
 
 from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from .cSkinContext import BrushHitContext
+# if TYPE_CHECKING:
+from .cSkinContext import BrushHitContext
 
 
 class MeshTopologyContext:
@@ -128,6 +129,7 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         self.weights_manager : WeightsManager      = None
         self.mesh_context    : MeshTopologyContext = None
         self.brush_context   : BrushHitContext     = None
+        self.brush_engine    : CoreBrushEngine     = None
 
         # --- influences
         self.influences_count        : int           = 0
@@ -268,11 +270,15 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         current_edge_count = mFnMesh.numEdges()
         current_polygon_count = mFnMesh.numPolygons()
 
+        if self.brush_engine is not None and self.mesh_context.vertex_positions is not None:
+            _buffer = self.mesh_context.vertex_positions.reshape((current_vertex_count, 3))
+            self.brush_engine.update_vertex_positions(_buffer.view)
+
         # CHECK
-        if (self.mesh_context.vertex_count  == current_vertex_count and
-            self.mesh_context.edge_count    == current_edge_count   and
-            self.mesh_context.polygon_count == current_polygon_count and
-            self.mesh_context.v2v_offsets is not None):  # fmt:skip
+        if (self.mesh_context.vertex_count == current_vertex_count 
+            and self.mesh_context.edge_count == current_edge_count
+            and self.mesh_context.polygon_count == current_polygon_count 
+            and self.mesh_context.v2v_offsets is not None):  # fmt:skip
             # 通过检查 证明topology没有变化 直接跳过
             return
 
@@ -312,13 +318,28 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         v2f_offsets_ctypes, v2f_indices_ctypes = cTopology.build_v2f_adjacency(self.mesh_context.vertex_count, self.mesh_context.triangle_indices.view)
         self.mesh_context.v2f_offsets = BufferManager.from_ctypes(v2f_offsets_ctypes)
         self.mesh_context.v2f_indices = BufferManager.from_ctypes(v2f_indices_ctypes)
+        # ====== Brush Core Engine
+        # 临时申请一个 buffer, 方便我们创建coreBrushEngine
+        self.mesh_context.vertex_positions = BufferManager.allocate("f", (self.mesh_context.vertex_count, 3))
+        self.brush_engine = CoreBrushEngine(
+            self.mesh_context.vertex_positions.view,
+            self.mesh_context.triangle_indices.reshape((self.mesh_context.triangle_count, 3)).view,
+            self.mesh_context.v2v_offsets.view,
+            self.mesh_context.v2v_indices.view,
+            self.mesh_context.v2f_offsets.view,
+            self.mesh_context.v2f_indices.view,
+        )
 
     def get_active_paint_weights(self) -> memoryview | None:
         """
         直接从 manager 提取当前需要绘制的的权重视图。
 
         Returns:
-            weightsView (memoryview | None): 返回针对特定骨骼切片后的视图。
+            tuple: (layer_index, is_mask, influences_index, weights_view)
+                - layer_index (int): layer index
+                - is_mask (bool): is mask
+                - influences_index (int): influences index
+                - weights_view (memoryview): weights view
         """
 
         if self.weights_manager is None:
@@ -384,15 +405,13 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         with MayaNativeProfiler("fnMesh-in", 3):
             mFnMesh_in = om1.MFnMesh(input_geom_obj)
             vertex_count = mFnMesh_in.numVertices()
-            rawPoints_original_mgr = BufferManager.from_ptr(int(mFnMesh_in.getRawPoints()), "f", (vertex_count * 3,))
+            rawPoints_original = BufferManager.from_ptr(int(mFnMesh_in.getRawPoints()), "f", (vertex_count * 3,))
         with MayaNativeProfiler("update-topology", 3):
             self.update_topology(mFnMesh_in)
 
         with MayaNativeProfiler("out-fnMesh", 6):
             mFnMesh_out = om1.MFnMesh(output_geom_obj)
-            self.rawPoints_output = BufferManager.from_ptr(int(mFnMesh_out.getRawPoints()), "f", (vertex_count * 3,))
-            # --- mesh_context.vertex_positions
-            self.mesh_context.vertex_positions = self.rawPoints_output
+            self.mesh_context.vertex_positions = BufferManager.from_ptr(int(mFnMesh_out.getRawPoints()), "f", (vertex_count * 3,))
 
         with MayaNativeProfiler("influences allocate", 4):
             influences_handle = dataBlock.inputArrayValue(self.aInfluenceMatrix)
@@ -460,8 +479,8 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
 
         with MayaNativeProfiler("Cython Cal skin", 3):
             cSkinDeformCython.run_skinning_core(
-                rawPoints_original_mgr.view,
-                self.rawPoints_output.view,
+                rawPoints_original.view,
+                self.mesh_context.vertex_positions.view,
                 self._skinWeights,
                 self._rotateMatrix_buffer.view,
                 self._translateVector_buffer.view,

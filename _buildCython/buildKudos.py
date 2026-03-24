@@ -75,11 +75,12 @@ else:
 shared_config = {
     "extra_compile_args": compile_args,
     "extra_link_args": link_args,
-    "include_dirs": [r"C:\Users\ext.dxu\Downloads\Autodesk_Maya_2024_2_Update_DEVKIT_Windows\devkitBase\include\Python310\Python"],
+    "include_dirs": [
+        r"C:\Users\ext.dxu\Downloads\Autodesk_Maya_2024_2_Update_DEVKIT_Windows\devkitBase\include\Python310\Python",
+        r"C:\Users\ext.dxu\Downloads\Autodesk_Maya_2024_2_Update_DEVKIT_Windows\devkitBase\include",
+    ],
     "library_dirs": [r"C:\Program Files\Autodesk\Maya2024\lib"],
-    # ==========================================
-    # 👇 【关键修改】：强制 Cython 使用 C++ 编译器
-    # ==========================================
+    "libraries": ["OpenMaya"],
     "language": "c++",
 }
 

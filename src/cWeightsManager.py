@@ -12,7 +12,7 @@ from collections import deque
 import maya.OpenMaya as om1  # type:ignore
 
 from . import apiundo
-from . import cBrushCoreCython
+from . import cBrushCore2Cython as cBrushCoreCython
 from ._cRegistry import SkinRegistry
 from .cBufferManager import BufferManager
 
@@ -737,6 +737,7 @@ class WeightsManager(_DeferredTaskMixin):
         _undo_buffer = BufferManager.allocate("f", (vtx_count, inf_count))
 
         return cBrushCoreCython.SkinWeightProcessor(
+            self.cSkin.brush_engine,
             weights_2d,
             tmp_idx.view,  # 直接传入 view
             tmp_bool.view,  # 直接传入 view
