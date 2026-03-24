@@ -414,8 +414,8 @@ class TriangleShape(om.MPxSurfaceShape):
         # 获取笔刷上下文
         brush_ctx = getattr(cSkin, "brush_context", None)
         if brush_ctx and brush_ctx.is_valid:
-            render_data.brush_hit_indices = brush_ctx.hit_indices.view
-            render_data.brush_hit_weights = brush_ctx.hit_weights.view
+            render_data.brush_hit_indices = brush_ctx.hit_indices
+            render_data.brush_hit_weights = brush_ctx.hit_weights
             render_data.brush_hit_count = brush_ctx.hit_count
         else:
             render_data.brush_hit_count = 0

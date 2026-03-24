@@ -1,12 +1,19 @@
-import typing
+from __future__ import annotations
+
 import maya.cmds as cmds
 import maya.api.OpenMaya as om
 import maya.api.OpenMayaUI as omui
 import maya.api.OpenMayaRender as omr
 
-# 统一使用相对路径和模块导入
-from . import cDisplayNode
-from . import cBrushManager
+
+
+from .cBrushManager import WeightBrushManager
+from ._cRegistry import SkinRegistry
+
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from .cSkinDeform import CythonSkinDeformer
+
 
 
 def maya_useNewAPI():
@@ -28,8 +35,7 @@ class WeightBrushContext(omui.MPxContext):
         super(WeightBrushContext, self).__init__()
 
         # 核心管理器 (Controller)
-        self.manager: "cBrushManager.WeightBrushManager" = None
-        self.preview_shape: "cDisplayNode.WeightPreviewShape" = None
+        self.brush_manager: WeightBrushManager = None
 
         # 视口与网格上下文
         self.fn_mesh: om.MFnMesh = None
@@ -48,17 +54,17 @@ class WeightBrushContext(omui.MPxContext):
         # 笔刷连续性插值状态
         self._last_mouse_x = None
         self._last_mouse_y = None
-        self.brush_spacing_pixels = 1.0  # 插值阈值(像素)：越小越连贯，建议 3~5
+        self.brush_spacing_pixels = 5  # 插值阈值(像素)：越小越连贯，建议 3~5
 
     def toolOnSetup(self, event):
         """工具启动：硬编码测试版，直接抓取 WeightPreview1"""
         try:
-            mSel = om.MGlobal.getActiveSelectionList()
+            mSel:om.MSelectionList = om.MGlobal.getActiveSelectionList()
             if mSel.isEmpty():
                 raise RuntimeError("请先选择一个模型。")
 
             # 1. 🛡️ 安全获取 Shape 的 MDagPath (用于计算世界/局部矩阵)
-            dag_path = mSel.getDagPath(0)
+            dag_path:om.MDagPath = mSel.getDagPath(0)
             if dag_path.hasFn(om.MFn.kTransform):
                 try:
                     dag_path.extendToShape()
@@ -74,30 +80,19 @@ class WeightBrushContext(omui.MPxContext):
             # =======================================================
             # 💥 2. 暴力硬编码：直接通过名字获取渲染节点 (用于测试)
             # =======================================================
-            target_node_name = "WeightPreviewShape1"
-            try:
-                mSel_preview = om.MGlobal.getSelectionListByName(target_node_name)
-                mObj_preview = mSel_preview.getDependNode(0)
-            except RuntimeError:
-                raise RuntimeError(f"场景中根本找不到名叫 '{target_node_name}' 的节点！请确认大纲视图。")
+            cSkin_node_name = "cSkinDeformer1"
+            self.cSkin:CythonSkinDeformer = SkinRegistry.from_instance_by_string(cSkin_node_name)
 
-            fn_node = om.MFnDependencyNode(mObj_preview)
-
-            if fn_node.typeName == cDisplayNode.NODE_NAME:
-                self.preview_shape = fn_node.userNode()
-            else:
-                raise RuntimeError(f"虽然找到了 {target_node_name}，但它的类型不是 {cDisplayNode.NODE_NAME}。")
-
-            if not self.preview_shape:
+            if not self.cSkin:
                 raise RuntimeError("未提取到 WeightPreviewShape 的 Python 实例。")
 
             # 3. 🚀 装配无状态笔刷系统
             self._view = omui.M3dView.active3dView()
-            self.manager = cBrushManager.WeightBrushManager(self.preview_shape)
+            self.brush_manager = WeightBrushManager(self.cSkin)
 
-            print(f"[Brush] 引擎测试版启动成功！已暴力连接至 -> {target_node_name}")
+            print(f"[Brush] 引擎测试版启动成功！已暴力连接至 -> {cSkin_node_name}")
 
-        except Exception as e:
+        except Exception:
             import traceback
 
             err_msg = traceback.format_exc()
@@ -107,8 +102,8 @@ class WeightBrushContext(omui.MPxContext):
     def toolOffCleanup(self):
         """工具退出：通知管理器清理内存"""
         print("off")
-        if self.manager:
-            self.manager.teardown()
+        if self.brush_manager:
+            self.brush_manager.teardown()
         self.__init__()
 
     def _update_ui_cursor_and_refresh(self, result, drawMgr):
@@ -141,8 +136,8 @@ class WeightBrushContext(omui.MPxContext):
         self._last_mouse_x = x
         self._last_mouse_y = y
 
-        if self.manager:
-            self.manager.begin_stroke()
+        if self.brush_manager:
+            self.brush_manager.begin_stroke()
             
         result = self._fire_ray_and_process(x, y, "press")
         self._update_ui_cursor_and_refresh(result, drawMgr)
@@ -191,9 +186,9 @@ class WeightBrushContext(omui.MPxContext):
         self._last_mouse_x = None
         self._last_mouse_y = None
         
-        if self.manager:
-            self.manager.end_stroke()
-            self.manager.clear_hit_state()
+        if self.brush_manager:
+            self.brush_manager.end_stroke()
+            self.brush_manager.clear_hit_state()
 
         self._cursor_pos = None
         self._refresh_viewport() # 离开时最后刷新一次
@@ -203,7 +198,7 @@ class WeightBrushContext(omui.MPxContext):
     # ==============================================================================
     def _fire_ray_and_process(self, screen_x: float, screen_y: float, stroke_action: str):
         """只负责发射射线和运算底层权重，返回击中结果，绝对不触发视口重绘"""
-        if not self.manager:
+        if not self.brush_manager:
             return None
 
         # viewToWorld 严格要求 int 类型的像素坐标
@@ -215,13 +210,12 @@ class WeightBrushContext(omui.MPxContext):
         ray_dir_obj = self._ray_direction * inv_matrix
 
         # 直接呼叫 Manager 的一站式流水线！
-        return self.manager.process_stroke(tuple(ray_source_obj)[0:3], tuple(ray_dir_obj), stroke_action)
+        return self.brush_manager.process_stroke(tuple(ray_source_obj)[0:3], tuple(ray_dir_obj), stroke_action)
     
 
     def _refresh_viewport(self):
         """触发 Shape 和 3D 视口刷新"""
-        if self.preview_shape and not self.preview_shape._mObj.isNull():
-            omr.MRenderer.setGeometryDrawDirty(self.preview_shape._mObj, True)
+        if self.cSkin and not self.cSkin.mObject.isNull():
             pass
         if self._view:
             self._view.refresh(False, False)
@@ -230,10 +224,10 @@ class WeightBrushContext(omui.MPxContext):
     # 🎨 VP2 光标绘制 (画出跟随模型的笔刷圆圈)
     # ==============================================================================
     def _draw_brush_cursor(self, drawMgr):
-        if not self.manager or not self._cursor_pos or not self._cursor_normal:
+        if not self.brush_manager or not self._cursor_pos or not self._cursor_normal:
             return
 
-        radius = self.manager.settings.radius
+        radius = self.brush_manager.settings.radius
         color = self.brushColor if not self._isPressed else self.brushPresColor
 
         drawMgr.beginDrawable()

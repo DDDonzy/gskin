@@ -122,11 +122,13 @@ class CoreBrushEngine:
     def update_vertex_positions(self, new_positions2D: cython.float[:, ::1]):
         self.vtx_positions2D = new_positions2D
 
-    def get_hit_indices(self):
+    @property
+    def raw_hit_indices(self):
         """将内部 C 级命中数组暴露给 Python 层"""
         return self.active_hit_indices.base
 
-    def get_hit_falloff(self):
+    @property
+    def raw_hit_falloff(self):
         """将内部 C 级衰减数组暴露给 Python 层"""
         return self.active_hit_falloff.base
 
@@ -319,7 +321,9 @@ class CoreBrushEngine:
             tid: cython.int  # 线程 ID
 
             # 🌟 调度策略切换回 guided 用于 Profiler 性能测试对比
-            for i in prange(num_tris, schedule="guided", num_threads=active_threads, nogil=True):
+            for i in prange(
+                num_tris, schedule="guided", num_threads=active_threads, nogil=True
+            ):
                 tid = omp_get_thread_num()
                 if tid >= 128:
                     tid = 0
@@ -402,7 +406,9 @@ class CoreBrushEngine:
             raw_nz: cython.float = edge1_x * edge2_y - edge1_y * edge2_x  # 法线叉积 Z
 
             # 获取法线模长 (调用 C 标准库 sqrt 极限提速)
-            norm_len: cython.float = sqrt(raw_nx * raw_nx + raw_ny * raw_ny + raw_nz * raw_nz)
+            norm_len: cython.float = sqrt(
+                raw_nx * raw_nx + raw_ny * raw_ny + raw_nz * raw_nz
+            )
 
             nx: cython.float = raw_nx / norm_len if norm_len > 0.000001 else 0.0
             ny: cython.float = raw_ny / norm_len if norm_len > 0.000001 else 0.0
@@ -730,7 +736,9 @@ class BrushUndoRecorder:
         if undo_buffer is None:
             flat_size = vtx_count * self.channel_count
             c_undo_arr = (ctypes.c_float * flat_size)()
-            self.undo_buffer = memoryview(c_undo_arr).cast("f", shape=(vtx_count, self.channel_count))
+            self.undo_buffer = memoryview(c_undo_arr).cast(
+                "f", shape=(vtx_count, self.channel_count)
+            )
         else:
             self.undo_buffer = undo_buffer
 
@@ -852,7 +860,9 @@ class BrushUndoRecorder:
 
         # --- 通道压缩 ---
         # 1. 分配临时内存 标记被修改过的通道
-        channel_is_dirty: cython.p_char = cython.cast(cython.p_char, calloc(_channel_count, cython.sizeof(cython.char)))
+        channel_is_dirty: cython.p_char = cython.cast(
+            cython.p_char, calloc(_channel_count, cython.sizeof(cython.char))
+        )
 
         # 2. 遍历已记录的顶点 比较新旧数据差异
         modified_channel_count: cython.int = 0
@@ -958,17 +968,6 @@ class BrushMathContext:
         self.falloff_buffer  = falloff_buffer
 # fmt:on
 
-# 用于自动收集操作映射的装饰器
-_BRUSH_OPS = {}
-
-
-def registry_operation(mode_id):
-    def decorator(func):
-        _BRUSH_OPS[mode_id] = func.__name__
-        return func
-
-    return decorator
-
 
 @cython.cclass
 class BrushMathEngine:
@@ -996,11 +995,20 @@ class BrushMathEngine:
         self.adj_indices = adj_indices
 
         # 显式建立映射表 这些方法在类内部被视为 ccall 在字典中作为 Python 对象存储
-        self._op_map = {k: getattr(self, v) for k, v in _BRUSH_OPS.items()}
+        self._op_map = {
+            0: self._math_add,
+            1: self._math_sub,
+            2: self._math_replace,
+            3: self._math_multiply,
+            4: self._math_smooth,
+            5: self._math_sharp,
+        }
 
     # region ---------- Exec Math
     @cython.cfunc
-    def _execute_math_step(self, brush_mode: cython.int, ctx: BrushMathContext) -> cython.void:
+    def _execute_math_step(
+        self, brush_mode: cython.int, ctx: BrushMathContext
+    ) -> cython.void:
         """根据模式从映射表中获取函数并执行"""
         func = self._op_map.get(brush_mode)
         if func is not None:
@@ -1011,7 +1019,6 @@ class BrushMathEngine:
     # endregion
 
     # region ---------- Add
-    @registry_operation(0)  # Add
     @cython.boundscheck(False)
     @cython.wraparound(False)
     @cython.initializedcheck(False)
@@ -1039,11 +1046,12 @@ class BrushMathEngine:
             fal = _f_buf[i]
             for j in range(c_count):
                 col = _ch_idx[j]
-                _array[row, col] = _clamp_float(_array[row, col] + (fal * _vals[j]), _min, _max)
+                _array[row, col] = _clamp_float(
+                    _array[row, col] + (fal * _vals[j]), _min, _max
+                )
 
     # endregion
     # region ---------- Sub
-    @registry_operation(1)  # Sub
     @cython.boundscheck(False)
     @cython.wraparound(False)
     @cython.initializedcheck(False)
@@ -1071,11 +1079,12 @@ class BrushMathEngine:
             fal = _f_buf[i]
             for j in range(c_count):
                 col = _ch_idx[j]
-                _array[row, col] = _clamp_float(_array[row, col] - (fal * _vals[j]), _min, _max)
+                _array[row, col] = _clamp_float(
+                    _array[row, col] - (fal * _vals[j]), _min, _max
+                )
 
     # endregion
     # region ---------- Replace
-    @registry_operation(2)  # replace
     @cython.boundscheck(False)
     @cython.wraparound(False)
     @cython.initializedcheck(False)
@@ -1105,11 +1114,12 @@ class BrushMathEngine:
             for j in range(c_count):
                 col = _ch_idx[j]
                 cur = _array[row, col]
-                _array[row, col] = _clamp_float(cur + (_vals[j] - cur) * fal, _min, _max)
+                _array[row, col] = _clamp_float(
+                    cur + (_vals[j] - cur) * fal, _min, _max
+                )
 
     # endregion
     # region ---------- Mul
-    @registry_operation(3)  # mul
     @cython.boundscheck(False)
     @cython.wraparound(False)
     @cython.initializedcheck(False)
@@ -1139,11 +1149,12 @@ class BrushMathEngine:
             for j in range(c_count):
                 col = _ch_idx[j]
                 cur = _array[row, col]
-                _array[row, col] = _clamp_float(cur + (cur * _vals[j] - cur) * fal, _min, _max)
+                _array[row, col] = _clamp_float(
+                    cur + (cur * _vals[j] - cur) * fal, _min, _max
+                )
 
     # endregion
     # region ---------- Smooth
-    @registry_operation(4)  # smooth
     @cython.boundscheck(False)
     @cython.wraparound(False)
     @cython.cdivision(True)
@@ -1151,7 +1162,9 @@ class BrushMathEngine:
     @cython.ccall
     def _math_smooth(self, ctx: BrushMathContext) -> cython.void:
         if self.adj_offsets is None or self.adj_indices is None:
-            raise RuntimeError("Smooth Error: Topology (adj_offsets/indices) is not initialized.")
+            raise RuntimeError(
+                "Smooth Error: Topology (adj_offsets/indices) is not initialized."
+            )
 
         # 拓扑专用变量声明
         i: cython.int = 0
@@ -1196,11 +1209,14 @@ class BrushMathEngine:
                         n_sum += _array[n_idx, col]
 
                     avg = n_sum / n_count
-                    _array[row, col] = _clamp_float(_array[row, col] + (avg - _array[row, col]) * (_vals[j] * fal), _min, _max)
+                    _array[row, col] = _clamp_float(
+                        _array[row, col] + (avg - _array[row, col]) * (_vals[j] * fal),
+                        _min,
+                        _max,
+                    )
 
     # endregion
     # region ---------- Sharp
-    @registry_operation(5)  # sharp
     @cython.boundscheck(False)
     @cython.wraparound(False)
     @cython.initializedcheck(False)
@@ -1493,7 +1509,9 @@ class UtilBrushProcessor:
 
     # region ---------- Brush Get/Set
     @cython.ccall
-    def get_custom_array(self, vertex_indices=None, channel_indices=None) -> array.array:
+    def get_custom_array(
+        self, vertex_indices=None, channel_indices=None
+    ) -> array.array:
         """提取指定范围的数据副本。"""
         return self.math_engine.get_custom_array(vertex_indices, channel_indices)
 
@@ -1550,7 +1568,8 @@ class SkinWeightProcessor(UtilBrushProcessor):
         undo_buffer: cython.float[:, ::1],
     ):
         """初始化权重笔刷 通过 super() 调用父类完成底层引擎的组装。"""
-        super().__init__(
+        UtilBrushProcessor.__init__(
+            self,
             core,
             modified_buffer,
             modified_vtx_indices_buffer,
@@ -1577,7 +1596,8 @@ class SkinWeightProcessor(UtilBrushProcessor):
 
         # 1. 调用父类核心逻辑
         # 无论是一根骨骼还是多根骨骼 MathEngine 都能通过 channel_indices 处理
-        res = super().process_stroke(
+        res = UtilBrushProcessor.process_stroke(
+            self,
             brush_mode,
             weights_value,
             influences_indices,

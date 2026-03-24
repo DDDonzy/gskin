@@ -5,8 +5,8 @@ import array
 from dataclasses import dataclass
 
 # 统一使用相对路径和模块导入
-from . import cBufferManager
-from . import cBrushCoreCython2 as cBrushCoreCython
+from .cBufferManager import BufferManager
+from . import cBrushCore2Cython as cBrushCoreCython
 from . import apiundo
 
 import typing
@@ -23,7 +23,7 @@ class BrushSettings:
     """存放笔刷半径、强度、模式等用户 UI 配置。"""
 
     # fmt:off
-    radius      : float = 0.5
+    radius      : float = 1
     strength    : float = 0.1
     iter        : int   = 10
     falloff_type: int   = 1     # 0:Linear, 1:Airbrush, 2:Solid, 3:Dome, 4:Spike
@@ -46,31 +46,23 @@ class WeightBrushManager:
         self.settings = BrushSettings
 
         # sync context
+        # 从cSkin 获取 上下文
         self.mesh_ctx = cSkin.mesh_context
         self.brush_ctx = cSkin.brush_context
-
-        # instance core brush engine
-        self.engine = cBrushCoreCython.CoreBrushEngine(
-            self.mesh_ctx.vertex_positions,
-            self.mesh_ctx.triangle_indices,
-            self.mesh_ctx.v2v_offsets,
-            self.mesh_ctx.v2v_indices,
-            self.mesh_ctx.v2f_offsets,
-            self.mesh_ctx.v2f_indices,
-        )
+        self.engine = cSkin.brush_engine
 
         # 引擎在底层造好了内存 我们把它“挂”到上下文里供全局使用
         # 这样就能保证 Python 层和 C 层读写的绝对是同一块物理内存
-        self.brush_ctx.hit_indices = self.engine.get_hit_indices()
-        self.brush_ctx.hit_weights = self.engine.get_hit_falloff()
+        self.brush_ctx.hit_indices = self.engine.raw_hit_indices
+        self.brush_ctx.hit_weights = self.engine.raw_hit_falloff
         self.brush_ctx.hit_count = 0  # 初始命中数为 0
 
         # 预分配 Undo/Redo 撤销系统内存池
         vtx_count = self.mesh_ctx.vertex_count
         inf_count = self.cSkin.influences_count if self.cSkin else 1
-        self.modified_vtx_bool_mgr = cBufferManager.BufferManager.allocate("B", (vtx_count,))
-        self.modified_vtx_indices_mgr = cBufferManager.BufferManager.allocate("i", (vtx_count,))
-        self.undo_buffer_mgr = cBufferManager.BufferManager.allocate("f", (vtx_count, inf_count))
+        self.modified_vtx_bool_mgr = BufferManager.allocate("B", (vtx_count,))
+        self.modified_vtx_indices_mgr = BufferManager.allocate("i", (vtx_count,))
+        self.undo_buffer_mgr = BufferManager.allocate("f", (vtx_count, inf_count))
         """ 撤销内存池 [i, j] 一次性预分配全量权重快照空间 用于备份刷写前的原始权重 """
 
         # Stroke 状态
@@ -104,18 +96,13 @@ class WeightBrushManager:
             return None
 
         # ----------------------------------------------------------------------------------
-        # deform 输出的 点位置信息不一定是同一个内存地址的 在并行模式下 可能多个内存地址切换
-        # 所以每次tick的时候 要更新笔刷底层的点位置信息 直接传入内存地址即可。
-        vtx_count = self.mesh_ctx.vertex_count
-        new_view = self.mesh_ctx.vertex_positions.reshape((vtx_count, 3)).view
-        self.engine.update_vertex_positions(new_view)
-        # ----------------------------------------------------------------------------------
         # ray cast
-        hit_success, hit_pos, hit_normal, hit_tri, _, _, _ = self.engine.raycast(ray_source, ray_dir)
+        hit_success, hit_pos, hit_normal, hit_tri, _, _, _ = self.engine.raycast(
+            ray_source, ray_dir
+        )
 
         # 未命中处理
         if not hit_success:
-            # if action == "hover":
             self.clear_hit_state()
             return None
 
@@ -145,10 +132,11 @@ class WeightBrushManager:
         鼠标按下
         解析 UI 目标 (Layer/Mask/Influence) 提取对应内存并装配 Processor。
         """
+
         weights_manager = self.cSkin.weights_manager
-
-        layer_idx, is_mask, active_influence_idx, _ = self.cSkin.get_active_paint_weights()
-
+        layer_idx, is_mask, active_influence_idx, _ = (
+            self.cSkin.get_active_paint_weights()
+        )
         self.layer_idx = layer_idx  # layer
         self.is_mask = is_mask  # layer
         self.active_influence_idx = active_influence_idx  # influence index
@@ -156,15 +144,15 @@ class WeightBrushManager:
         handle = weights_manager.get_handle(layer_idx, is_mask)
         if not handle.is_valid:
             return
-
-        vtx_count, influences_count, _, weights_1d = weights_manager.get_handle(layer_idx, is_mask).parse_raw_weights()
+        vtx_count, influences_count, _, weights_1d = handle.parse_raw_weights()
         if vtx_count <= 0:
             return
 
         weights_2d = weights_1d.cast("B").cast("f", (vtx_count, influences_count))
-        # influence locked indices
-        self._temp_locks_mgr = cBufferManager.BufferManager.allocate("B", (influences_count,))
 
+        # influence locked indices  | 临时创建一个骨骼锁定数组
+        self._temp_locks_mgr = BufferManager.allocate("B", (influences_count,))
+        # 构造笔刷执行器
         self.active_processor = cBrushCoreCython.SkinWeightProcessor(
             self.engine,
             weights_2d,
@@ -181,6 +169,7 @@ class WeightBrushManager:
         if not self.active_processor or self.brush_ctx.hit_count == 0:
             return False
 
+        # 构造临时array
         val_ary = array.array("f", [self.settings.strength])
         idx_ary = array.array("i", [self.active_influence_idx])
 
@@ -213,7 +202,7 @@ class WeightBrushManager:
             layer = self.layer_idx
             mask = self.is_mask
 
-            # ✨ 核心改变 使用专用的稀疏状态还原器 强行覆盖 绝对精准
+            # 核心改变 使用专用的稀疏状态还原器 强行覆盖 绝对精准
             def undo():
                 wm.set_sparse_weights(layer, mask, mod_vtx_idx, mod_ch_idx, old_sparse)
 
@@ -222,11 +211,6 @@ class WeightBrushManager:
 
             # 提交到咱们自己的 API 撤销栈
             apiundo.commit(redo, undo, execute=False)
-
-        wm = self.cSkin.weights_manager
-        handle = wm.get_handle(self.layer_idx, self.is_mask)
-        if handle and handle.is_valid:
-            handle.commit()
 
         self.active_processor = None
         self.active_handle = None
