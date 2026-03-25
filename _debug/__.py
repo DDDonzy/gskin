@@ -1,5 +1,4 @@
 from importlib import reload
-import re
 
 import maya.cmds as cmds
 import maya.api.OpenMaya as om2
@@ -11,6 +10,8 @@ import gskin._debug.gskinReload as gskinReload
 from gskin._debug.convert import get_skinWeights, convert_skin_to_cSkin
 from gskin.src._cRegistry import SkinRegistry
 import numpy as np
+
+from z_np.src.cBrushCore import BrushHitState
 
 
 maya_file = r"C:/Users/ext.dxu/Desktop/ng_test.ma"
@@ -39,5 +40,26 @@ influence_indices = cmds.getAttr(f"{sk_node}.matrix", mi=1)
 manager = wm.WeightsManager.from_node("cSkinDeformer1")
 manager.init_handle_data(-1, 0, vertex_count, len(influence_indices), influence_indices, list(maya_weights))
 
+
 shape = cmds.createNode("triangleShape")
 cmds.connectAttr(f"{cSkin}.outputGeometry[0]",f"{shape}.inputMesh")
+
+
+cmds.setToolTo("selectSuperContext")
+if cmds.contextInfo("cBrush", exists=True):
+    cmds.deleteUI("cBrush", toolContext=True)
+
+
+cmds.select("pCube1")
+
+if not cmds.contextInfo("cBrush", exists=True):
+    cmds.cBrushCtx("cBrush")
+
+
+cmds.setToolTo("cBrush")
+
+
+
+from gskin.src.cBrushManager import BrushSettings
+
+BrushSettings.radius = 10

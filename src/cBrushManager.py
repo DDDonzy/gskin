@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-import array
 
+import array
+import typing
 from dataclasses import dataclass
 
-# 统一使用相对路径和模块导入
+from . import apiundo
 from .cBufferManager import BufferManager
 from . import cBrushCore2Cython as cBrushCoreCython
-from . import apiundo
 
-import typing
 
 if typing.TYPE_CHECKING:
     from .cSkinDeform import CythonSkinDeformer
@@ -81,51 +80,6 @@ class WeightBrushManager:
         self.active_processor = None
         self.active_handle = None
 
-    def process_stroke(self, ray_source: tuple, ray_dir: tuple, action: str) -> tuple:
-        """
-        封装射线投射、范围检测和笔刷涂抹的完整过程。
-
-        Args:
-            ray_source (tuple): 射线起点 (局部空间)
-            ray_dir (tuple): 射线方向 (局部空间)
-            action (str): 当前鼠标动作 ("hover", "press", "drag")
-        Returns:
-            tuple: (hit_pos, hit_normal) 供前端绘制光标。若未命中则返回 None。
-        """
-        if not self.engine:
-            return None
-
-        # ----------------------------------------------------------------------------------
-        # ray cast
-        hit_success, hit_pos, hit_normal, hit_tri, _, _, _ = self.engine.raycast(
-            ray_source, ray_dir
-        )
-
-        # 未命中处理
-        if not hit_success:
-            self.clear_hit_state()
-            return None
-
-        # 命中处理
-        if self.mesh_ctx and self.mesh_ctx.vertex_positions:
-            hit_count, _, _ = self.engine.calc_brush_falloff(
-                hit_pos,
-                hit_tri,
-                self.settings.radius,
-                self.settings.falloff_type,
-                self.settings.use_surface,
-            )
-            self.brush_ctx.hit_count = hit_count
-            self.brush_ctx.hit_center_position = hit_pos
-
-        # 如果是按下或拖拽 执行核心涂抹运算
-        if action in ("press", "drag"):
-            self.update_stroke()
-            self.cSkin.setDirty()
-
-        # 返回局部坐标和法线 供 UI 层转换世界坐标画圈
-        return (hit_pos, hit_normal)
-
     # Stroke (按下 -> 拖拽 -> 松开)
     def begin_stroke(self):
         """
@@ -134,9 +88,7 @@ class WeightBrushManager:
         """
 
         weights_manager = self.cSkin.weights_manager
-        layer_idx, is_mask, active_influence_idx, _ = (
-            self.cSkin.get_active_paint_weights()
-        )
+        layer_idx, is_mask, active_influence_idx, _ = self.cSkin.get_active_paint_weights()
         self.layer_idx = layer_idx  # layer
         self.is_mask = is_mask  # layer
         self.active_influence_idx = active_influence_idx  # influence index
@@ -164,24 +116,6 @@ class WeightBrushManager:
 
         # 通知 Processor 清空掩码 开始记录历史
         self.active_processor.begin_stroke()
-
-    def update_stroke(self) -> bool:
-        if not self.active_processor or self.brush_ctx.hit_count == 0:
-            return False
-
-        # 构造临时array
-        val_ary = array.array("f", [self.settings.strength])
-        idx_ary = array.array("i", [self.active_influence_idx])
-
-        self.active_processor.process_stroke(
-            brush_mode=self.settings.mode,
-            weights_value=val_ary,
-            influences_indices=idx_ary,
-            clamp_min=0.0,
-            clamp_max=1.0,
-            iterations=self.settings.iter,
-        )
-        return True
 
     def end_stroke(self):
         """
@@ -214,3 +148,57 @@ class WeightBrushManager:
 
         self.active_processor = None
         self.active_handle = None
+
+    def process_stroke(self, ray_source: tuple, ray_dir: tuple, action: str) -> tuple:
+        """
+        封装射线投射、范围检测和笔刷涂抹的完整过程。
+
+        Args:
+            ray_source (tuple): 射线起点 (局部空间)
+            ray_dir (tuple): 射线方向 (局部空间)
+            action (str): 当前鼠标动作 ("hover", "press", "drag")
+        Returns:
+            tuple: (bool, hit_pos, hit_normal) 供前端绘制光标。若未命中则返回 None。
+        """
+        # --- 
+        if not self.engine:
+            return False, None, None
+
+        # ray cast ---------------------------------------------------------------------------------
+        hit_success, hit_pos, hit_normal, hit_tri, _, _, _ = self.engine.raycast(ray_source, ray_dir)
+
+        # is not hit -------------------------------------------------------------------------------
+        if not hit_success:
+            self.clear_hit_state()
+            return False, None, None
+
+        # is hit -----------------------------------------------------------------------------------
+        if self.mesh_ctx and self.mesh_ctx.vertex_positions:
+            hit_count, _, _ = self.engine.calc_brush_falloff(
+                hit_pos,
+                hit_tri,
+                self.settings.radius,
+                self.settings.falloff_type,
+                self.settings.use_surface,
+            )
+            self.brush_ctx.hit_count = hit_count
+            self.brush_ctx.hit_center_position = hit_pos
+
+        # press or drag ---------------------------------------------------------------------------
+        if action in ("press", "drag"):
+            if not self.active_processor or self.brush_ctx.hit_count == 0:
+                return True, hit_pos, hit_normal
+
+            # 构造临时array
+            val_ary = array.array("f", [self.settings.strength])
+            idx_ary = array.array("i", [self.active_influence_idx])
+
+            self.active_processor.process_stroke(
+                brush_mode=self.settings.mode,
+                weights_value=val_ary,
+                influences_indices=idx_ary,
+                clamp_min=0.0,
+                clamp_max=1.0,
+                iterations=self.settings.iter,
+            )
+        return True, hit_pos, hit_normal

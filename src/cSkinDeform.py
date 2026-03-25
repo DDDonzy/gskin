@@ -134,6 +134,11 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         # --- influences
         self.influences_count        : int           = 0
         self.influences_locks_buffer : BufferManager = None
+        
+        # --- current paint data
+        self.layer_index      :int  = -1
+        self.is_mask          :bool = False
+        self.influences_count :int  = 0
 
         # --- dirty
         self.isDirty                  : bool = True
@@ -347,24 +352,19 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
 
         manager = self.weights_manager
 
-        # 获取用户输入数据
-        layer_index = self.mFnDep.findPlug(self.aCurrentPaintLayerIndex).asInt()
-        is_mask = self.mFnDep.findPlug(self.aCurrentPaintMaskBool).asBool()
-        influences_index = self.mFnDep.findPlug(self.aCurrentPaintInfluenceIndex).asInt() if not is_mask else 0
-
-        handle = manager.get_handle(layer_index, is_mask)
+        handle = manager.get_handle(self.layer_index, self.is_mask)
         if handle is None:
-            return layer_index, is_mask, influences_index, None
+            return self.layer_index, self.is_mask, self.influences_index, None
 
         _, inf_count, _, weights_view = handle.parse_raw_weights()
 
         if inf_count <= 0 or not weights_view:
-            return layer_index, is_mask, influences_index, None
+            return self.layer_index, self.is_mask, self.influences_index, None
 
         # 2. 计算安全偏移量
-        safe_idx = max(0, min(influences_index, inf_count - 1))
+        safe_idx = max(0, min(self.influences_index, inf_count - 1))
 
-        return layer_index, is_mask, influences_index, weights_view[safe_idx::inf_count]
+        return self.layer_index, self.is_mask, self.influences_index, weights_view[safe_idx::inf_count]
 
     @maya_profile(0, "Compute")
     def compute(self, plug, dataBlock):
@@ -378,13 +378,17 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         if not self.isDirty:
             return None
 
+        # 获取当前绘制 layer 数据
+        self.layer_index = dataBlock.inputValue(self.aCurrentPaintLayerIndex).asInt()
+        self.is_mask = dataBlock.inputValue(self.aCurrentPaintMaskBool).asBool()
+        self.influences_index = dataBlock.inputValue(self.aCurrentPaintInfluenceIndex).asInt() if not self.is_mask else 0
+
         res = super().compute(plug, dataBlock)
         self.isDirty = False
         return res
 
     @maya_profile(0, "Deform")
     def deform(self, dataBlock: om1.MDataBlock, geoIter, localToWorldMatrix, multiIndex):  # noqa: ARG002
-        print("deform-start")
         envelope = dataBlock.inputValue(ompx.cvar.MPxGeometryFilter_envelope).asFloat()
 
         with MayaNativeProfiler("in-geo-object", 2):
@@ -486,7 +490,6 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
                 self._translateVector_buffer.view,
                 envelope,
             )
-        print("deform-end")
 
     @classmethod
     def nodeInitializer(cls):
