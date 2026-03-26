@@ -68,6 +68,8 @@ class CoreBrushEngine:
     brush_epoch: cython.int
     raycast_epoch: cython.int
 
+    last_ray_hit_tri: cython.int
+
     def __init__(
         self,
         vtx_positions2D: cython.float[:, ::1],
@@ -119,6 +121,8 @@ class CoreBrushEngine:
         self.raycast_epoch = 1
         self.active_hit_count = 0
 
+        self.last_ray_hit_tri = -1
+
     def update_vertex_positions(self, new_positions2D: cython.float[:, ::1]):
         self.vtx_positions2D = new_positions2D
 
@@ -139,41 +143,20 @@ class CoreBrushEngine:
     @cython.wraparound(False)
     @cython.cdivision(True)
     @cython.ccall
-    def raycast(self, ray_pos: tuple, ray_dir: tuple, cull_backface: cython.bint = False) -> tuple:
-        """双轨制射线检测 局部缓存拦截 + 多线程暴力兜底 寻找最近交点。
-
-        采用了业界顶级的 "Coherent Spatial Caching (相干性空间缓存)" 架构。
-        - 轨道一 (O(1) 级) 优先测试上一帧笔刷衰减圈内的面片 单线程极速拦截。
-        - 轨道二 (O(N) 级) 若缓存未命中 (例如鼠标高速大范围甩动) 唤醒 OpenMP 多线程全量遍历。
-
-        Args:
-            ray_pos (tuple): 射线的世界坐标起点 (x, y, z)。
-            ray_dir (tuple): 射线的世界方向向量 (x, y, z)。
-
-        Returns:
-            tuple: 包含以下元素的元组:
-                - is_hit (cython.bint): 是否击中模型。
-                - hit_pos (x,y,z): 击中点的坐标 (hit_x, hit_y, hit_z)。
-                - normal (x,y,z): 击中点所在面的法线 (nx, ny, nz)。
-                - hit_tri (cython.int): 击中的三角面索引。
-                - t (cython.float): 射线起点到击中点的距离。
-                - u (cython.float): 重心坐标 U。
-                - v (cython.float): 重心坐标 V。
-        """
+    def raycast(self, ray_pos: tuple, ray_dir: tuple, cull_backface: cython.bint = True) -> tuple:
+        """单线程极速双轨制射线检测 (彻底剥离 Falloff 依赖，采用三角面微缓存自愈)。"""
         _points: cython.float[:, ::1] = self.vtx_positions2D
         _tri_indices: cython.int[:, ::1] = self.tri_indices2D
 
-        # 射线属性拆包
-        orig_x: cython.float = ray_pos[0]  # 射线起点 X
-        orig_y: cython.float = ray_pos[1]  # 射线起点 Y
-        orig_z: cython.float = ray_pos[2]  # 射线起点 Z
-        dir_x: cython.float = ray_dir[0]  # 射线方向 X
-        dir_y: cython.float = ray_dir[1]  # 射线方向 Y
-        dir_z: cython.float = ray_dir[2]  # 射线方向 Z
+        orig_x: cython.float = ray_pos[0]
+        orig_y: cython.float = ray_pos[1]
+        orig_z: cython.float = ray_pos[2]
+        dir_x: cython.float = ray_dir[0]
+        dir_y: cython.float = ray_dir[1]
+        dir_z: cython.float = ray_dir[2]
 
-        num_tris: cython.int = _tri_indices.shape[0]  # 模型三角面总数
+        num_tris: cython.int = _tri_indices.shape[0]
 
-        # M-T 算法所需核心数学变量声明
         v0_idx: cython.int
         v1_idx: cython.int
         v2_idx: cython.int
@@ -199,21 +182,145 @@ class CoreBrushEngine:
         t: cython.float
 
         # --- 全局交点结果容器 ---
-        global_closest_t: cython.float = 999999.0  # 全局最小距离
-        global_hit_tri: cython.int = -1  # 全局命中的面索引
-        global_u: cython.float = 0.0  # 全局重心坐标 U
-        global_v: cython.float = 0.0  # 全局重心坐标 V
+        global_closest_t: cython.float = 999999.0
+        global_hit_tri: cython.int = -1
+        global_u: cython.float = 0.0
+        global_v: cython.float = 0.0
 
-        i: cython.int  # 全局循环索引
-        j: cython.int  # V2F 局部循环索引
+        i: cython.int
+        j: cython.int
 
-        cache_hit: cython.bint = False  # 缓存命中标记
+        cache_hit: cython.bint = False
+
+        self.raycast_epoch += 1
 
         # =====================================================================
-        # 🚀 轨道一 V2F 局部空间缓存拦截 (单线程极速 O(1) 级判定)
+        # 🚀 轨道一: V2F 局部空间拦截 (((基于last_hit_tri
         # =====================================================================
-        if self.active_hit_count > 0:
-            self.raycast_epoch += 1
+        # region --- plan 1
+        temp_hover_vtx: cython.int[3] = cython.declare(cython.int[3])
+
+        # 只要上一帧击中过任何面，微缓存就生效！
+        if self.last_ray_hit_tri != -1:
+            # 提取上一帧击中面的 3 个顶点作为种子
+            temp_hover_vtx[0] = _tri_indices[self.last_ray_hit_tri, 0]
+            temp_hover_vtx[1] = _tri_indices[self.last_ray_hit_tri, 1]
+            temp_hover_vtx[2] = _tri_indices[self.last_ray_hit_tri, 2]
+
+            _curr_r_epoch: cython.int = self.raycast_epoch
+            _f_epochs = self.faces_epochs
+
+            v_idx: cython.int
+            edge_start: cython.int
+            edge_end: cython.int
+            test_tri: cython.int
+
+            with cython.nogil:
+                # 永远只遍历这 3 个顶点
+                for i in range(3):
+                    v_idx = temp_hover_vtx[i]
+                    edge_start = self.v2f_offsets[v_idx]
+                    edge_end = self.v2f_offsets[v_idx + 1]
+
+                    for j in range(edge_start, edge_end):
+                        test_tri = self.v2f_indices[j]
+
+                        # 世代掩码：保证同一个面绝对只测一次
+                        if _f_epochs[test_tri] == _curr_r_epoch:
+                            continue
+                        _f_epochs[test_tri] = _curr_r_epoch
+
+                        v0_idx = _tri_indices[test_tri, 0]
+                        v1_idx = _tri_indices[test_tri, 1]
+                        v2_idx = _tri_indices[test_tri, 2]
+
+                        edge1_x = _points[v1_idx, 0] - _points[v0_idx, 0]
+                        edge1_y = _points[v1_idx, 1] - _points[v0_idx, 1]
+                        edge1_z = _points[v1_idx, 2] - _points[v0_idx, 2]
+
+                        edge2_x = _points[v2_idx, 0] - _points[v0_idx, 0]
+                        edge2_y = _points[v2_idx, 1] - _points[v0_idx, 1]
+                        edge2_z = _points[v2_idx, 2] - _points[v0_idx, 2]
+
+                        h_x = dir_y * edge2_z - dir_z * edge2_y
+                        h_y = dir_z * edge2_x - dir_x * edge2_z
+                        h_z = dir_x * edge2_y - dir_y * edge2_x
+
+                        a = edge1_x * h_x + edge1_y * h_y + edge1_z * h_z
+
+                        if cull_backface:
+                            # 🟢 单面极速模式 (开启背面剔除 + 延迟除法)
+                            if a < 0.000001:
+                                continue
+
+                            s_x = orig_x - _points[v0_idx, 0]
+                            s_y = orig_y - _points[v0_idx, 1]
+                            s_z = orig_z - _points[v0_idx, 2]
+
+                            u_unscaled = s_x * h_x + s_y * h_y + s_z * h_z
+                            if u_unscaled < 0.0 or u_unscaled > a:
+                                continue
+
+                            q_x = s_y * edge1_z - s_z * edge1_y
+                            q_y = s_z * edge1_x - s_x * edge1_z
+                            q_z = s_x * edge1_y - s_y * edge1_x
+
+                            v_unscaled = dir_x * q_x + dir_y * q_y + dir_z * q_z
+                            if v_unscaled < 0.0 or u_unscaled + v_unscaled > a:
+                                continue
+
+                            t_unscaled = edge2_x * q_x + edge2_y * q_y + edge2_z * q_z
+
+                            if t_unscaled < 0.000001 * a or t_unscaled > global_closest_t * a:
+                                continue
+
+                            f = 1.0 / a
+                            global_closest_t = t_unscaled * f
+                            global_hit_tri = test_tri
+                            global_u = u_unscaled * f
+                            global_v = v_unscaled * f
+                            cache_hit = True
+
+                        else:
+                            # 🔴 双面安全模式 (无背面剔除)
+                            if a > -0.000001 and a < 0.000001:
+                                continue
+
+                            f = 1.0 / a
+
+                            s_x = orig_x - _points[v0_idx, 0]
+                            s_y = orig_y - _points[v0_idx, 1]
+                            s_z = orig_z - _points[v0_idx, 2]
+
+                            u = f * (s_x * h_x + s_y * h_y + s_z * h_z)
+                            if u < 0.0 or u > 1.0:
+                                continue
+
+                            q_x = s_y * edge1_z - s_z * edge1_y
+                            q_y = s_z * edge1_x - s_x * edge1_z
+                            q_z = s_x * edge1_y - s_y * edge1_x
+
+                            v = f * (dir_x * q_x + dir_y * q_y + dir_z * q_z)
+                            if v < 0.0 or u + v > 1.0:
+                                continue
+
+                            t = f * (edge2_x * q_x + edge2_y * q_y + edge2_z * q_z)
+
+                            if t < 0.000001 or t > global_closest_t:
+                                continue
+
+                            global_closest_t = t
+                            global_hit_tri = test_tri
+                            global_u = u
+                            global_v = v
+                            cache_hit = True
+        # endregion
+
+        # =====================================================================
+        # 🚀 轨道一一二V2F 局部空间拦截 (((基于falloff）
+        # =====================================================================
+        if not cache_hit and self.active_hit_count > 0:
+            print("plan 2")
             _curr_r_epoch: cython.int = self.raycast_epoch
             _f_epochs = self.faces_epochs
 
@@ -290,7 +397,7 @@ class CoreBrushEngine:
                             global_hit_tri = test_tri
                             global_u = u_unscaled * f
                             global_v = v_unscaled * f
-                            
+
                             cache_hit = True
 
                         else:
@@ -301,7 +408,7 @@ class CoreBrushEngine:
                                 continue
 
                             f = 1.0 / a
-                            
+
                             s_x = orig_x - _points[v0_idx, 0]
                             s_y = orig_y - _points[v0_idx, 1]
                             s_z = orig_z - _points[v0_idx, 2]
@@ -327,15 +434,13 @@ class CoreBrushEngine:
                             global_hit_tri = test_tri
                             global_u = u
                             global_v = v
-                            
+
                             cache_hit = True
 
-
         # =====================================================================
-        # 🛡️ 轨道二: 纯单线程暴力搜索 (带单/双面分支)
+        # 🛡️ 轨道二二三纯单线程极致暴力盲扫 (缓存未命中或首笔落下时触发)
         # =====================================================================
         if not cache_hit:
-            # 🌟 释放 GIL，进入纯 C 单核模式
             with cython.nogil:
                 for i in range(num_tris):
                     v0_idx = _tri_indices[i, 0]
@@ -357,9 +462,6 @@ class CoreBrushEngine:
                     a = edge1_x * h_x + edge1_y * h_y + edge1_z * h_z
 
                     if cull_backface:
-                        # ---------------------------------------------
-                        # 🟢 模式 A：单面极速模式 (开启背面剔除 + 延迟除法)
-                        # ---------------------------------------------
                         if a < 0.000001:
                             continue
 
@@ -384,7 +486,6 @@ class CoreBrushEngine:
                         if t_unscaled < 0.000001 * a or t_unscaled > global_closest_t * a:
                             continue
 
-                        # 活到这里的绝对是最近点，花 CPU 周期执行除法
                         f = 1.0 / a
                         global_closest_t = t_unscaled * f
                         global_hit_tri = i
@@ -392,14 +493,9 @@ class CoreBrushEngine:
                         global_v = v_unscaled * f
 
                     else:
-                        # ---------------------------------------------
-                        # 🔴 模式 B：双面安全模式 (无背面剔除)
-                        # ---------------------------------------------
-                        # 行列式 a 接近于 0 代表射线与面平行，无论正反面都要剔除
                         if a > -0.000001 and a < 0.000001:
                             continue
 
-                        # 因为 a 符号不定，必须提前执行除法统一计算符号
                         f = 1.0 / a
 
                         s_x = orig_x - _points[v0_idx, 0]
@@ -429,10 +525,12 @@ class CoreBrushEngine:
                         global_v = v
 
         # =====================================================================
-        # 🏁 计算交点属性并返回
+        # 🏁 结算并记录本次命中，反哺下一帧缓存
         # =====================================================================
         if global_hit_tri != -1:
-            # 重新获取命中面的顶点信息
+            # 🌟 核心：永远记住最后一次命中的面！供下一帧轨道一直接使用！
+            self.last_ray_hit_tri = global_hit_tri
+
             v0_idx = _tri_indices[global_hit_tri, 0]
             v1_idx = _tri_indices[global_hit_tri, 1]
             v2_idx = _tri_indices[global_hit_tri, 2]
@@ -445,11 +543,10 @@ class CoreBrushEngine:
             edge2_y = _points[v2_idx, 1] - _points[v0_idx, 1]
             edge2_z = _points[v2_idx, 2] - _points[v0_idx, 2]
 
-            raw_nx: cython.float = edge1_y * edge2_z - edge1_z * edge2_y  # 法线叉积 X
-            raw_ny: cython.float = edge1_z * edge2_x - edge1_x * edge2_z  # 法线叉积 Y
-            raw_nz: cython.float = edge1_x * edge2_y - edge1_y * edge2_x  # 法线叉积 Z
+            raw_nx: cython.float = edge1_y * edge2_z - edge1_z * edge2_y
+            raw_ny: cython.float = edge1_z * edge2_x - edge1_x * edge2_z
+            raw_nz: cython.float = edge1_x * edge2_y - edge1_y * edge2_x
 
-            # 获取法线模长 (调用 C 标准库 sqrt 极限提速)
             norm_len: cython.float = sqrt(raw_nx * raw_nx + raw_ny * raw_ny + raw_nz * raw_nz)
 
             nx: cython.float = raw_nx / norm_len if norm_len > 0.000001 else 0.0
@@ -470,9 +567,11 @@ class CoreBrushEngine:
                 global_v,
             )
 
-        # 未击中任何模型
+        # 🌟 如果射线飞到了宇宙边缘（未命中任何物体），清空微缓存，强制下一帧盲扫
+        self.last_ray_hit_tri = -1
         return False, (0.0, 0.0, 0.0), (0.0, 0.0, 0.0), -1, 0.0, 0.0, 0.0
 
+    # endregion
     # endregion
 
     # region ---------- Falloff
