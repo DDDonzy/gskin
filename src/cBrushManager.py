@@ -149,30 +149,28 @@ class WeightBrushManager:
         self.active_processor = None
         self.active_handle = None
 
-    def process_stroke(self, ray_source: tuple, ray_dir: tuple, action: str) -> tuple:
+    def raycast(self, ray_source: tuple, ray_dir: tuple) -> tuple:
         """
-        封装射线投射、范围检测和笔刷涂抹的完整过程。
-
-        Args:
-            ray_source (tuple): 射线起点 (局部空间)
-            ray_dir (tuple): 射线方向 (局部空间)
-            action (str): 当前鼠标动作 ("hover", "press", "drag")
+        [1. 探测阶段] 纯物理射线探测，绝对不触发任何涂抹计算。
         Returns:
-            tuple: (bool, hit_pos, hit_normal) 供前端绘制光标。若未命中则返回 None。
+            tuple: (is_hit, hit_pos, hit_normal, hit_tri)
         """
-        # --- 
         if not self.engine:
-            return False, None, None
+            return False, None, None, None
 
-        # ray cast ---------------------------------------------------------------------------------
         hit_success, hit_pos, hit_normal, hit_tri, _, _, _ = self.engine.raycast(ray_source, ray_dir)
 
-        # is not hit -------------------------------------------------------------------------------
         if not hit_success:
             self.clear_hit_state()
-            return False, None, None
+            return False, None, None, None
 
-        # is hit -----------------------------------------------------------------------------------
+        return True, hit_pos, hit_normal, hit_tri
+
+    def apply_brush(self, hit_pos: tuple, hit_tri: int, action: str):
+        """
+        [2. 涂抹阶段] 接收现成的击中数据，计算衰减并修改权重。
+        """
+        # 1. 计算笔刷衰减 (Falloff)
         if self.mesh_ctx and self.mesh_ctx.vertex_positions:
             hit_count, _, _ = self.engine.calc_brush_falloff(
                 hit_pos,
@@ -184,10 +182,10 @@ class WeightBrushManager:
             self.brush_ctx.hit_count = hit_count
             self.brush_ctx.hit_center_position = hit_pos
 
-        # press or drag ---------------------------------------------------------------------------
+        # 2. 修改权重数组 (Press / Drag)
         if action in ("press", "drag"):
             if not self.active_processor or self.brush_ctx.hit_count == 0:
-                return True, hit_pos, hit_normal
+                return
 
             # 构造临时array
             val_ary = array.array("f", [self.settings.strength])
@@ -201,4 +199,4 @@ class WeightBrushManager:
                 clamp_max=1.0,
                 iterations=self.settings.iter,
             )
-        return True, hit_pos, hit_normal
+        self.cSkin.setDirty()
