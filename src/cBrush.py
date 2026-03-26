@@ -66,11 +66,13 @@ class WeightBrushContext(omui.MPxContext):
     @maya_profile(0, "doHover")
     def doPtrMoved(self, event, drawMgr, context):
         """悬停阶段 单次检测与高亮"""
-        with MayaNativeProfiler('raycast',1):
-            # get local ray & ray_dir
-            ray_src, ray_dir = self._get_ray_from_screen(*event.position)
-            #  raycast
-            is_hit, hit_pos, hit_normal, _ = self.brush_manager.raycast(ray_src, ray_dir)
+        with MayaNativeProfiler("raycast", 1):
+            with MayaNativeProfiler("raycast_xy-to_vector", 1):
+                # get local ray & ray_dir
+                ray_src, ray_dir = self._get_ray_from_screen(*event.position)
+            with MayaNativeProfiler("cython-raycast", 1):
+                #  raycast
+                is_hit, hit_pos, hit_normal, _ = self.brush_manager.raycast(ray_src, ray_dir)
         # draw cursor
         if is_hit:
             self.draw_cursor((True, hit_pos, hit_normal), drawMgr)
@@ -88,9 +90,12 @@ class WeightBrushContext(omui.MPxContext):
 
         last_hit_result = None
         for x, y in interp_points:
-            ray_src, ray_dir = self._get_ray_from_screen(x, y)
-            # raycast
-            is_hit, hit_pos, hit_normal, hit_tri = self.brush_manager.raycast(ray_src, ray_dir)
+            with MayaNativeProfiler("raycast", 1):
+                with MayaNativeProfiler("raycast_xy-to_vector", 1):
+                    ray_src, ray_dir = self._get_ray_from_screen(x, y)
+                with MayaNativeProfiler("cython-raycast", 1):
+                    # raycast
+                    is_hit, hit_pos, hit_normal, hit_tri = self.brush_manager.raycast(ray_src, ray_dir)
             if is_hit:
                 # apply brush
                 self.brush_manager.apply_brush(hit_pos, hit_tri, "press")
@@ -110,9 +115,12 @@ class WeightBrushContext(omui.MPxContext):
         final_cursor_hit = None
         if interp_points:
             for x, y in interp_points:
-                ray_src, ray_dir = self._get_ray_from_screen(x, y)
-                # raycast
-                is_hit, hit_pos, hit_normal, hit_tri = self.brush_manager.raycast(ray_src, ray_dir)
+                with MayaNativeProfiler("raycast", 1):
+                    with MayaNativeProfiler("raycast_xy-to_vector", 1):
+                        ray_src, ray_dir = self._get_ray_from_screen(x, y)
+                    with MayaNativeProfiler("cython-raycast", 1):
+                        # raycast
+                        is_hit, hit_pos, hit_normal, hit_tri = self.brush_manager.raycast(ray_src, ray_dir)
                 if is_hit:
                     # apply brush
                     self.brush_manager.apply_brush(hit_pos, hit_tri, "drag")
@@ -121,8 +129,12 @@ class WeightBrushContext(omui.MPxContext):
             if final_cursor_hit:
                 self._update_dynamic_spacing(final_cursor_hit)
         else:
-            ray_src, ray_dir = self._get_ray_from_screen(*event.position)
-            is_hit, hit_pos, hit_normal, _ = self.brush_manager.raycast(ray_src, ray_dir)
+            with MayaNativeProfiler("raycast", 1):
+                with MayaNativeProfiler("raycast_xy-to_vector", 1):
+                    ray_src, ray_dir = self._get_ray_from_screen(*event.position)
+                with MayaNativeProfiler("cython-raycast", 1):
+                    # raycast
+                    is_hit, hit_pos, hit_normal, hit_tri = self.brush_manager.raycast(ray_src, ray_dir)
             if is_hit:
                 final_cursor_hit = (True, hit_pos, hit_normal)
 
@@ -138,9 +150,12 @@ class WeightBrushContext(omui.MPxContext):
         last_hit_result = None
         if interp_points:
             for x, y in interp_points:
-                ray_src, ray_dir = self._get_ray_from_screen(x, y)
-
-                is_hit, hit_pos, hit_normal, hit_tri = self.brush_manager.raycast(ray_src, ray_dir)
+                with MayaNativeProfiler("raycast", 1):
+                    with MayaNativeProfiler("raycast_xy-to_vector", 1):
+                        ray_src, ray_dir = self._get_ray_from_screen(x, y)
+                    with MayaNativeProfiler("cython-raycast", 1):
+                        # raycast
+                        is_hit, hit_pos, hit_normal, hit_tri = self.brush_manager.raycast(ray_src, ray_dir)
 
                 if is_hit:
                     self.brush_manager.apply_brush(hit_pos, hit_tri, "drag")

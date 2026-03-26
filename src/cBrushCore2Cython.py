@@ -139,7 +139,7 @@ class CoreBrushEngine:
     @cython.wraparound(False)
     @cython.cdivision(True)
     @cython.ccall
-    def raycast(self, ray_pos: tuple, ray_dir: tuple) -> tuple:
+    def raycast(self, ray_pos: tuple, ray_dir: tuple, cull_backface: cython.bint = False) -> tuple:
         """双轨制射线检测 局部缓存拦截 + 多线程暴力兜底 寻找最近交点。
 
         采用了业界顶级的 "Coherent Spatial Caching (相干性空间缓存)" 架构。
@@ -213,34 +213,134 @@ class CoreBrushEngine:
         # 🚀 轨道一 V2F 局部空间缓存拦截 (单线程极速 O(1) 级判定)
         # =====================================================================
         if self.active_hit_count > 0:
-            self.raycast_epoch += 1  # 更新本帧的射线测试世代
+            self.raycast_epoch += 1
             _curr_r_epoch: cython.int = self.raycast_epoch
-            _f_epochs = self.faces_epochs  # 面片测试掩码 防止同一个面被测试多次
+            _f_epochs = self.faces_epochs
 
-            v_idx: cython.int  # 缓存圈内的顶点索引
-            edge_start: cython.int  # V2F 拓扑表起始游标
-            edge_end: cython.int  # V2F 拓扑表结束游标
-            test_tri: cython.int  # 当前需要测试的相邻面
+            v_idx: cython.int
+            edge_start: cython.int
+            edge_end: cython.int
+            test_tri: cython.int
 
-            # 遍历上一帧笔刷衰减圈内的所有命中顶点
-            for i in range(self.active_hit_count):
-                v_idx = self.active_hit_indices[i]
-                edge_start = self.v2f_offsets[v_idx]
-                edge_end = self.v2f_offsets[v_idx + 1]
+            # 🌟 必须加上 nogil，否则异步调用时会卡死 Maya 主线程
+            with cython.nogil:
+                for i in range(self.active_hit_count):
+                    v_idx = self.active_hit_indices[i]
+                    edge_start = self.v2f_offsets[v_idx]
+                    edge_end = self.v2f_offsets[v_idx + 1]
 
-                # 遍历该顶点连接的所有三角面 (通常是 3~6 个)
-                for j in range(edge_start, edge_end):
-                    test_tri = self.v2f_indices[j]
+                    for j in range(edge_start, edge_end):
+                        test_tri = self.v2f_indices[j]
 
-                    # 🌟 冗余防御 利用世代掩码 保证一帧内同一个面绝对只测试一次
-                    if _f_epochs[test_tri] == _curr_r_epoch:
-                        continue
-                    _f_epochs[test_tri] = _curr_r_epoch
+                        # 世代掩码：保证一帧内同一个面绝对只测一次
+                        if _f_epochs[test_tri] == _curr_r_epoch:
+                            continue
+                        _f_epochs[test_tri] = _curr_r_epoch
 
-                    # 读取三角面顶点坐标 (2D 读取模式)
-                    v0_idx = _tri_indices[test_tri, 0]
-                    v1_idx = _tri_indices[test_tri, 1]
-                    v2_idx = _tri_indices[test_tri, 2]
+                        v0_idx = _tri_indices[test_tri, 0]
+                        v1_idx = _tri_indices[test_tri, 1]
+                        v2_idx = _tri_indices[test_tri, 2]
+
+                        edge1_x = _points[v1_idx, 0] - _points[v0_idx, 0]
+                        edge1_y = _points[v1_idx, 1] - _points[v0_idx, 1]
+                        edge1_z = _points[v1_idx, 2] - _points[v0_idx, 2]
+
+                        edge2_x = _points[v2_idx, 0] - _points[v0_idx, 0]
+                        edge2_y = _points[v2_idx, 1] - _points[v0_idx, 1]
+                        edge2_z = _points[v2_idx, 2] - _points[v0_idx, 2]
+
+                        h_x = dir_y * edge2_z - dir_z * edge2_y
+                        h_y = dir_z * edge2_x - dir_x * edge2_z
+                        h_z = dir_x * edge2_y - dir_y * edge2_x
+
+                        a = edge1_x * h_x + edge1_y * h_y + edge1_z * h_z
+
+                        if cull_backface:
+                            # ---------------------------------------------
+                            # 🟢 模式 A：单面极速模式 (开启背面剔除 + 延迟除法)
+                            # ---------------------------------------------
+                            if a < 0.000001:
+                                continue
+
+                            s_x = orig_x - _points[v0_idx, 0]
+                            s_y = orig_y - _points[v0_idx, 1]
+                            s_z = orig_z - _points[v0_idx, 2]
+
+                            u_unscaled = s_x * h_x + s_y * h_y + s_z * h_z
+                            if u_unscaled < 0.0 or u_unscaled > a:
+                                continue
+
+                            q_x = s_y * edge1_z - s_z * edge1_y
+                            q_y = s_z * edge1_x - s_x * edge1_z
+                            q_z = s_x * edge1_y - s_y * edge1_x
+
+                            v_unscaled = dir_x * q_x + dir_y * q_y + dir_z * q_z
+                            if v_unscaled < 0.0 or u_unscaled + v_unscaled > a:
+                                continue
+
+                            t_unscaled = edge2_x * q_x + edge2_y * q_y + edge2_z * q_z
+
+                            # 深度裁剪：将 t 放大 a 倍后直接比较
+                            if t_unscaled < 0.000001 * a or t_unscaled > global_closest_t * a:
+                                continue
+
+                            # 结算：执行极其昂贵的除法
+                            f = 1.0 / a
+                            global_closest_t = t_unscaled * f
+                            global_hit_tri = test_tri
+                            global_u = u_unscaled * f
+                            global_v = v_unscaled * f
+                            
+                            cache_hit = True
+
+                        else:
+                            # ---------------------------------------------
+                            # 🔴 模式 B：双面安全模式 (无背面剔除)
+                            # ---------------------------------------------
+                            if a > -0.000001 and a < 0.000001:
+                                continue
+
+                            f = 1.0 / a
+                            
+                            s_x = orig_x - _points[v0_idx, 0]
+                            s_y = orig_y - _points[v0_idx, 1]
+                            s_z = orig_z - _points[v0_idx, 2]
+
+                            u = f * (s_x * h_x + s_y * h_y + s_z * h_z)
+                            if u < 0.0 or u > 1.0:
+                                continue
+
+                            q_x = s_y * edge1_z - s_z * edge1_y
+                            q_y = s_z * edge1_x - s_x * edge1_z
+                            q_z = s_x * edge1_y - s_y * edge1_x
+
+                            v = f * (dir_x * q_x + dir_y * q_y + dir_z * q_z)
+                            if v < 0.0 or u + v > 1.0:
+                                continue
+
+                            t = f * (edge2_x * q_x + edge2_y * q_y + edge2_z * q_z)
+
+                            if t < 0.000001 or t > global_closest_t:
+                                continue
+
+                            global_closest_t = t
+                            global_hit_tri = test_tri
+                            global_u = u
+                            global_v = v
+                            
+                            cache_hit = True
+
+
+        # =====================================================================
+        # 🛡️ 轨道二: 纯单线程暴力搜索 (带单/双面分支)
+        # =====================================================================
+        if not cache_hit:
+            # 🌟 释放 GIL，进入纯 C 单核模式
+            with cython.nogil:
+                for i in range(num_tris):
+                    v0_idx = _tri_indices[i, 0]
+                    v1_idx = _tri_indices[i, 1]
+                    v2_idx = _tri_indices[i, 2]
 
                     edge1_x = _points[v1_idx, 0] - _points[v0_idx, 0]
                     edge1_y = _points[v1_idx, 1] - _points[v0_idx, 1]
@@ -256,133 +356,77 @@ class CoreBrushEngine:
 
                     a = edge1_x * h_x + edge1_y * h_y + edge1_z * h_z
 
-                    # 射线与三角形平行
-                    if a > -0.0000001 and a < 0.0000001:
-                        continue
+                    if cull_backface:
+                        # ---------------------------------------------
+                        # 🟢 模式 A：单面极速模式 (开启背面剔除 + 延迟除法)
+                        # ---------------------------------------------
+                        if a < 0.000001:
+                            continue
 
-                    # 🌟 背面剔除 (Backface Culling) 防止薄片模型在拖拽时穿透画到背面
-                    if a < 0.0:
-                        continue
+                        s_x = orig_x - _points[v0_idx, 0]
+                        s_y = orig_y - _points[v0_idx, 1]
+                        s_z = orig_z - _points[v0_idx, 2]
 
-                    f = 1.0 / a
-                    s_x = orig_x - _points[v0_idx, 0]
-                    s_y = orig_y - _points[v0_idx, 1]
-                    s_z = orig_z - _points[v0_idx, 2]
+                        u_unscaled = s_x * h_x + s_y * h_y + s_z * h_z
+                        if u_unscaled < 0.0 or u_unscaled > a:
+                            continue
 
-                    u = f * (s_x * h_x + s_y * h_y + s_z * h_z)
-                    if u < 0.0 or u > 1.0:
-                        continue
+                        q_x = s_y * edge1_z - s_z * edge1_y
+                        q_y = s_z * edge1_x - s_x * edge1_z
+                        q_z = s_x * edge1_y - s_y * edge1_x
 
-                    q_x = s_y * edge1_z - s_z * edge1_y
-                    q_y = s_z * edge1_x - s_x * edge1_z
-                    q_z = s_x * edge1_y - s_y * edge1_x
+                        v_unscaled = dir_x * q_x + dir_y * q_y + dir_z * q_z
+                        if v_unscaled < 0.0 or u_unscaled + v_unscaled > a:
+                            continue
 
-                    v = f * (dir_x * q_x + dir_y * q_y + dir_z * q_z)
-                    if v < 0.0 or u + v > 1.0:
-                        continue
+                        t_unscaled = edge2_x * q_x + edge2_y * q_y + edge2_z * q_z
 
-                    t = f * (edge2_x * q_x + edge2_y * q_y + edge2_z * q_z)
+                        if t_unscaled < 0.000001 * a or t_unscaled > global_closest_t * a:
+                            continue
 
-                    # 记录并更新局部最小值
-                    if t > 0.000001 and t < global_closest_t:
+                        # 活到这里的绝对是最近点，花 CPU 周期执行除法
+                        f = 1.0 / a
+                        global_closest_t = t_unscaled * f
+                        global_hit_tri = i
+                        global_u = u_unscaled * f
+                        global_v = v_unscaled * f
+
+                    else:
+                        # ---------------------------------------------
+                        # 🔴 模式 B：双面安全模式 (无背面剔除)
+                        # ---------------------------------------------
+                        # 行列式 a 接近于 0 代表射线与面平行，无论正反面都要剔除
+                        if a > -0.000001 and a < 0.000001:
+                            continue
+
+                        # 因为 a 符号不定，必须提前执行除法统一计算符号
+                        f = 1.0 / a
+
+                        s_x = orig_x - _points[v0_idx, 0]
+                        s_y = orig_y - _points[v0_idx, 1]
+                        s_z = orig_z - _points[v0_idx, 2]
+
+                        u = f * (s_x * h_x + s_y * h_y + s_z * h_z)
+                        if u < 0.0 or u > 1.0:
+                            continue
+
+                        q_x = s_y * edge1_z - s_z * edge1_y
+                        q_y = s_z * edge1_x - s_x * edge1_z
+                        q_z = s_x * edge1_y - s_y * edge1_x
+
+                        v = f * (dir_x * q_x + dir_y * q_y + dir_z * q_z)
+                        if v < 0.0 or u + v > 1.0:
+                            continue
+
+                        t = f * (edge2_x * q_x + edge2_y * q_y + edge2_z * q_z)
+
+                        if t < 0.000001 or t > global_closest_t:
+                            continue
+
                         global_closest_t = t
-                        global_hit_tri = test_tri
+                        global_hit_tri = i
                         global_u = u
                         global_v = v
-                        cache_hit = True
-
-        # =====================================================================
-        # 🛡️ 轨道二 缓存未命中 启动 OpenMP 多核全量搜索兜底
-        # =====================================================================
-        if not cache_hit:
-            # 🌟 纯 Python 模式获取硬件线程数
-            hw_threads: cython.int = omp_get_max_threads()
-            active_threads: cython.int = hw_threads - 2
-
-            # 安全防线 保证线程数在合理范围内
-            if active_threads < 1:
-                active_threads = 1
-            elif active_threads > 128:
-                active_threads = 128
-
-            # OpenMP 线程本地缓存声明 (使用 cython.declare 分配 C 栈数组)
-            thread_closest_t = cython.declare(cython.float[128])
-            thread_hit_tri = cython.declare(cython.int[128])
-            thread_u = cython.declare(cython.float[128])
-            thread_v = cython.declare(cython.float[128])
-
-            # 初始化线程缓存
-            for i in range(128):
-                thread_closest_t[i] = 999999.0
-                thread_hit_tri[i] = -1
-                thread_u[i] = 0.0
-                thread_v[i] = 0.0
-
-            tid: cython.int  # 线程 ID
-
-            # 🌟 调度策略切换回 guided 用于 Profiler 性能测试对比
-            for i in prange(
-                num_tris, schedule="guided", num_threads=active_threads, nogil=True
-            ):
-                tid = omp_get_thread_num()
-                if tid >= 128:
-                    tid = 0
-
-                v0_idx = _tri_indices[i, 0]
-                v1_idx = _tri_indices[i, 1]
-                v2_idx = _tri_indices[i, 2]
-
-                edge1_x = _points[v1_idx, 0] - _points[v0_idx, 0]
-                edge1_y = _points[v1_idx, 1] - _points[v0_idx, 1]
-                edge1_z = _points[v1_idx, 2] - _points[v0_idx, 2]
-
-                edge2_x = _points[v2_idx, 0] - _points[v0_idx, 0]
-                edge2_y = _points[v2_idx, 1] - _points[v0_idx, 1]
-                edge2_z = _points[v2_idx, 2] - _points[v0_idx, 2]
-
-                h_x = dir_y * edge2_z - dir_z * edge2_y
-                h_y = dir_z * edge2_x - dir_x * edge2_z
-                h_z = dir_x * edge2_y - dir_y * edge2_x
-
-                a = edge1_x * h_x + edge1_y * h_y + edge1_z * h_z
-
-                # 行列式为 0 代表平行 忽略
-                if a > -0.0000001 and a < 0.0000001:
-                    continue
-
-                f = 1.0 / a
-                s_x = orig_x - _points[v0_idx, 0]
-                s_y = orig_y - _points[v0_idx, 1]
-                s_z = orig_z - _points[v0_idx, 2]
-
-                u = f * (s_x * h_x + s_y * h_y + s_z * h_z)
-                if u < 0.0 or u > 1.0:
-                    continue
-
-                q_x = s_y * edge1_z - s_z * edge1_y
-                q_y = s_z * edge1_x - s_x * edge1_z
-                q_z = s_x * edge1_y - s_y * edge1_x
-
-                v = f * (dir_x * q_x + dir_y * q_y + dir_z * q_z)
-                if v < 0.0 or u + v > 1.0:
-                    continue
-
-                t = f * (edge2_x * q_x + edge2_y * q_y + edge2_z * q_z)
-
-                # 每个线程只记录该物理核心计算出的一批面片中的最近点
-                if t > 0.000001 and t < thread_closest_t[tid]:
-                    thread_closest_t[tid] = t
-                    thread_hit_tri[tid] = i
-                    thread_u[tid] = u
-                    thread_v[tid] = v
-
-            # 🏁 数据归约 各线程上报结果 统筹出全局最近点
-            for i in range(128):
-                if thread_closest_t[i] < global_closest_t:
-                    global_closest_t = thread_closest_t[i]
-                    global_hit_tri = thread_hit_tri[i]
-                    global_u = thread_u[i]
-                    global_v = thread_v[i]
 
         # =====================================================================
         # 🏁 计算交点属性并返回
@@ -406,9 +450,7 @@ class CoreBrushEngine:
             raw_nz: cython.float = edge1_x * edge2_y - edge1_y * edge2_x  # 法线叉积 Z
 
             # 获取法线模长 (调用 C 标准库 sqrt 极限提速)
-            norm_len: cython.float = sqrt(
-                raw_nx * raw_nx + raw_ny * raw_ny + raw_nz * raw_nz
-            )
+            norm_len: cython.float = sqrt(raw_nx * raw_nx + raw_ny * raw_ny + raw_nz * raw_nz)
 
             nx: cython.float = raw_nx / norm_len if norm_len > 0.000001 else 0.0
             ny: cython.float = raw_ny / norm_len if norm_len > 0.000001 else 0.0
@@ -736,9 +778,7 @@ class BrushUndoRecorder:
         if undo_buffer is None:
             flat_size = vtx_count * self.channel_count
             c_undo_arr = (ctypes.c_float * flat_size)()
-            self.undo_buffer = memoryview(c_undo_arr).cast(
-                "f", shape=(vtx_count, self.channel_count)
-            )
+            self.undo_buffer = memoryview(c_undo_arr).cast("f", shape=(vtx_count, self.channel_count))
         else:
             self.undo_buffer = undo_buffer
 
@@ -860,9 +900,7 @@ class BrushUndoRecorder:
 
         # --- 通道压缩 ---
         # 1. 分配临时内存 标记被修改过的通道
-        channel_is_dirty: cython.p_char = cython.cast(
-            cython.p_char, calloc(_channel_count, cython.sizeof(cython.char))
-        )
+        channel_is_dirty: cython.p_char = cython.cast(cython.p_char, calloc(_channel_count, cython.sizeof(cython.char)))
 
         # 2. 遍历已记录的顶点 比较新旧数据差异
         modified_channel_count: cython.int = 0
@@ -1006,9 +1044,7 @@ class BrushMathEngine:
 
     # region ---------- Exec Math
     @cython.cfunc
-    def _execute_math_step(
-        self, brush_mode: cython.int, ctx: BrushMathContext
-    ) -> cython.void:
+    def _execute_math_step(self, brush_mode: cython.int, ctx: BrushMathContext) -> cython.void:
         """根据模式从映射表中获取函数并执行"""
         func = self._op_map.get(brush_mode)
         if func is not None:
@@ -1046,9 +1082,7 @@ class BrushMathEngine:
             fal = _f_buf[i]
             for j in range(c_count):
                 col = _ch_idx[j]
-                _array[row, col] = _clamp_float(
-                    _array[row, col] + (fal * _vals[j]), _min, _max
-                )
+                _array[row, col] = _clamp_float(_array[row, col] + (fal * _vals[j]), _min, _max)
 
     # endregion
     # region ---------- Sub
@@ -1079,9 +1113,7 @@ class BrushMathEngine:
             fal = _f_buf[i]
             for j in range(c_count):
                 col = _ch_idx[j]
-                _array[row, col] = _clamp_float(
-                    _array[row, col] - (fal * _vals[j]), _min, _max
-                )
+                _array[row, col] = _clamp_float(_array[row, col] - (fal * _vals[j]), _min, _max)
 
     # endregion
     # region ---------- Replace
@@ -1114,9 +1146,7 @@ class BrushMathEngine:
             for j in range(c_count):
                 col = _ch_idx[j]
                 cur = _array[row, col]
-                _array[row, col] = _clamp_float(
-                    cur + (_vals[j] - cur) * fal, _min, _max
-                )
+                _array[row, col] = _clamp_float(cur + (_vals[j] - cur) * fal, _min, _max)
 
     # endregion
     # region ---------- Mul
@@ -1149,9 +1179,7 @@ class BrushMathEngine:
             for j in range(c_count):
                 col = _ch_idx[j]
                 cur = _array[row, col]
-                _array[row, col] = _clamp_float(
-                    cur + (cur * _vals[j] - cur) * fal, _min, _max
-                )
+                _array[row, col] = _clamp_float(cur + (cur * _vals[j] - cur) * fal, _min, _max)
 
     # endregion
     # region ---------- Smooth
@@ -1162,9 +1190,7 @@ class BrushMathEngine:
     @cython.ccall
     def _math_smooth(self, ctx: BrushMathContext) -> cython.void:
         if self.adj_offsets is None or self.adj_indices is None:
-            raise RuntimeError(
-                "Smooth Error: Topology (adj_offsets/indices) is not initialized."
-            )
+            raise RuntimeError("Smooth Error: Topology (adj_offsets/indices) is not initialized.")
 
         # 拓扑专用变量声明
         i: cython.int = 0
@@ -1509,9 +1535,7 @@ class UtilBrushProcessor:
 
     # region ---------- Brush Get/Set
     @cython.ccall
-    def get_custom_array(
-        self, vertex_indices=None, channel_indices=None
-    ) -> array.array:
+    def get_custom_array(self, vertex_indices=None, channel_indices=None) -> array.array:
         """提取指定范围的数据副本。"""
         return self.math_engine.get_custom_array(vertex_indices, channel_indices)
 

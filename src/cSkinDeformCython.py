@@ -106,7 +106,7 @@ def _run_skinning_core(
     out_y: cython.float  # output y
     out_z: cython.float  # output z
 
-    for v in prange(num_verts):
+    for v in range(num_verts): # or prange
         x = ori_pts[v * 3 + 0]
         y = ori_pts[v * 3 + 1]
         z = ori_pts[v * 3 + 2]

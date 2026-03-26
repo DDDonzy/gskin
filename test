@@ -1,0 +1,29 @@
+cSkin 
+    多线程 
+        57.5 Fps
+        551 us - cython deform
+    单线程
+        52 Fps
+        2348 us  - cython deform
+
+
+raycast 全量扫描 旧版本
+    单线程
+        11240 us
+    多线程
+        1189 us
+
+
+raycast 优化全量扫描，忽略背面
+    单线程
+        6960 us
+
+
+raycast 优化全量扫描，不忽略背面
+    单线程
+        8612 us
+
+
+raycast 上次局部扫描，不忽略背面
+    单线程
+        510 us
