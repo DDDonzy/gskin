@@ -8,6 +8,7 @@ import maya.api.OpenMayaUI as omui
 from ._cRegistry import SkinRegistry
 from .cBrushInterpolator import LinearStrokeInterpolator
 from .cBrushManager import WeightBrushManager
+from ._cProfilerCython import MayaNativeProfiler, maya_profile
 
 import math
 from typing import TYPE_CHECKING
@@ -62,12 +63,14 @@ class WeightBrushContext(omui.MPxContext):
 
     # === Event
 
+    @maya_profile(0, "doHover")
     def doPtrMoved(self, event, drawMgr, context):
         """悬停阶段 单次检测与高亮"""
-        # get local ray & ray_dir
-        ray_src, ray_dir = self._get_ray_from_screen(*event.position)
-        #  raycast
-        is_hit, hit_pos, hit_normal, _ = self.brush_manager.raycast(ray_src, ray_dir)
+        with MayaNativeProfiler('raycast',1):
+            # get local ray & ray_dir
+            ray_src, ray_dir = self._get_ray_from_screen(*event.position)
+            #  raycast
+            is_hit, hit_pos, hit_normal, _ = self.brush_manager.raycast(ray_src, ray_dir)
         # draw cursor
         if is_hit:
             self.draw_cursor((True, hit_pos, hit_normal), drawMgr)
@@ -160,6 +163,7 @@ class WeightBrushContext(omui.MPxContext):
         ray_dir_obj = self._ray_direction * inv_matrix
         return tuple(ray_src_obj)[0:3], tuple(ray_dir_obj)
 
+    @maya_profile(1, "drawCursor")
     def draw_cursor(self, hit_result, drawMgr):
         """专门负责解析结果 更新光标位置 并通知 Maya 刷新画面"""
         if not hit_result:
@@ -222,7 +226,8 @@ class WeightBrushContext(omui.MPxContext):
 
     def refresh(self):
         # 刷新 view 视图
-        self._view.refresh(False, True)
+        self._view.refresh(False, False)
+        pass
 
     def _into_brush(self):
         try:

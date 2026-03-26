@@ -11,7 +11,6 @@ from gskin._debug.convert import get_skinWeights, convert_skin_to_cSkin
 from gskin.src._cRegistry import SkinRegistry
 import numpy as np
 
-from z_np.src.cBrushCore import BrushHitState
 
 
 maya_file = r"C:/Users/ext.dxu/Desktop/ng_test.ma"
@@ -50,6 +49,20 @@ if cmds.contextInfo("cBrush", exists=True):
     cmds.deleteUI("cBrush", toolContext=True)
 
 
+
+
+
+from gskin.src.cBrushManager import BrushSettings
+
+BrushSettings.radius = 2
+
+
+cmds.setAttr("triangleShape1.drawLines", 0)
+cmds.setAttr("triangleShape1.drawPoints", 0)
+cmds.setAttr("pCube1.visibility", 0)
+
+
+
 cmds.select("pCube1")
 
 if not cmds.contextInfo("cBrush", exists=True):
@@ -58,8 +71,3 @@ if not cmds.contextInfo("cBrush", exists=True):
 
 cmds.setToolTo("cBrush")
 
-
-
-from gskin.src.cBrushManager import BrushSettings
-
-BrushSettings.radius = 10

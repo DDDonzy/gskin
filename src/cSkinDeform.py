@@ -134,7 +134,7 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         # --- influences
         self.influences_count        : int           = 0
         self.influences_locks_buffer : BufferManager = None
-        
+
         # --- current paint data
         self.layer_index      :int  = -1
         self.is_mask          :bool = False
@@ -461,7 +461,10 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
 
         with MayaNativeProfiler("Update Weights", 2):
             if self.isDirty_weights:
+                # 更新权重layer数据
                 self.weights_manager.sync_layer_cache(dataBlock)
+                # 执行异步权重修改
+                # 为了优化性能, 权重修改是放在deform内部进行, 通过dataBlock拿到rawPoint直接修改内存, 而非外部直接修改mPlug
                 self.weights_manager.execute_deferred_tasks()
 
                 self.isDirty_weights = True
