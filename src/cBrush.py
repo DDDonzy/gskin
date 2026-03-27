@@ -30,13 +30,14 @@ class WeightBrushContext(omui.MPxContext):
     brushLine = 2.0
     brushColor = om.MColor((1.0, 0.5, 0.0, 1.0))
     brushPresColor = om.MColor((1.0, 1.0, 1.0, 1.0))
+    brush_spacing_ratio = 0.2  # 笔刷半径的 15%
 
     def __init__(self):
         super().__init__()
 
         # 核心管理器与追踪器
         self.brush_manager: WeightBrushManager = None
-        self.brush_spacing_ratio = 1  # 笔刷半径的 15%
+        
         self.stroke_tracker = LinearStrokeInterpolator()
 
         # 视口与网格上下文

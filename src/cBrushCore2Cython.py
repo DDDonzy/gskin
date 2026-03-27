@@ -319,8 +319,8 @@ class CoreBrushEngine:
         # =====================================================================
         # 🚀 轨道一一二V2F 局部空间拦截 (((基于falloff）
         # =====================================================================
+        # region --- plan 2
         if not cache_hit and self.active_hit_count > 0:
-            print("plan 2")
             _curr_r_epoch: cython.int = self.raycast_epoch
             _f_epochs = self.faces_epochs
 
@@ -436,10 +436,12 @@ class CoreBrushEngine:
                             global_v = v
 
                             cache_hit = True
+        # endregion
 
         # =====================================================================
         # 🛡️ 轨道二二三纯单线程极致暴力盲扫 (缓存未命中或首笔落下时触发)
         # =====================================================================
+        # region --- plan 3
         if not cache_hit:
             with cython.nogil:
                 for i in range(num_tris):
@@ -523,6 +525,7 @@ class CoreBrushEngine:
                         global_hit_tri = i
                         global_u = u
                         global_v = v
+        # endregion
 
         # =====================================================================
         # 🏁 结算并记录本次命中，反哺下一帧缓存
