@@ -7,8 +7,7 @@ import maya.api.OpenMayaUI as omui
 
 from ._cRegistry import SkinRegistry
 from .cBrushInterpolator import LinearStrokeInterpolator
-from .cBrushManager import WeightBrushManager
-from ._cProfilerCython import MayaNativeProfiler, maya_profile
+from .cBrushManager import WeightBrushManager, BrushSettings
 
 import math
 from typing import TYPE_CHECKING
@@ -30,14 +29,13 @@ class WeightBrushContext(omui.MPxContext):
     brushLine = 2.0
     brushColor = om.MColor((1.0, 0.5, 0.0, 1.0))
     brushPresColor = om.MColor((1.0, 1.0, 1.0, 1.0))
-    brush_spacing_ratio = 0.2  # 笔刷半径的 15%
 
     def __init__(self):
         super().__init__()
 
         # 核心管理器与追踪器
         self.brush_manager: WeightBrushManager = None
-        
+
         self.stroke_tracker = LinearStrokeInterpolator()
 
         # 视口与网格上下文
@@ -64,16 +62,12 @@ class WeightBrushContext(omui.MPxContext):
 
     # === Event
 
-    @maya_profile(0, "doHover")
     def doPtrMoved(self, event, drawMgr, context):
         """悬停阶段 单次检测与高亮"""
-        with MayaNativeProfiler("raycast", 1):
-            with MayaNativeProfiler("raycast_xy-to_vector", 1):
-                # get local ray & ray_dir
-                ray_src, ray_dir = self._get_ray_from_screen(*event.position)
-            with MayaNativeProfiler("cython-raycast", 1):
-                #  raycast
-                is_hit, hit_pos, hit_normal, _ = self.brush_manager.raycast(ray_src, ray_dir)
+        # get local ray & ray_dir
+        ray_src, ray_dir = self.get_ray_from_screen(*event.position)
+        #  raycast
+        is_hit, hit_pos, hit_normal, _ = self.brush_manager.raycast(ray_src, ray_dir)
         # draw cursor
         if is_hit:
             self.draw_cursor((True, hit_pos, hit_normal), drawMgr)
@@ -91,18 +85,10 @@ class WeightBrushContext(omui.MPxContext):
 
         last_hit_result = None
         for x, y in interp_points:
-            with MayaNativeProfiler("raycast", 1):
-                with MayaNativeProfiler("raycast_xy-to_vector", 1):
-                    ray_src, ray_dir = self._get_ray_from_screen(x, y)
-                with MayaNativeProfiler("cython-raycast", 1):
-                    # raycast
-                    is_hit, hit_pos, hit_normal, hit_tri = self.brush_manager.raycast(ray_src, ray_dir)
-            if is_hit:
-                # apply brush
-                self.brush_manager.apply_brush(hit_pos, hit_tri, "press")
-                last_hit_result = (True, hit_pos, hit_normal)
+            ray_src, ray_dir = self.get_ray_from_screen(x, y)
+            last_hit_result = self.brush_manager.stroke(ray_src, ray_dir, is_pressed=True)
 
-        if last_hit_result:
+        if last_hit_result[0] is True:
             self._update_dynamic_spacing(last_hit_result)
             self.draw_cursor(last_hit_result, drawMgr)
 
@@ -111,59 +97,30 @@ class WeightBrushContext(omui.MPxContext):
 
         # brush path interpolator
         interp_points = self.stroke_tracker.drag_stroke(*event.position)
+        interp_points_is_empty = not interp_points
 
-        # 记录给光标用的最终结果
-        final_cursor_hit = None
-        if interp_points:
-            for x, y in interp_points:
-                with MayaNativeProfiler("raycast", 1):
-                    with MayaNativeProfiler("raycast_xy-to_vector", 1):
-                        ray_src, ray_dir = self._get_ray_from_screen(x, y)
-                    with MayaNativeProfiler("cython-raycast", 1):
-                        # raycast
-                        is_hit, hit_pos, hit_normal, hit_tri = self.brush_manager.raycast(ray_src, ray_dir)
-                if is_hit:
-                    # apply brush
-                    self.brush_manager.apply_brush(hit_pos, hit_tri, "drag")
-                    final_cursor_hit = (True, hit_pos, hit_normal)
+        if not interp_points:
+            interp_points = [event.position]
 
-            if final_cursor_hit:
-                self._update_dynamic_spacing(final_cursor_hit)
+        for x, y in interp_points:
+            ray_src, ray_dir = self.get_ray_from_screen(x, y)
+            # raycast
+            self.brush_manager.stroke(ray_src, ray_dir, is_pressed=not interp_points_is_empty)
+
+        # draw
+        draw_raycast = self.brush_manager.raycast(*self.get_ray_from_screen(*event.position))
+        if draw_raycast[0] is True:
+            _ = (draw_raycast[0], draw_raycast[1], draw_raycast[2])
+            self._update_dynamic_spacing(_)
+            self.draw_cursor(_, drawMgr)
         else:
-            with MayaNativeProfiler("raycast", 1):
-                with MayaNativeProfiler("raycast_xy-to_vector", 1):
-                    ray_src, ray_dir = self._get_ray_from_screen(*event.position)
-                with MayaNativeProfiler("cython-raycast", 1):
-                    # raycast
-                    is_hit, hit_pos, hit_normal, hit_tri = self.brush_manager.raycast(ray_src, ray_dir)
-            if is_hit:
-                final_cursor_hit = (True, hit_pos, hit_normal)
-
-        if final_cursor_hit:
-            self.draw_cursor(final_cursor_hit, drawMgr)
+            self.refresh()
 
     def doRelease(self, event, drawMgr, context):
         """松开阶段 强制闭合端点并提交撤销栈"""
         self._isPressed = False
 
-        interp_points = self.stroke_tracker.end_stroke(*event.position)
-
-        last_hit_result = None
-        if interp_points:
-            for x, y in interp_points:
-                with MayaNativeProfiler("raycast", 1):
-                    with MayaNativeProfiler("raycast_xy-to_vector", 1):
-                        ray_src, ray_dir = self._get_ray_from_screen(x, y)
-                    with MayaNativeProfiler("cython-raycast", 1):
-                        # raycast
-                        is_hit, hit_pos, hit_normal, hit_tri = self.brush_manager.raycast(ray_src, ray_dir)
-
-                if is_hit:
-                    self.brush_manager.apply_brush(hit_pos, hit_tri, "drag")
-                    last_hit_result = (True, hit_pos, hit_normal)
-
-        if last_hit_result:
-            self.draw_cursor(last_hit_result, drawMgr)
+        self.stroke_tracker.end_stroke(*event.position)
 
         if self.brush_manager:
             self.brush_manager.end_stroke()
@@ -171,7 +128,7 @@ class WeightBrushContext(omui.MPxContext):
 
     # ==============================================================================
 
-    def _get_ray_from_screen(self, screen_x: float, screen_y: float) -> tuple:
+    def get_ray_from_screen(self, screen_x: float, screen_y: float) -> tuple:
         """辅助函数：将屏幕 2D 坐标转换为局部空间的射线 (source, dir)"""
         self._view.viewToWorld(int(screen_x), int(screen_y), self._ray_source, self._ray_direction)
         inv_matrix = self.mesh_dag_path.inclusiveMatrixInverse()
@@ -179,7 +136,6 @@ class WeightBrushContext(omui.MPxContext):
         ray_dir_obj = self._ray_direction * inv_matrix
         return tuple(ray_src_obj)[0:3], tuple(ray_dir_obj)
 
-    @maya_profile(1, "drawCursor")
     def draw_cursor(self, hit_result, drawMgr):
         """专门负责解析结果 更新光标位置 并通知 Maya 刷新画面"""
         if not hit_result:
@@ -213,7 +169,7 @@ class WeightBrushContext(omui.MPxContext):
         _, hit_pos_obj, _ = hit_result
         radius_3d = self.brush_manager.settings.radius
 
-        spacing_percentage = self.brush_spacing_ratio
+        spacing_percentage = BrushSettings.brush_spacing_ratio
 
         # 1. 局部坐标转世界坐标
         world_matrix = self.mesh_dag_path.inclusiveMatrix()
@@ -242,7 +198,7 @@ class WeightBrushContext(omui.MPxContext):
 
     def refresh(self):
         # 刷新 view 视图
-        self._view.refresh(False, False)
+        self._view.refresh(False, True)
         pass
 
     def _into_brush(self):

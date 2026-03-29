@@ -147,6 +147,7 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         self.isDirty_inputGeometry    : bool = True
         self.isDirty_bindPreMatrix    : bool = True
         self.isDirty_influencesMatrix : bool = True
+        self.isDirty_brushFastPreview : bool = False
 
         # --------------------
         self._geo_matrix             : om1.MMatrix = None
@@ -158,6 +159,7 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         self._rotateMatrix_buffer        : BufferManager = None
         self._translateVector_buffer     : BufferManager = None
 
+        self.rawPoints_original = None
         self._skinWeights = None
         # fmt:on
 
@@ -366,7 +368,7 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
 
         return self.layer_index, self.is_mask, self.influences_index, weights_view[safe_idx::inf_count]
 
-    @maya_profile(0, "Compute")
+    @maya_profile("Compute", 0)
     def compute(self, plug, dataBlock):
         """
         很蛋疼的是`DG`模式下 如果`.outputGeometry[i]`输出给多个模型
@@ -387,12 +389,15 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         self.isDirty = False
         return res
 
-    @maya_profile(0, "Deform")
-    def deform(self, dataBlock: om1.MDataBlock, geoIter, localToWorldMatrix, multiIndex):  # noqa: ARG002
-        envelope = dataBlock.inputValue(ompx.cvar.MPxGeometryFilter_envelope).asFloat()
+    @maya_profile("Deform", 0)
+    def deform(self, dataBlock: om1.MDataBlock, geoIter, localToWorldMatrix, multiIndex):
+
+        self.isDirty_brushFastPreview = False
+
+        self.envelope_value = dataBlock.inputValue(ompx.cvar.MPxGeometryFilter_envelope).asFloat()
 
         with MayaNativeProfiler("in-geo-object", 2):
-            input_handle = dataBlock.outputArrayValue(ompx.cvar.MPxGeometryFilter_input)
+            input_handle = dataBlock.inputArrayValue(ompx.cvar.MPxGeometryFilter_input)
             input_handle.jumpToElement(multiIndex)
             _input_geom_obj = input_handle.outputValue().child(ompx.cvar.MPxGeometryFilter_inputGeom)
             input_geom_obj = _input_geom_obj.asMesh()
@@ -406,16 +411,29 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         if input_geom_obj.isNull() or output_geom_obj.isNull():
             return
 
-        with MayaNativeProfiler("fnMesh-in", 3):
-            mFnMesh_in = om1.MFnMesh(input_geom_obj)
-            vertex_count = mFnMesh_in.numVertices()
-            rawPoints_original = BufferManager.from_ptr(int(mFnMesh_in.getRawPoints()), "f", (vertex_count * 3,))
-        with MayaNativeProfiler("update-topology", 3):
-            self.update_topology(mFnMesh_in)
-
-        with MayaNativeProfiler("out-fnMesh", 6):
+        with MayaNativeProfiler("fnMesh-out", 6):
             mFnMesh_out = om1.MFnMesh(output_geom_obj)
+            vertex_count = mFnMesh_out.numVertices()
             self.mesh_context.vertex_positions = BufferManager.from_ptr(int(mFnMesh_out.getRawPoints()), "f", (vertex_count * 3,))
+
+        with MayaNativeProfiler("update-topology", 3):
+            self.update_topology(mFnMesh_out)
+
+        with MayaNativeProfiler("fnMesh-in", 3):
+            if (self.isDirty_inputGeometry is True 
+                or self.rawPoints_original is None 
+                or self.rawPoints_original.shape[0] != vertex_count * 3):  # fmt:off
+                if self.rawPoints_original is None or self.rawPoints_original.shape[0] != vertex_count * 3:
+                    # 没有原始数据 or topology 变了才申请内存
+                    self.rawPoints_original = BufferManager.allocate("f", (vertex_count * 3,))
+                #  将原始数据复制到 original 内存中
+                mFnMesh_in = om1.MFnMesh(input_geom_obj)
+                ctypes.memmove(
+                    self.rawPoints_original.ptr,
+                    int(mFnMesh_in.getRawPoints()),
+                    vertex_count * 3 * ctypes.sizeof(ctypes.c_float),
+                )
+                self.isDirty_inputGeometry = False
 
         with MayaNativeProfiler("influences allocate", 4):
             influences_handle = dataBlock.inputArrayValue(self.aInfluenceMatrix)
@@ -486,13 +504,45 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
 
         with MayaNativeProfiler("Cython Cal skin", 3):
             cSkinDeformCython.run_skinning_core(
-                rawPoints_original.view,
+                self.rawPoints_original.view,
                 self.mesh_context.vertex_positions.view,
                 self._skinWeights,
                 self._rotateMatrix_buffer.view,
                 self._translateVector_buffer.view,
-                envelope,
+                self.envelope_value,
             )
+
+    def fast_preview_deform(self, hit_indices: memoryview | None = None, hit_count: int = 0):
+        """
+        局部蒙皮算法, 专供笔刷调用
+        根据笔刷的 hit_indices 和 hit_count 来局部计算蒙皮,
+        不唤醒 deform 函数, 不触发maya dg, 直接通知渲染节点更新
+        """
+
+        if hit_count <= 0 or hit_indices is None:
+            return
+
+        # 检查上一帧的缓存是否真的存在避免还没经过 deform 就强行刷笔刷
+        if (   self._skinWeights            is None 
+            or self.rawPoints_original      is None 
+            or self._rotateMatrix_buffer    is None 
+            or self._translateVector_buffer is None):  # fmt:skip
+            return
+
+        valid_indices_view = hit_indices[:hit_count]
+
+        # 局部极速蒙皮 复用上一帧的矩阵和源点
+        cSkinDeformCython.run_partial_skinning_core(
+            valid_indices_view,
+            self.rawPoints_original.view,
+            self.mesh_context.vertex_positions.view,
+            self._skinWeights,
+            self._rotateMatrix_buffer.view,
+            self._translateVector_buffer.view,
+            self.envelope_value,
+        )
+        # 更新脏标记
+        self.isDirty_brushFastPreview = True
 
     @classmethod
     def nodeInitializer(cls):

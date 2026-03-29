@@ -106,7 +106,7 @@ def _run_skinning_core(
     out_y: cython.float  # output y
     out_z: cython.float  # output z
 
-    for v in range(num_verts): # or prange
+    for v in range(num_verts):  # or prange
         x = ori_pts[v * 3 + 0]
         y = ori_pts[v * 3 + 1]
         z = ori_pts[v * 3 + 2]
@@ -128,6 +128,67 @@ def _run_skinning_core(
             out_y = (out_y - y) * envelope + y
             out_z = (out_z - z) * envelope + z
 
+        out_pts[v * 3 + 0] = out_x
+        out_pts[v * 3 + 1] = out_y
+        out_pts[v * 3 + 2] = out_z
+
+
+@cython.cfunc
+@cython.boundscheck(False)
+@cython.wraparound(False)
+@cython.cdivision(True)
+@cython.exceptval(check=False)  # 等同于 noexcept
+@cython.nogil
+def _run_partial_skinning_core(
+    hit_indices: cython.p_int,  # 🌟 新增：受影响的顶点索引池
+    hit_count: cython.int,  # 🌟 新增：受影响的顶点数量
+    ori_pts: cython.p_float,
+    out_pts: cython.p_float,
+    weights: cython.p_float,
+    m_rot: cython.p_float,
+    m_trans: cython.p_float,
+    num_bones: cython.int,
+    envelope: cython.float,
+) -> cython.void:
+    """局部蒙皮 C 级内核：只计算被传入的顶点索引，极限榨取性能"""
+
+    i: cython.int  # 循环索引
+    v: cython.int  # 实际顶点 ID
+    b: cython.int  # bone index
+    w: cython.float  # weight
+    x: cython.float  # original x
+    y: cython.float  # original y
+    z: cython.float  # original z
+    out_x: cython.float  # output x
+    out_y: cython.float  # output y
+    out_z: cython.float  # output z
+
+    # 🌟 核心区别：不再遍历所有顶点，只遍历 hit_indices 中的有效索引
+    for i in range(hit_count):
+        v = hit_indices[i]
+
+        x = ori_pts[v * 3 + 0]
+        y = ori_pts[v * 3 + 1]
+        z = ori_pts[v * 3 + 2]
+        out_x = 0.0
+        out_y = 0.0
+        out_z = 0.0
+
+        for b in range(num_bones):
+            w = weights[v * num_bones + b]
+            if w < 0.000001:
+                continue
+
+            out_x += w * (x * m_rot[b * 9 + 0] + y * m_rot[b * 9 + 3] + z * m_rot[b * 9 + 6] + m_trans[b * 3 + 0])
+            out_y += w * (x * m_rot[b * 9 + 1] + y * m_rot[b * 9 + 4] + z * m_rot[b * 9 + 7] + m_trans[b * 3 + 1])
+            out_z += w * (x * m_rot[b * 9 + 2] + y * m_rot[b * 9 + 5] + z * m_rot[b * 9 + 8] + m_trans[b * 3 + 2])
+
+        if envelope != 1.0:
+            out_x = (out_x - x) * envelope + x
+            out_y = (out_y - y) * envelope + y
+            out_z = (out_z - z) * envelope + z
+
+        # 🌟 直接将算好的新坐标就地覆写进输出数组 (共享内存)
         out_pts[v * 3 + 0] = out_x
         out_pts[v * 3 + 1] = out_y
         out_pts[v * 3 + 2] = out_z
@@ -199,6 +260,47 @@ def run_skinning_core(
         rot_ptr,
         trans_ptr,
         num_verts,
+        num_bones,
+        envelope,
+    )
+
+
+def run_partial_skinning_core(
+    hit_indices_view: cython.int[:],  # 🌟 新增传入的索引切片
+    ori_pts_view: cython.float[:],
+    out_pts_view: cython.float[:],
+    weights_view: cython.float[:],
+    rot_view: cython.float[:, :],
+    trans_view: cython.float[:, :],
+    envelope: cython.float,
+):
+    """供 Python 调用的局部蒙皮核心解算入口，完全基于 MemoryView"""
+
+    # 自动获取需要计算的顶点数量
+    hit_count: cython.int = hit_indices_view.shape[0]
+    if hit_count == 0:
+        return
+
+    # 自动获取骨骼数
+    num_bones: cython.int = trans_view.shape[0]
+
+    # 提取底层原生 C 指针
+    hit_ptr = cython.cast(cython.p_int, cython.address(hit_indices_view[0]))
+    ori_ptr = cython.cast(cython.p_float, cython.address(ori_pts_view[0]))
+    out_ptr = cython.cast(cython.p_float, cython.address(out_pts_view[0]))
+    w_ptr = cython.cast(cython.p_float, cython.address(weights_view[0]))
+    rot_ptr = cython.cast(cython.p_float, cython.address(rot_view[0, 0]))
+    trans_ptr = cython.cast(cython.p_float, cython.address(trans_view[0, 0]))
+
+    # 调用无 GIL 的纯 C 内核
+    _run_partial_skinning_core(
+        hit_ptr,
+        hit_count,
+        ori_ptr,
+        out_ptr,
+        w_ptr,
+        rot_ptr,
+        trans_ptr,
         num_bones,
         envelope,
     )

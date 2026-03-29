@@ -1,3 +1,4 @@
+from __future__ import annotations
 import ctypes
 from contextlib import contextmanager
 
@@ -10,6 +11,8 @@ from gskin.src import cColorCython as cColor
 from gskin.src._cProfilerCython import MayaNativeProfiler, maya_profile
 
 from typing import TYPE_CHECKING
+
+from gskin.src.cSkinContext import BrushHitContext
 
 if TYPE_CHECKING:
     from gskin.src.cSkinDeform import CythonSkinDeformer
@@ -192,6 +195,7 @@ class TriangleShape(om.MPxSurfaceShape):
         self.render_data = RenderData()  # 挂载数据中心
         # 预先储存好包围盒,避免每帧重复创建对象
         self._boundingBox = om.MBoundingBox(om.MPoint(-100, -100, -100), om.MPoint(100, 100, 100))
+        self.cSkin: CythonSkinDeformer = None
 
     @classmethod
     def creator(cls):
@@ -366,6 +370,36 @@ class TriangleShape(om.MPxSurfaceShape):
             with MayaNativeProfiler("render-compute-get-setClean", 4):
                 dataBlock.outputValue(TriangleShape.outDummyAttr).setClean()
 
+    def get_cSkin_instance(self) -> CythonSkinDeformer | None:
+        """通过连接线直接获取 cSkin 的 Python 实例，绝不触发 DG 求值"""
+        plug = om.MPlug(self.thisMObject(), TriangleShape.inMeshAttr)
+        if plug.isConnected:
+            conns = plug.connectedTo(True, False)
+            if conns:
+                return SkinRegistry.get_instance_by_api2(conns[0].node())
+        return None
+
+    def fast_sync_from_cSkin(self, cSkin: CythonSkinDeformer):
+        """绕开 dataBlock，直接将 C 内存引用甩给 GPU"""
+        render_data = self.render_data
+
+        # 1. 笔刷高亮与权重数据指针同步 因为内存是 BufferManager 分配的，指针永远有效
+        _, render_data.is_mask, _, render_data.paint_weights_view = cSkin.get_active_paint_weights()
+
+        brush_ctx: BrushHitContext = getattr(cSkin, "brush_context", None)
+        if brush_ctx and brush_ctx.is_valid:
+            render_data.brush_hit_indices = brush_ctx.hit_indices
+            render_data.brush_hit_weights = brush_ctx.hit_weights
+            render_data.brush_hit_count = brush_ctx.hit_count
+        else:
+            render_data.brush_hit_count = 0
+
+        # 强行打上 GPU 脏标 只通知 GPU 去搬运内存 绝不触发 DG
+        render_data.dirty_vertices_pos = True
+        render_data.dirty_face_colors = True
+        render_data.dirty_line_colors = True
+        render_data.dirty_point_colors = True
+
     def _update_from_cSkin(self, dataBlock):
         """管线接线员:获取上游内存并刷新渲染上下文数据,使用前置判定消灭深层嵌套"""
 
@@ -373,14 +407,11 @@ class TriangleShape(om.MPxSurfaceShape):
             dataBlock.inputValue(TriangleShape.inMeshAttr)
 
         # region Get cSkin
-        cSkin_plug: om.MPlug = om.MPlug(self.thisMObject(), TriangleShape.inMeshAttr)
-        if not cSkin_plug.isConnected:
+        cSkin = self.get_cSkin_instance()
+        self.cSkin = cSkin
+        if not cSkin:
             return
-        conns = cSkin_plug.connectedTo(True, False)
-        if not conns:
-            return
-        cSkin_node = conns[0].node()
-        cSkin: CythonSkinDeformer = SkinRegistry.get_instance_by_api2(cSkin_node)
+        self.cSkin._render_shape_obj = self.thisMObject()
         # endregion
 
         if not cSkin or getattr(cSkin, "mesh_context", None) is None:
@@ -734,12 +765,20 @@ class TriangleOverride(omr.MPxSubSceneOverride):
 
     def update(self, container, frameContext):
         with MayaNativeProfiler("render-update", 2):
-            with MayaNativeProfiler("render-update-dg", 4):
-                # 1. 拉取 dummy 属性触发 DG 依赖脏标更新
-                om.MPlug(self.node_obj, TriangleShape.outDummyAttr).asInt()
-            with MayaNativeProfiler("render-update-userNode-data", 4):
-                shape_inst: TriangleShape = om.MFnDependencyNode(self.node_obj).userNode()
-                render_data: RenderData = shape_inst.render_data
+            shape_inst: TriangleShape = om.MFnDependencyNode(self.node_obj).userNode()
+            render_data: RenderData = shape_inst.render_data
+
+            cSkin = shape_inst.cSkin
+
+            if cSkin and getattr(cSkin, "isDirty_brushFastPreview", False):
+                # 如果存在 cSkin，且笔刷快速预览脏标为 True, 说明笔刷调用过局部蒙皮计算,直接渲染
+                with MayaNativeProfiler("render-update-fast-path", 3):
+                    shape_inst.fast_sync_from_cSkin(cSkin)
+                    cSkin.isDirty_brushFastPreview = False
+            else:
+                # 否则通过maya dg 获取触发全量蒙皮计算, 然后渲染
+                with MayaNativeProfiler("render-update-dg", 4):
+                    om.MPlug(self.node_obj, TriangleShape.outDummyAttr).asInt()
 
             with MayaNativeProfiler("render-update-buffer", 4):
                 # 2. 初始 RenderItem 与 GPU缓冲 创建

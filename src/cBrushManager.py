@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from . import apiundo
 from .cBufferManager import BufferManager
 from . import cBrushCore2Cython as cBrushCoreCython
+from ._cProfilerCython import MayaNativeProfiler, maya_profile
 
 
 if typing.TYPE_CHECKING:
@@ -22,12 +23,13 @@ class BrushSettings:
     """存放笔刷半径、强度、模式等用户 UI 配置。"""
 
     # fmt:off
-    radius      : float = 1
-    strength    : float = 0.1
-    iter        : int   = 10
-    falloff_type: int   = 1     # 0:Linear, 1:Airbrush, 2:Solid, 3:Dome, 4:Spike
-    mode        : int   = 0     # 0:Add, 1:Sub, 2:Replace, 3:Multiply, 4:Smooth, 5:Sharp
-    use_surface : bool  = True
+    radius              : float = 1
+    strength            : float = 0.1
+    iter                : int   = 10
+    falloff_type        : int   = 1     # 0:Linear, 1:Airbrush, 2:Solid, 3:Dome, 4:Spike
+    mode                : int   = 0     # 0:Add, 1:Sub, 2:Replace, 3:Multiply, 4:Smooth, 5:Sharp
+    brush_spacing_ratio : float = 0.1
+    use_surface         : bool  = True
     # fmt:on
 
 
@@ -68,6 +70,9 @@ class WeightBrushManager:
         self.active_processor: cBrushCoreCython.SkinWeightProcessor = None
         self.active_handle = None
         self.active_influence_idx = 0
+
+        # brush
+        self.prev_hit_position: tuple | None = None
 
     def clear_hit_state(self):
         """清空高亮状态 (光标离开模型时)。"""
@@ -115,7 +120,17 @@ class WeightBrushManager:
         )
 
         # 通知 Processor 清空掩码 开始记录历史
+        self.engine.lock_mesh()
         self.active_processor.begin_stroke()
+        self.prev_hit_position = None
+
+    def stroke(self, ray_src, ray_dir, is_pressed=False):
+        is_hit, hit_pos, hit_normal, hit_tri = self.raycast(ray_src, ray_dir)
+        if is_hit and is_pressed is True:
+            self._apply_brush(hit_pos, hit_tri, self.prev_hit_position, is_pressed)
+            self.prev_hit_position = hit_pos
+            return (True, hit_pos, hit_normal)
+        return (False, None, None)
 
     def end_stroke(self):
         """
@@ -146,9 +161,12 @@ class WeightBrushManager:
             # 提交到咱们自己的 API 撤销栈
             apiundo.commit(redo, undo, execute=False)
 
+        self.engine.unlock_mesh()
         self.active_processor = None
         self.active_handle = None
+        self.prev_hit_position = None
 
+    @maya_profile("raycast", 2)
     def raycast(self, ray_source: tuple, ray_dir: tuple) -> tuple:
         """
         [1. 探测阶段] 纯物理射线探测，绝对不触发任何涂抹计算。
@@ -166,37 +184,44 @@ class WeightBrushManager:
 
         return True, hit_pos, hit_normal, hit_tri
 
-    def apply_brush(self, hit_pos: tuple, hit_tri: int, action: str):
+    def _apply_brush(self, hit_pos: tuple, hit_tri: int, perv_hit_pos: tuple | None = None, is_pressed: bool = False):
         """
         [2. 涂抹阶段] 接收现成的击中数据，计算衰减并修改权重。
         """
-        # 1. 计算笔刷衰减 (Falloff)
-        if self.mesh_ctx and self.mesh_ctx.vertex_positions:
-            hit_count, _, _ = self.engine.calc_brush_falloff(
-                hit_pos,
-                hit_tri,
-                self.settings.radius,
-                self.settings.falloff_type,
-                self.settings.use_surface,
-            )
-            self.brush_ctx.hit_count = hit_count
-            self.brush_ctx.hit_center_position = hit_pos
+        if perv_hit_pos is None:
+            perv_hit_pos = hit_pos
+        with MayaNativeProfiler("cal_falloff", 3):
+            # 1. 计算笔刷衰减 (Falloff)
+            if self.mesh_ctx and self.mesh_ctx.vertex_positions:
+                hit_count, _, _ = self.engine.calc_brush_falloff(
+                    hit_pos,
+                    perv_hit_pos,
+                    hit_tri,
+                    self.settings.radius,
+                    self.settings.falloff_type,
+                    self.settings.use_surface,
+                )
+                self.brush_ctx.hit_count = hit_count
+                self.brush_ctx.hit_center_position = hit_pos
 
-        # 2. 修改权重数组 (Press / Drag)
-        if action in ("press", "drag"):
-            if not self.active_processor or self.brush_ctx.hit_count == 0:
-                return
+        with MayaNativeProfiler("process_stroke", 4):
+            # 2. 修改权重数组 (Press / Drag)
+            if is_pressed is True:
+                if not self.active_processor or self.brush_ctx.hit_count == 0:
+                    return
 
-            # 构造临时array
-            val_ary = array.array("f", [self.settings.strength])
-            idx_ary = array.array("i", [self.active_influence_idx])
+                # 构造临时array
+                val_ary = array.array("f", [self.settings.strength])
+                idx_ary = array.array("i", [self.active_influence_idx])
 
-            self.active_processor.process_stroke(
-                brush_mode=self.settings.mode,
-                weights_value=val_ary,
-                influences_indices=idx_ary,
-                clamp_min=0.0,
-                clamp_max=1.0,
-                iterations=self.settings.iter,
-            )
-        self.cSkin.setDirty()
+                self.active_processor.process_stroke(
+                    brush_mode=self.settings.mode,
+                    weights_value=val_ary,
+                    influences_indices=idx_ary,
+                    clamp_min=0.0,
+                    clamp_max=1.0,
+                    iterations=self.settings.iter,
+                )
+        with MayaNativeProfiler("set_dirty", 5):
+            if hit_count > 0:
+                self.cSkin.fast_preview_deform(self.brush_ctx.hit_indices, hit_count)
