@@ -24,12 +24,13 @@ class BrushSettings:
 
     # fmt:off
     radius              : float = 1
-    strength            : float = 0.1
+    strength            : float = 1.0
     iter                : int   = 10
     falloff_type        : int   = 1     # 0:Linear, 1:Airbrush, 2:Solid, 3:Dome, 4:Spike
     mode                : int   = 0     # 0:Add, 1:Sub, 2:Replace, 3:Multiply, 4:Smooth, 5:Sharp
     brush_spacing_ratio : float = 0.1
     use_surface         : bool  = True
+    _pressure           : float = 1.0   # 内部压力值 由 TabletTracker 维护
     # fmt:on
 
 
@@ -124,10 +125,10 @@ class WeightBrushManager:
         self.active_processor.begin_stroke()
         self.prev_hit_position = None
 
-    def stroke(self, ray_src, ray_dir, is_pressed=False):
+    def stroke(self, ray_src, ray_dir, is_pressed=False, value=1.0):
         is_hit, hit_pos, hit_normal, hit_tri = self.raycast(ray_src, ray_dir)
         if is_hit and is_pressed is True:
-            self._apply_brush(hit_pos, hit_tri, self.prev_hit_position, is_pressed)
+            self._apply_brush(hit_pos, hit_tri, self.prev_hit_position, is_pressed, value)
             self.prev_hit_position = hit_pos
             return (True, hit_pos, hit_normal)
         return (False, None, None)
@@ -184,7 +185,14 @@ class WeightBrushManager:
 
         return True, hit_pos, hit_normal, hit_tri
 
-    def _apply_brush(self, hit_pos: tuple, hit_tri: int, perv_hit_pos: tuple | None = None, is_pressed: bool = False):
+    def _apply_brush(
+        self,
+        hit_pos: tuple,
+        hit_tri: int,
+        perv_hit_pos: tuple | None = None,
+        is_pressed: bool = False,
+        value: float = 1.0,
+    ):
         """
         [2. 涂抹阶段] 接收现成的击中数据，计算衰减并修改权重。
         """
@@ -211,7 +219,7 @@ class WeightBrushManager:
                     return
 
                 # 构造临时array
-                val_ary = array.array("f", [self.settings.strength])
+                val_ary = array.array("f", [value])
                 idx_ary = array.array("i", [self.active_influence_idx])
 
                 self.active_processor.process_stroke(

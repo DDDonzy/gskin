@@ -6,6 +6,7 @@ import maya.api.OpenMayaUI as omui
 
 
 from ._cRegistry import SkinRegistry
+from .cBrushTabletInput import TabletTracker
 from .cBrushInterpolator import LinearStrokeInterpolator
 from .cBrushManager import WeightBrushManager, BrushSettings
 
@@ -49,10 +50,15 @@ class WeightBrushContext(omui.MPxContext):
 
         # UI 状态
         self._isPressed = False
+        # Brush Pressure 由 TabletTracker 维护 并通过 BrushSettings._pressure 实时传递给 BrushManager
+        self.tablet_tracker: TabletTracker = None
 
     def toolOnSetup(self, event):
         """工具启动时的初始化装配"""
         self._into_brush()
+        # 启动数位板追踪器 开始采集压力数据
+        self.tablet_tracker = TabletTracker()
+        self.tablet_tracker.start()
 
     def toolOffCleanup(self):
         """工具退出 通知管理器清理内存"""
@@ -80,13 +86,20 @@ class WeightBrushContext(omui.MPxContext):
         if self.brush_manager:
             self.brush_manager.begin_stroke()
 
+        # 手绘板压力值传递给 BrushSettings 以供 BrushManager 使用
+
         # brush path interpolator
-        interp_points = self.stroke_tracker.begin_stroke(*event.position)
+        interp_points = self.stroke_tracker.begin_stroke(*event.position, self.tablet_tracker.pressure)
 
         last_hit_result = None
-        for x, y in interp_points:
+        for x, y, p in interp_points:
             ray_src, ray_dir = self.get_ray_from_screen(x, y)
-            last_hit_result = self.brush_manager.stroke(ray_src, ray_dir, is_pressed=True)
+            last_hit_result = self.brush_manager.stroke(
+                ray_src,
+                ray_dir,
+                is_pressed=True,
+                value=BrushSettings.strength * p,
+            )
 
         if last_hit_result[0] is True:
             self._update_dynamic_spacing(last_hit_result)
@@ -95,17 +108,24 @@ class WeightBrushContext(omui.MPxContext):
     def doDrag(self, event, drawMgr, context):
         """拖拽阶段 纯数据驱动的批量涂抹"""
 
+        # 手绘板压力值传递给 BrushSettings 以供 BrushManager 使用
+        BrushSettings._pressure = self.tablet_tracker.pressure
+
         # brush path interpolator
-        interp_points = self.stroke_tracker.drag_stroke(*event.position)
+        interp_points = self.stroke_tracker.drag_stroke(*event.position, self.tablet_tracker.pressure)
         interp_points_is_empty = not interp_points
 
         if not interp_points:
-            interp_points = [event.position]
-
-        for x, y in interp_points:
+            interp_points = [(*event.position, self.tablet_tracker.pressure)]  # 即使没有移动，也要持续更新压力值
+        for x, y, p in interp_points:
             ray_src, ray_dir = self.get_ray_from_screen(x, y)
             # raycast
-            self.brush_manager.stroke(ray_src, ray_dir, is_pressed=not interp_points_is_empty)
+            self.brush_manager.stroke(
+                ray_src,
+                ray_dir,
+                is_pressed=not interp_points_is_empty,
+                value=BrushSettings.strength * p,
+            )
 
         # draw
         draw_raycast = self.brush_manager.raycast(*self.get_ray_from_screen(*event.position))

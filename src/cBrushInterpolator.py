@@ -39,50 +39,50 @@ class LinearStrokeInterpolator:
         self._last_draw_pos: tuple | None = None
         self._leftover_dist: float = 0.0
 
-    def begin_stroke(self, x: float, y: float) -> list[tuple]:
+    def begin_stroke(self, x: float, y: float, p: float = 1.0) -> list[tuple]:
         """
-        记录第一笔的起始坐标 并初始化内部状态。
+        Args:
+            x (float): 起笔坐标 X。
+            y (float): 起笔坐标 Y。
+            p (float): 起笔压感值（默认为 1.0）。
         """
-        self._last_raw_pos = (x, y)
-        self._last_draw_pos = (x, y)
+        self._last_raw_pos = (x, y, p)
+        self._last_draw_pos = (x, y, p)
         self._leftover_dist = 0.0
-        return [(x, y)]
+        return [(x, y, p)]
 
-    def drag_stroke(self, curr_x: float, curr_y: float) -> list[tuple]:
+    def drag_stroke(self, curr_x: float, curr_y: float, curr_p: float = 1.0) -> list[tuple]:
         """
-        接收实时鼠标坐标 进行物理防抖与线性等距采样。
+        Args:
+            x (float): 起笔坐标 X。
+            y (float): 起笔坐标 Y。
+            p (float): 起笔压感值（默认为 1.0）。
         """
-        # 防御：若未起笔直接运笔 强制转为起笔逻辑
         if not self._last_raw_pos:
-            return self.begin_stroke(curr_x, curr_y)
+            return self.begin_stroke(curr_x, curr_y, curr_p)
 
-        # 物理防抖：剔除极小范围的鼠标抖动噪音
         dist = math.hypot(curr_x - self._last_raw_pos[0], curr_y - self._last_raw_pos[1])
         if dist < 0.1:
             return []
 
-        # 核心逻辑：从上一个真实鼠标点 向当前真实鼠标点连线并采样
-        pts = self._sample_line(self._last_raw_pos, (curr_x, curr_y))
-
-        # 更新记忆 将当前点作为下一次运算的起点
-        self._last_raw_pos = (curr_x, curr_y)
+        pts = self._sample_line(self._last_raw_pos, (curr_x, curr_y, curr_p))
+        self._last_raw_pos = (curr_x, curr_y, curr_p)
         return pts
 
-    def end_stroke(self, curr_x: float, curr_y: float) -> list[tuple]:
+    def end_stroke(self, curr_x: float, curr_y: float, curr_p: float = 1.0) -> list[tuple]:
         """
-        强制闭合最后一段缺失的轨迹 并重置追踪器。
+        Args:
+            x (float): 起笔坐标 X。
+            y (float): 起笔坐标 Y。
+            p (float): 起笔压感值（默认为 1.0）。
         """
         res = []
-
-        # 补齐最后一段滑动距离
         if self._last_raw_pos:
-            res.extend(self._sample_line(self._last_raw_pos, (curr_x, curr_y)))
+            res.extend(self._sample_line(self._last_raw_pos, (curr_x, curr_y, curr_p)))
 
-        # 兜底强制闭合：如果上述采样未能精准覆盖到最终释放点 强行补入最后一点
         if not res or math.hypot(res[-1][0] - curr_x, res[-1][1] - curr_y) > 0.1:
-            res.append((curr_x, curr_y))
+            res.append((curr_x, curr_y, curr_p))
 
-        # 彻底清空寄存状态
         self._last_raw_pos = None
         self._last_draw_pos = None
         self._leftover_dist = 0.0
@@ -107,10 +107,6 @@ class LinearStrokeInterpolator:
         p_start: tuple,
         p_end: tuple,
     ) -> list[tuple]:
-        """
-        核心距离累加器。
-        将传入的线段距离注入能量槽 满 `spacing` 阈值即吐出一个精确的插值坐标点。
-        """
         if segment_dist <= 0:
             return []
 
@@ -118,12 +114,17 @@ class LinearStrokeInterpolator:
         results = []
 
         while self._leftover_dist >= self.spacing:
-            # 倒推计算刚好达到 spacing 时的 t 值比例
             t = (segment_dist - (self._leftover_dist - self.spacing)) / segment_dist
-            t = max(0.0, min(1.0, t))  # 钳制防止浮点数精度溢出
+            t = max(0.0, min(1.0, t))
 
-            new_p = (p_start[0] + (p_end[0] - p_start[0]) * t, p_start[1] + (p_end[1] - p_start[1]) * t)
+            # X, Y 坐标插值
+            nx = p_start[0] + (p_end[0] - p_start[0]) * t
+            ny = p_start[1] + (p_end[1] - p_start[1]) * t
 
+            # 🌟 压感(Pressure) 线性插值
+            np = p_start[2] + (p_end[2] - p_start[2]) * t
+
+            new_p = (nx, ny, np)
             results.append(new_p)
             self._last_draw_pos = new_p
             self._leftover_dist -= self.spacing
