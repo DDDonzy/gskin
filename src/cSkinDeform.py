@@ -197,7 +197,10 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
                     self.aLayerMask,
                     self.aLayerWeights,
                     self.aLayerEnabled,
-                    self.aRefresh):  # fmt:skip
+                    self.aRefresh,
+                    self.aCurrentPaintInfluenceIndex,
+                    self.aCurrentPaintLayerIndex,
+                    self.aCurrentPaintMaskBool):  # fmt:skip
             self.isDirty = True
             self.isDirty_weights = True
         # envelope
@@ -254,7 +257,10 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
                 or evaluationNode.dirtyPlugExists(self.aLayerMask)
                 or evaluationNode.dirtyPlugExists(self.aLayerWeights)
                 or evaluationNode.dirtyPlugExists(self.aLayerEnabled)
-                or evaluationNode.dirtyPlugExists(self.aRefresh)):  # fmt:skip
+                or evaluationNode.dirtyPlugExists(self.aRefresh)
+                or evaluationNode.dirtyPlugExists(self.aCurrentPaintInfluenceIndex)
+                or evaluationNode.dirtyPlugExists(self.aCurrentPaintLayerIndex)
+                or evaluationNode.dirtyPlugExists(self.aCurrentPaintMaskBool)):  # fmt:skip
                 self.isDirty = True
                 self.isDirty_weights = True
 

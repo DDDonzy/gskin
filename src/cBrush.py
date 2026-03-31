@@ -7,7 +7,7 @@ import maya.api.OpenMayaUI as omui
 
 from ._cRegistry import SkinRegistry
 from .cBrushTabletInput import TabletTracker
-from .cBrushInterpolator import LinearStrokeInterpolator
+from .cBrushInterpolator import LinearStrokeInterpolator, SplineStrokeInterpolator
 from .cBrushManager import WeightBrushManager, BrushSettings
 
 import math
@@ -94,12 +94,7 @@ class WeightBrushContext(omui.MPxContext):
         last_hit_result = None
         for x, y, p in interp_points:
             ray_src, ray_dir = self.get_ray_from_screen(x, y)
-            last_hit_result = self.brush_manager.stroke(
-                ray_src,
-                ray_dir,
-                is_pressed=True,
-                value=BrushSettings.strength * p,
-            )
+            last_hit_result = self.brush_manager.stroke(ray_src, ray_dir, is_pressed=True, value=BrushSettings.strength, pressure=p)
 
         if last_hit_result[0] is True:
             self._update_dynamic_spacing(last_hit_result)
@@ -120,12 +115,7 @@ class WeightBrushContext(omui.MPxContext):
         for x, y, p in interp_points:
             ray_src, ray_dir = self.get_ray_from_screen(x, y)
             # raycast
-            self.brush_manager.stroke(
-                ray_src,
-                ray_dir,
-                is_pressed=not interp_points_is_empty,
-                value=BrushSettings.strength * p,
-            )
+            self.brush_manager.stroke(ray_src, ray_dir, is_pressed=not interp_points_is_empty, value=BrushSettings.strength, pressure=p)
 
         # draw
         draw_raycast = self.brush_manager.raycast(*self.get_ray_from_screen(*event.position))

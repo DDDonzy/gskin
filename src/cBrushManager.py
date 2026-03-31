@@ -125,10 +125,17 @@ class WeightBrushManager:
         self.active_processor.begin_stroke()
         self.prev_hit_position = None
 
-    def stroke(self, ray_src, ray_dir, is_pressed=False, value=1.0):
+    def stroke(self, ray_src, ray_dir, is_pressed=False, value=1.0, pressure=1.0):
         is_hit, hit_pos, hit_normal, hit_tri = self.raycast(ray_src, ray_dir)
         if is_hit and is_pressed is True:
-            self._apply_brush(hit_pos, hit_tri, self.prev_hit_position, is_pressed, value)
+            self._apply_brush(
+                hit_pos,
+                hit_tri,
+                self.prev_hit_position,
+                is_pressed,
+                value,
+                pressure,
+            )
             self.prev_hit_position = hit_pos
             return (True, hit_pos, hit_normal)
         return (False, None, None)
@@ -192,6 +199,7 @@ class WeightBrushManager:
         perv_hit_pos: tuple | None = None,
         is_pressed: bool = False,
         value: float = 1.0,
+        pressure: float = 1.0,
     ):
         """
         [2. 涂抹阶段] 接收现成的击中数据，计算衰减并修改权重。
@@ -226,6 +234,7 @@ class WeightBrushManager:
                     brush_mode=self.settings.mode,
                     weights_value=val_ary,
                     influences_indices=idx_ary,
+                    pressure=pressure,
                     clamp_min=0.0,
                     clamp_max=1.0,
                     iterations=self.settings.iter,
