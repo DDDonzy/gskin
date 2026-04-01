@@ -105,6 +105,7 @@ class WeightBrushContext(omui.MPxContext):
 
         # 手绘板压力值传递给 BrushSettings 以供 BrushManager 使用
         BrushSettings._pressure = self.tablet_tracker.pressure
+        print(f"Current Pressure: {BrushSettings._pressure:.3f}")
 
         # brush path interpolator
         interp_points = self.stroke_tracker.drag_stroke(*event.position, self.tablet_tracker.pressure)

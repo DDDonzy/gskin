@@ -90,6 +90,7 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
                  "isDirty_inputGeometry",
                  "isDirty_bindPreMatrix",
                  "isDirty_influencesMatrix",
+                 "isDirty_brushFastPreview"
                  # 内部计算变量与内存视图 (Internal Vars & Views)
                  "_geo_matrix",
                  "_get_matrix_i",

@@ -8,8 +8,8 @@ Module: cTabletInput
 
 from __future__ import annotations
 
+import time
 from PySide2 import QtCore, QtWidgets
-
 
 class _TabletEventFilter(QtCore.QObject):
     """底层的 Qt 事件过滤器"""
@@ -17,23 +17,37 @@ class _TabletEventFilter(QtCore.QObject):
     def __init__(self, tracker: TabletTracker):
         super().__init__()
         self._tracker: TabletTracker = tracker
-        self._pen_in_proximity = False  # 追踪笔尖是否在数位板感应范围内
+        self._last_tablet_event_time = 0.0
 
     def eventFilter(self, obj, event):
         ev_type = event.type()
 
-        # 极简感应：毫无计算压力，耗时 < 0.0001ms
-        if ev_type == QtCore.QEvent.TabletEnterProximity:
-            self._pen_in_proximity = True
-        elif ev_type == QtCore.QEvent.TabletLeaveProximity:
-            self._pen_in_proximity = False
-            self._tracker.pressure = 1.0  # 恢复满力
-
-        # 极简赋值：只要在板子上，就无脑更新数值，不做任何其他判定
-        if self._pen_in_proximity and ev_type in (QtCore.QEvent.TabletMove, QtCore.QEvent.TabletPress):
+        # 1. 优先处理并拦截真实的手绘板事件
+        if ev_type in (QtCore.QEvent.TabletMove, QtCore.QEvent.TabletPress):
             self._tracker.pressure = event.pressure()
+            # 使用 perf_counter 获得最高精度的相对时间
+            self._last_tablet_event_time = time.perf_counter() 
+            return False
 
-        return False  # 永远放行，绝对不卡 Maya
+        # 2. 过滤掉手绘板“伪造”的鼠标事件
+        if ev_type in (QtCore.QEvent.MouseMove, QtCore.QEvent.MouseButtonPress):
+            current_time = time.perf_counter()
+            time_delta = current_time - self._last_tablet_event_time
+
+            # 0.1秒 (100ms) 内的鼠标事件视为伪造，直接无视，保护压感
+            if time_delta < 0.1:  
+                return False
+
+            # 超过 0.1 秒，确认为纯物理鼠标，强制重置压感为 1.0
+            self._tracker.pressure = 1.0  
+            return False
+
+        # 3. 释放事件清理
+        if ev_type in (QtCore.QEvent.TabletRelease, QtCore.QEvent.MouseButtonRelease):
+            self._tracker.pressure = 1.0
+
+        # 返回 False 确保 Maya 自身的视图导航（如 Alt+拖拽）不会被阻断
+        return False
 
 
 class TabletTracker:
