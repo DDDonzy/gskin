@@ -5,9 +5,6 @@ import array
 import typing
 from dataclasses import dataclass
 
-from . import apiundo
-from .cBufferManager import BufferManager
-from . import cBrushCore2Cython as cBrushCoreCython
 from ._cProfilerCython import MayaNativeProfiler, maya_profile
 
 
@@ -59,17 +56,8 @@ class WeightBrushManager:
         self.brush_ctx.hit_weights = self.engine.raw_hit_falloff
         self.brush_ctx.hit_count = 0  # 初始命中数为 0
 
-        # 预分配 Undo/Redo 撤销系统内存池
-        vtx_count = self.mesh_ctx.vertex_count
-        inf_count = self.cSkin.influences_count if self.cSkin else 1
-        self.modified_vtx_bool_mgr = BufferManager.allocate("B", (vtx_count,))
-        self.modified_vtx_indices_mgr = BufferManager.allocate("i", (vtx_count,))
-        self.undo_buffer_mgr = BufferManager.allocate("f", (vtx_count, inf_count))
-        """ 撤销内存池 [i, j] 一次性预分配全量权重快照空间 用于备份刷写前的原始权重 """
-
         # Stroke 状态
-        self.active_processor: cBrushCoreCython.SkinWeightProcessor = None
-        self.active_handle = None
+        self._stroke_coroutine = None  # 🌟 新增：存放协程上下文
         self.active_influence_idx = 0
 
         # brush
@@ -83,8 +71,9 @@ class WeightBrushManager:
     def teardown(self):
         """彻底清理内存资源与引用。"""
         self.clear_hit_state()
-        self.active_processor = None
-        self.active_handle = None
+        if self._stroke_coroutine:
+            self._stroke_coroutine.close()
+        self._stroke_coroutine = None
 
     # Stroke (按下 -> 拖拽 -> 松开)
     def begin_stroke(self):
@@ -93,36 +82,20 @@ class WeightBrushManager:
         解析 UI 目标 (Layer/Mask/Influence) 提取对应内存并装配 Processor。
         """
 
-        weights_manager = self.cSkin.weights_manager
         layer_idx, is_mask, active_influence_idx, _ = self.cSkin.get_active_paint_weights()
-        self.layer_idx = layer_idx  # layer
-        self.is_mask = is_mask  # layer
-        self.active_influence_idx = active_influence_idx  # influence index
+        self.layer_idx = layer_idx
+        self.is_mask = is_mask
+        self.active_influence_idx = active_influence_idx
 
-        handle = weights_manager.get_handle(layer_idx, is_mask)
-        if not handle.is_valid:
+        # 🌟 核心：向 WeightsManager 索要魔法协程
+        self._stroke_coroutine = self.cSkin.weights_manager.paint_stroke_coroutine(layer_idx, is_mask)
+
+        # 预激协程 (执行到第一个 yield)，如果底层引擎返回 False，说明该层异常，直接抛弃
+        if next(self._stroke_coroutine) is False:
+            self._stroke_coroutine = None
             return
-        vtx_count, influences_count, _, weights_1d = handle.parse_raw_weights()
-        if vtx_count <= 0:
-            return
 
-        weights_2d = weights_1d.cast("B").cast("f", (vtx_count, influences_count))
-
-        # influence locked indices  | 临时创建一个骨骼锁定数组
-        self._temp_locks_mgr = BufferManager.allocate("B", (influences_count,))
-        # 构造笔刷执行器
-        self.active_processor = cBrushCoreCython.SkinWeightProcessor(
-            self.engine,
-            weights_2d,
-            self.modified_vtx_indices_mgr.view,
-            self.modified_vtx_bool_mgr.view,
-            self._temp_locks_mgr.view,
-            self.undo_buffer_mgr.view,
-        )
-
-        # 通知 Processor 清空掩码 开始记录历史
         self.engine.lock_mesh()
-        self.active_processor.begin_stroke()
         self.prev_hit_position = None
 
     def stroke(self, ray_src, ray_dir, is_pressed=False, value=1.0, pressure=1.0):
@@ -145,33 +118,11 @@ class WeightBrushManager:
         鼠标松开
         提取 Undo 历史 并向 Maya 正式提交这一笔的所有修改。
         """
-        if not self.active_processor:
-            return
-
-        # 返回值: (mod_vertex_indices, mod_channel_indices, old_sparse_ary, new_sparse_ary)
-        undo_redo_pack = self.active_processor.end_stroke()
-
-        if undo_redo_pack:
-            mod_vtx_idx, mod_ch_idx, old_sparse, new_sparse = undo_redo_pack
-
-            # 提前提取引用 防止闭包晚绑定陷阱
-            wm = self.cSkin.weights_manager
-            layer = self.layer_idx
-            mask = self.is_mask
-
-            # 核心改变 使用专用的稀疏状态还原器 强行覆盖 绝对精准
-            def undo():
-                wm.set_sparse_weights(layer, mask, mod_vtx_idx, mod_ch_idx, old_sparse)
-
-            def redo():
-                wm.set_sparse_weights(layer, mask, mod_vtx_idx, mod_ch_idx, new_sparse)
-
-            # 提交到咱们自己的 API 撤销栈
-            apiundo.commit(redo, undo, execute=False)
+        if self._stroke_coroutine:
+            self._stroke_coroutine.close()
+            self._stroke_coroutine = None
 
         self.engine.unlock_mesh()
-        self.active_processor = None
-        self.active_handle = None
         self.prev_hit_position = None
 
     @maya_profile("raycast", 2)
@@ -201,44 +152,40 @@ class WeightBrushManager:
         value: float = 1.0,
         pressure: float = 1.0,
     ):
-        """
-        [2. 涂抹阶段] 接收现成的击中数据，计算衰减并修改权重。
-        """
         if perv_hit_pos is None:
             perv_hit_pos = hit_pos
+
         with MayaNativeProfiler("cal_falloff", 3):
-            # 1. 计算笔刷衰减 (Falloff)
+            # 1. 计算笔刷衰减 (保持不变)
             if self.mesh_ctx and self.mesh_ctx.vertex_positions:
-                hit_count, _, _ = self.engine.calc_brush_falloff(
-                    hit_pos,
-                    perv_hit_pos,
-                    hit_tri,
-                    self.settings.radius,
-                    self.settings.falloff_type,
-                    self.settings.use_surface,
-                )
+                hit_count, _, _ = self.engine.calc_brush_falloff(hit_pos, perv_hit_pos, hit_tri, self.settings.radius, self.settings.falloff_type, self.settings.use_surface)
                 self.brush_ctx.hit_count = hit_count
                 self.brush_ctx.hit_center_position = hit_pos
 
         with MayaNativeProfiler("process_stroke", 4):
-            # 2. 修改权重数组 (Press / Drag)
+            # 2. 向协程投喂计算参数
             if is_pressed is True:
-                if not self.active_processor or self.brush_ctx.hit_count == 0:
+                # 如果没按中，或者协程没正常启动，直接退出
+                if not self._stroke_coroutine or self.brush_ctx.hit_count == 0:
                     return
 
-                # 构造临时array
                 val_ary = array.array("f", [value])
                 idx_ary = array.array("i", [self.active_influence_idx])
 
-                self.active_processor.process_stroke(
-                    brush_mode=self.settings.mode,
-                    weights_value=val_ary,
-                    influences_indices=idx_ary,
-                    pressure=pressure,
-                    clamp_min=0.0,
-                    clamp_max=1.0,
-                    iterations=self.settings.iter,
-                )
+                # 🌟 把当前帧的所有参数打包成 kwargs 字典
+                stroke_kwargs = {
+                    "brush_mode": self.settings.mode,
+                    "weights_value": val_ary,
+                    "influences_indices": idx_ary,
+                    "pressure": pressure,
+                    "clamp_min": 0.0,
+                    "clamp_max": 1.0,
+                    "iterations": self.settings.iter,
+                }
+
+                # 🌟 魔法触发：用 send() 把数据喂给在 yield 处苦苦等待的底层引擎！
+                self._stroke_coroutine.send(stroke_kwargs)
+
         with MayaNativeProfiler("set_dirty", 5):
             if hit_count > 0:
                 self.cSkin.fast_preview_deform(self.brush_ctx.hit_indices, hit_count)

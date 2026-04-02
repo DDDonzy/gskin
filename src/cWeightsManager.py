@@ -316,10 +316,12 @@ class WeightsLayerItem:
         _handle_weights = mDataHandle.child(cSkin.aLayerWeights)
         _handle_mask = mDataHandle.child(cSkin.aLayerMask)
         _handle_enabled = mDataHandle.child(cSkin.aLayerEnabled)
+        _handle_name = mDataHandle.child(cSkin.aLayerName)
 
         self.enabled = _handle_enabled.asBool()
         self.weights = WeightsHandle(self.mPlug_weights, _handle_weights)
         self.mask = WeightsHandle(self.mPlug_mask, _handle_mask)
+        self.name = _handle_name.asString()
 
     # ==========================================
     # 安全的属性获取:直接找 cSkin 要 MObject,完全不碰短命的 MDataHandle
@@ -342,6 +344,16 @@ class WeightsLayerItem:
         mPlug = om1.MPlug(self.cSkin.mObject, self.cSkin.aLayerEnabled)
         mPlug.selectAncestorLogicalIndex(self.logical_idx, self.cSkin.aLayerCompound)
         return mPlug
+
+    @property
+    def mPlug_name(self):
+        mPlug = om1.MPlug(self.cSkin.mObject, self.cSkin.aLayerName)
+        mPlug.selectAncestorLogicalIndex(self.logical_idx, self.cSkin.aLayerCompound)
+        return mPlug
+
+    def set_name(self, new_name: str):
+        self.mPlug_name.setString(new_name)
+        self.name = new_name
 
 
 class _DeferredTaskMixin:
@@ -414,6 +426,16 @@ class WeightsManager(_DeferredTaskMixin):
 
         self.plug_refresh: om1.MPlug = cSkin.plug_refresh
         self.plug_weights: om1.MPlug = om1.MPlug(cSkin.mObject, cSkin.aWeights)
+
+
+        # =========================================================
+        # 笔刷引擎的共享物理内存池 (Object Pool)
+        # 寿命与节点等长，避免鼠标按下时疯狂申请内存引发 GC 卡顿
+        # =========================================================
+        self._pool_vtx_idx: BufferManager = None
+        self._pool_vtx_bool: BufferManager = None
+        self._pool_inf_locks: BufferManager = None
+        self._pool_undo_buffer: BufferManager = None
 
     @property
     def layer_indices(self) -> list[int]:
@@ -697,9 +719,9 @@ class WeightsManager(_DeferredTaskMixin):
         sparse_values,
     ):
         """
-        专供 Undo / Redo 闭包调用。
+        专供 Undo / Redo 调用。
         直接使用 C 级覆盖能力还原快照,彻底告别 Python 循环！
-        """  # noqa: RUF002
+        """  
         processor = self._create_processor(layer_idx, is_mask)
         if not processor:
             return
@@ -713,11 +735,6 @@ class WeightsManager(_DeferredTaskMixin):
         )
 
     def _create_processor(self, layer_idx: int, is_mask: bool):
-        """
-        - 提取指定图层的物理内存,并为创建 `SkinWeightProcessor`实例,可以根据`return`的实例进行操作。
-        - `SkinWeightProcessor` 本质是笔刷处理器,初始化权重笔刷,将权重数据与笔刷引擎托管给父类进行通用运算。
-        - 在这里可以用来快速设置权重,并且自动注册undo和redo快照(参考`set_sparse_data`函数)。
-        """
         handle = self.get_handle(layer_idx, is_mask)
 
         if handle is None or not handle.is_valid:
@@ -730,17 +747,84 @@ class WeightsManager(_DeferredTaskMixin):
 
         weights_2d = weights_1d.cast("B").cast("f", (vtx_count, inf_count))
 
-        tmp_idx = BufferManager.allocate("i", (vtx_count,))
-        tmp_bool = BufferManager.allocate("B", (vtx_count,))
-        tmp_locks = BufferManager.allocate("B", (inf_count,))
+        # =========================================================
+        # 只在第一次，或者顶点数/骨骼数变大时才去申请新内存！
+        # =========================================================
+        # 1. 顶点索引池 (vtx_count)
+        if not self._pool_vtx_idx or self._pool_vtx_idx.shape[0] < vtx_count:
+            self._pool_vtx_idx = BufferManager.allocate("i", (vtx_count,))
+            
+        # 2. 顶点布尔防重录池 (vtx_count)
+        if not self._pool_vtx_bool or self._pool_vtx_bool.shape[0] < vtx_count:
+            self._pool_vtx_bool = BufferManager.allocate("B", (vtx_count,))
+            
+        # 3. 骨骼锁定池 (inf_count)
+        if not self._pool_inf_locks or self._pool_inf_locks.shape[0] < inf_count:
+            self._pool_inf_locks = BufferManager.allocate("B", (inf_count,))
+            
+        # 4. Undo 2D 矩阵池 (vtx_count * inf_count)
+        req_undo_elements = vtx_count * inf_count
+        curr_undo_elements = self._pool_undo_buffer.shape[0] * self._pool_undo_buffer.shape[1] if self._pool_undo_buffer else 0
+        
+        if curr_undo_elements < req_undo_elements:
+            # 容量不足，重新申请大内存
+            self._pool_undo_buffer = BufferManager.allocate("f", (vtx_count, inf_count))
+        else:
+            # 容量足够，直接零拷贝 Reshape 出当前图层所需的二维形状！
+            # (比如从 80 个骨骼的权重层 切到 1 个通道的 Mask 层，直接把大内存切成瘦长条)
+            self._pool_undo_buffer = self._pool_undo_buffer.reshape((vtx_count, inf_count))
 
-        _undo_buffer = BufferManager.allocate("f", (vtx_count, inf_count))
+        # =========================================================
 
+        # 组装引擎，传入复用的内存池视图
         return cBrushCoreCython.SkinWeightProcessor(
             self.cSkin.brush_engine,
             weights_2d,
-            tmp_idx.view,  # 直接传入 view
-            tmp_bool.view,  # 直接传入 view
-            tmp_locks.view,  # 直接传入 view
-            _undo_buffer.view,  # 直接传入完美的 2D view
+            self._pool_vtx_idx.view, 
+            self._pool_vtx_bool.view,  
+            self._pool_inf_locks.view,  
+            self._pool_undo_buffer.view,  
         )
+    
+    def paint_stroke_coroutine(self, layer_idx: int, is_mask: bool, backup: bool = True):
+        """
+        [魔法生成器] 基于 yield 的跨帧笔刷状态机。
+        完美接管 begin_stroke -> N次过程计算 -> end_stroke。
+        """
+        # 1. 获取底层算力引擎（它内部已经自动分配好了当前层精确所需的 Undo 缓存）
+        processor = self._create_processor(layer_idx, is_mask)
+        if not processor:
+            yield False # 启动失败
+            return
+
+        # 2. 初始化录制（相当于拦截了 doPress）
+        if backup:
+            processor.begin_stroke()
+
+        try:
+            while True:
+                # 3. 核心魔法：在此挂起协程，等待 BrushManager 发来这一帧的涂抹参数
+                # .send(kwargs) 传进来的数据会被赋值给 stroke_kwargs
+                stroke_kwargs = yield True
+
+                if stroke_kwargs:
+                    # 将参数解包传给 C 引擎进行真实涂抹与归一化
+                    processor.process_stroke(**stroke_kwargs)
+                    
+        except GeneratorExit:
+            # 4. 外部调用 .close() 时，会触发此异常（相当于拦截了 doRelease）
+            # 我们在这里安全收尾，并生成 Maya 撤销栈
+            if backup:
+                undo_data = processor.end_stroke()
+                if undo_data:
+                    mod_vtx, mod_ch, old_sparse, new_sparse = undo_data
+
+                    def redo():
+                        self.set_sparse_weights(layer_idx, is_mask, mod_vtx, mod_ch, new_sparse)
+                        self.updateDG()
+
+                    def undo():
+                        self.set_sparse_weights(layer_idx, is_mask, mod_vtx, mod_ch, old_sparse)
+                        self.updateDG()
+
+                    apiundo.commit(redo, undo, execute=False)
