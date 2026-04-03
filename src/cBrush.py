@@ -13,7 +13,7 @@ from ._cRegistry import SkinRegistry
 from .cBrushTabletInput import TabletTracker
 from .cBrushInterpolator import LinearStrokeInterpolator, SplineStrokeInterpolator
 from .cBrushSettings import BrushSettings
-from .cWeightsManager import StrokeParameters
+from .cBrushCore2Cython import BrushStrokeContext
 
 from typing import TYPE_CHECKING
 
@@ -195,7 +195,14 @@ class WeightBrushContext(omui.MPxContext):
             prev_pos = self._prev_hit_position if self._prev_hit_position else hit_pos
 
             # 计算衰减
-            hit_count, active_indices, active_weights = self.engine.calc_brush_falloff(hit_pos, prev_pos, hit_tri, self.settings.radius, self.settings.falloff_type, self.settings.use_surface)
+            hit_count, active_indices, active_weights = self.engine.calc_brush_falloff(
+                hit_pos,
+                prev_pos,
+                hit_tri,
+                self.settings.radius,
+                self.settings.falloff_type,
+                self.settings.use_surface,
+            )
 
             # 更新笔刷命中上下文
             self.brush_ctx.hit_indices = active_indices
@@ -204,15 +211,17 @@ class WeightBrushContext(omui.MPxContext):
             self.brush_ctx.hit_center_position = hit_pos
 
             if hit_count > 0:
-                params = StrokeParameters(
-                    brush_mode         = self.settings.mode,
-                    weights_value      = array.array("f", [self.settings.strength]),
-                    influences_indices = array.array("i", [self._active_influence_idx]),
-                    pressure           = pressure,
-                    iterations         = self.settings.iter,
+                ctx = BrushStrokeContext(
+                    brush_mode      = self.settings.mode,
+                    values          = array.array("f", [self.settings.strength]),
+                    channel_indices = array.array("i", [self._active_influence_idx]),
+                    pressure        = pressure,
+                    clamp_min       = 0.0,
+                    clamp_max       = 1.0,
+                    iterations      = self.settings.iter,
                 )  # fmt:skip
 
-                self._stroke_coroutine.send(params)
+                self._stroke_coroutine.send(ctx)
 
                 self.cSkin.fast_preview_deform(active_indices, hit_count)
 

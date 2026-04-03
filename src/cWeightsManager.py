@@ -60,61 +60,77 @@ class StrokeParameters:
         self.iterations = iterations
 
 
-class _DeferredTaskMixin:
+# ==============================================================================
+# ⏱️ 任务调度组件 (Composition Component)
+# ==============================================================================
+class DeferredTaskManager:
     """
-    专为 Maya 节点计算周期设计的任务调度器与刷新锁。
-    提供队列管理、并发锁以及 updateDG 的执行防抖。
+    专为 Maya 节点计算周期设计的任务调度器。
+    提供线程安全的队列管理和执行防抖。
     """
 
-    def __init__(self):
-        # 全部声明为保护属性,向子类隐藏实现细节
+    def __init__(self, update_callback: typing.Callable[[], None]):
         self._deferred_tasks = deque()
-        self._tasks_lock = threading.Lock()
+        self._tasks_lock = threading.RLock()
         self._is_dg_updating = False
 
-    @staticmethod
-    def _update_dg(func):
-        """防抖锁:确保唯一次视口刷新"""
+        # 绑定的回调函数，用于唤醒 Maya 节点 (通常是 WeightsManager.updateDG)
+        self._update_callback = update_callback
 
-        @functools.wraps(func)
-        def wrapper(self: WeightsManager, *args, **kwargs):
-            is_top_level = not getattr(self, "_is_dg_updating", False)
-            if is_top_level:
-                self._is_dg_updating = True
-            try:
-                return func(self, *args, **kwargs)
-            finally:
-                if is_top_level:
-                    self._is_dg_updating = False
-                    if hasattr(self, "updateDG") and callable(self.updateDG):
-                        self.updateDG()
+    def add_task(self, task: typing.Callable):
+        """推入队列并尝试唤醒节点"""
+        with self._tasks_lock:
+            self._deferred_tasks.append(task)
+        if self._update_callback:
+            self._update_callback()
 
-        return wrapper
-
-    @staticmethod
-    def _defer_task(func):
-        """延迟执行:推入队列并唤醒节点"""
-
-        @functools.wraps(func)
-        def wrapper(self: WeightsManager, *args, **kwargs):
-            task = functools.partial(func, self, *args, **kwargs)
-            with self._tasks_lock:
-                self._deferred_tasks.append(task)
-
-            if hasattr(self, "updateDG") and callable(self.updateDG):
-                self.updateDG()
-
-        return wrapper
-
-    def execute_deferred_tasks(self):
-        """[高内聚] 暴露给子类,用于消化队列"""
+    def execute_tasks(self):
+        """消化队列中的所有任务"""
         if not self._deferred_tasks:
             return
-
         with self._tasks_lock:
             while self._deferred_tasks:
                 task = self._deferred_tasks.popleft()
                 task()
+
+    @contextlib.contextmanager
+    def update_dg_context(self):
+        """防抖锁上下文：确保只有最外层嵌套执行结束后，才触发一次 Maya 刷新"""
+        is_top_level = not self._is_dg_updating
+        if is_top_level:
+            self._is_dg_updating = True
+        try:
+            yield
+        finally:
+            if is_top_level:
+                self._is_dg_updating = False
+                if self._update_callback:
+                    self._update_callback()
+
+
+# ==============================================================================
+# 🍬 调度器专属装饰器 (Syntactic Sugar)
+# ==============================================================================
+def defer_task(func):
+    """将被装饰的方法打包为延迟任务，交给实例的 task_manager 处理"""
+
+    @functools.wraps(func)
+    def wrapper(self: WeightsManager, *args, **kwargs):
+        task = functools.partial(func, self, *args, **kwargs)
+        self.task_manager.add_task(task)  # 🌟 直接调用组合组件
+
+    return wrapper
+
+
+def update_dg(func):
+    """为方法包裹防抖锁"""
+
+    @functools.wraps(func)
+    def wrapper(self: WeightsManager, *args, **kwargs):
+        with self.task_manager.update_dg_context():  # 🌟 调用组合组件的上下文
+            return func(self, *args, **kwargs)
+
+    return wrapper
 
 
 class WeightsHandle:
@@ -452,7 +468,7 @@ class WeightsLayerItem:
         self.name = new_name
 
 
-class WeightsManager(_DeferredTaskMixin):
+class WeightsManager:
     def __init__(self, cSkin: CythonSkinDeformer):
         super().__init__()
 
@@ -474,6 +490,8 @@ class WeightsManager(_DeferredTaskMixin):
         self._pool_vtx_bool: BufferManager = None
         self._pool_inf_locks: BufferManager = None
         self._pool_undo_buffer: BufferManager = None
+        #
+        self.task_manager = DeferredTaskManager(self.updateDG)
 
     @property
     def layer_indices(self) -> list[int]:
@@ -524,19 +542,19 @@ class WeightsManager(_DeferredTaskMixin):
         except IndexError:
             return None
 
-    def get_handle(self, layer_logical_idx, isMask: bool = False) -> WeightsHandle:
+    def get_handle(self, layer_logical_idx, is_mask: bool = False) -> WeightsHandle:
         """
         严格根据逻辑索引寻找对应的 Handle
         """
         # 基础权重
         if layer_logical_idx == -1:
-            if isMask:
+            if is_mask:
                 return None
             return self.weights
         # layer 权重
         if layer_logical_idx in self.layers:
             layer_item = self.layers[layer_logical_idx]
-            if isMask:
+            if is_mask:
                 return layer_item.mask
             return layer_item.weights
 
@@ -598,181 +616,6 @@ class WeightsManager(_DeferredTaskMixin):
 
         return v_count, i_count, global_bone_ids, out_vtx, out_bone, weights_1d
 
-    @contextlib.contextmanager
-    def _processor_session(self, layer_idx: int, is_mask: bool, backup: bool = True):
-        """
-        [引擎上下文管理器]
-        统管 Cython 算力引擎的获取、快照录制与撤销栈注册。
-        """
-        # 1. 尝试获取算力引擎
-        processor = self._create_processor(layer_idx, is_mask)
-
-        # 拦截空图层或坏句柄
-        if not processor:
-            yield None
-            return
-
-        # 2. 开启录制 (Setup)
-        if backup:
-            processor.begin_stroke()
-
-        try:
-            # 3. 将引擎实例递交给业务代码使用
-            yield processor
-
-        finally:
-            # 4. 收尾工作 (Teardown):确保快照闭合与闭包注册
-            if backup:
-                undo_data = processor.end_stroke()
-                if undo_data:
-                    mod_vtx, mod_ch, old_sparse, new_sparse = undo_data
-
-                    def redo():
-                        self.set_sparse_weights(layer_idx, is_mask, mod_vtx, mod_ch, new_sparse)
-
-                    def undo():
-                        self.set_sparse_weights(layer_idx, is_mask, mod_vtx, mod_ch, old_sparse)
-
-                    # 注册进 Maya 的原生撤销栈
-                    apiundo.commit(redo, undo, execute=False)
-
-                handle = self.get_handle(layer_idx, is_mask)
-                if handle and handle.is_valid:
-                    pass
-
-    @_DeferredTaskMixin._defer_task
-    def blend_weights(
-        self,
-        layer_idx: int,
-        is_mask: bool,
-        weights_1d,
-        vtx_indices,
-        influence_indices=None,
-        blend_mode: int = 2,
-        alpha: float = 1.0,
-        falloff_weights=None,
-        normalize=True,
-        backup: bool = True,
-    ):
-        """
-        [混合/覆写权重] (统一高级接口)
-        支持加减乘除、透明度混合、蒙版衰减、自动归一化与稀疏撤销。
-        """
-        # 开启引擎会话
-        with self._processor_session(layer_idx, is_mask, backup) as processor:
-            # 如果没拿到引擎,直接退出
-            if not processor:
-                return False
-
-            # --- 纯粹的数据转换与计算 ---
-            # fmt:off
-            v_view   = BufferManager.auto(vtx_indices              , "i").view    if vtx_indices              is not None else None
-            b_view   = BufferManager.auto(influence_indices        , "i").view    if influence_indices        is not None else None
-            src_view = BufferManager.auto(weights_1d               , "f").view
-            fal_view = BufferManager.auto(falloff_weights          , "f").view    if falloff_weights          is not None else None
-            # fmt:on
-
-            # Cython 执行带混合模式的覆写
-            processor.set_custom_array( source_values   = src_view   ,
-                                        blend_mode      = blend_mode ,
-                                        vertex_indices  = v_view     ,
-                                        channel_indices = b_view     ,
-                                        alpha           = alpha      ,
-                                        falloff_weights = fal_view   )  # fmt:skip
-
-            # 权重归一化
-            if not is_mask and normalize:
-                priority = b_view[0] if (b_view is not None and len(b_view) > 0) else -1
-                processor.normalize_weights(v_view, priority)
-
-        return True
-
-    @_DeferredTaskMixin._defer_task
-    def allocate_and_set_weights(
-        self,
-        layer_idx,
-        is_mask,
-        vtx_count,
-        inf_count,
-        influence_indices,
-        weights_1d,
-        backup=True,
-    ):
-        """
-        [全量重建/覆盖图层]
-        Python 负责重建 Maya 的底层物理内存和结构,然后移交 Cython 引擎进行纯数据的光速覆写。
-        """
-        handle = self.get_handle(layer_idx, is_mask)
-        if handle is None:
-            return False
-
-        # --- [1. 记录图层全量结构快照] ---
-        if backup:
-            old_v_cnt, old_i_cnt, old_g_bones, _, _, old_w_1d = self.get_weights(layer_idx, is_mask)  # get weights 是拷贝,无需再次拷贝
-
-            # 传入进来的数据可能是引用,这个数据要用来处理 redo, 一定要拷贝数据
-            safe_new_idx = array.array("i", BufferManager.auto(influence_indices, "i").view)
-            safe_new_w = array.array("f", BufferManager.auto(weights_1d, "f").view)
-
-            def redo():
-                self.allocate_and_set_weights(layer_idx, is_mask, vtx_count, inf_count, safe_new_idx, safe_new_w, backup=False)
-
-            def undo():
-                self.allocate_and_set_weights(layer_idx, is_mask, old_v_cnt, old_i_cnt, old_g_bones, old_w_1d, backup=False)
-
-            apiundo.commit(redo, undo, execute=False)
-
-        if vtx_count == 0:
-            handle.clear()
-            return True
-
-        # --- [2. Python 负责重建底层物理内存与骨骼 Header (搭地基)] ---
-        handle.resize(vtx_count, len(influence_indices))
-
-        if influence_indices:
-            _view = handle.memory.view
-            _int = _view.cast("B").cast("i")
-            _int[2 : 2 + len(influence_indices)] = BufferManager.auto(influence_indices, "i").view
-
-        # 🚀 修复 2:召唤 Cython 引擎,执行全量底层 Replace 覆写
-        if weights_1d is not None:
-            processor = self._create_processor(layer_idx, is_mask)
-            if processor:
-                processor.set_custom_array(
-                    source_values=BufferManager.auto(weights_1d, "f").view,
-                    blend_mode=2,
-                    vertex_indices=None,
-                    channel_indices=None,
-                )
-
-        return True
-
-    @_DeferredTaskMixin._update_dg
-    def set_sparse_weights(
-        self,
-        layer_idx: int,
-        is_mask: bool,
-        vtx_indices,
-        channel_indices,
-        sparse_values,
-    ):
-        """
-        设置稀疏权重
-        专供 Undo / Redo 调用。
-        直接使用 C 级覆盖能力还原快照
-        """
-        processor = self._create_processor(layer_idx, is_mask)
-        if not processor:
-            return
-
-        # 撤销时不需要记录新的 Undo 快照,也不需要复杂的模式,直接暴力 Replace (blend_mode=2)
-        processor.set_custom_array(
-            source_values=sparse_values,
-            blend_mode=2,
-            vertex_indices=vtx_indices,
-            channel_indices=channel_indices,
-        )
-
     def _create_processor(self, layer_idx: int, is_mask: bool):
         """
         创建一个 Cython 笔刷引擎实例,并传入完美复用的共享内存池视图。
@@ -784,7 +627,7 @@ class WeightsManager(_DeferredTaskMixin):
                 if processor:
                     processor.get_custom_array(vertex_indices=..., channel_indices=...)
                     processor.set_custom_array( source_values=..., blend_mode=..., vertex_indices=..., channel_indices=..., alpha=..., falloff_weights=... )
-                    processor.normalize_weights(vertex_indices=..., priority=...)
+                    processor.normalize_weights(vertex_indices=..., priority_influence=...)
         ```
         """
         handle = self.get_handle(layer_idx, is_mask)
@@ -846,6 +689,48 @@ class WeightsManager(_DeferredTaskMixin):
             _undo_2d_view,  # 🌟 传入精确塑形后的 2D 视图
         )
 
+    @contextlib.contextmanager
+    def processor_session(self, layer_idx: int, is_mask: bool, backup: bool = True):
+        """
+        [引擎上下文管理器]
+        统管 Cython 算力引擎的获取、快照录制与撤销栈注册。
+        """
+        # 1. 尝试获取算力引擎
+        processor = self._create_processor(layer_idx, is_mask)
+
+        # 拦截空图层或坏句柄
+        if not processor:
+            yield None
+            return
+
+        # 2. 开启录制 (Setup)
+        if backup:
+            processor.begin_stroke()
+
+        try:
+            # 3. 将引擎实例递交给业务代码使用
+            yield processor
+
+        finally:
+            # 4. 收尾工作 (Teardown):确保快照闭合与闭包注册
+            if backup:
+                undo_data = processor.end_stroke()
+                if undo_data:
+                    mod_vtx, mod_ch, old_sparse, new_sparse = undo_data
+
+                    def redo():
+                        self.set_sparse_weights(layer_idx, is_mask, mod_vtx, mod_ch, new_sparse)
+
+                    def undo():
+                        self.set_sparse_weights(layer_idx, is_mask, mod_vtx, mod_ch, old_sparse)
+
+                    # 注册进 Maya 的原生撤销栈
+                    apiundo.commit(redo, undo, execute=False)
+
+                handle = self.get_handle(layer_idx, is_mask)
+                if handle and handle.is_valid:
+                    pass
+
     def paint_stroke_coroutine(self, layer_idx: int, is_mask: bool, backup: bool = True) -> typing.Generator[bool, StrokeParameters, None]:
         """
         [笔刷涂抹协程]
@@ -877,34 +762,35 @@ class WeightsManager(_DeferredTaskMixin):
             # ============================================================
             stroke_coroutine.close()  # 结束涂抹,触发收尾与撤销注册
         """
-        # 1. 获取底层算力引擎（它内部已经自动分配好了当前层精确所需的 Undo 缓存）
+        # 1. 负责绘制当前图层的 Processor
         processor = self._create_processor(layer_idx, is_mask)
         if not processor:
-            yield False  # 启动失败
+            yield False
             return
 
-        # 2. 初始化录制（相当于拦截了 doPress）
+        # 前把 Layer -1 (渲染幕布) 的引擎实例化好，
+        # 因为只做缓存覆盖，所以它完全不需要开启 begin_stroke 录制。
+        base_processor = None
+        if layer_idx >= 0:
+            base_processor = self._create_processor(-1, is_mask=False)
+
+        # 开启当前图层的 Undo 录制
         if backup:
             processor.begin_stroke()
 
         try:
             while True:
-                # 3. 核心魔法：在此挂起协程，等待 BrushManager 发来这一帧的涂抹参数
-                # .send(kwargs) 传进来的数据会被赋值给 stroke_kwargs
-                params: StrokeParameters = yield True
+                # 在此挂起协程，等待 BrushManager 发来这一帧的涂抹参数
+                # 直接接收外部 (Brush) 投喂的 C 级上下文
+                ctx: cBrushCoreCython.BrushStrokeContext = yield True
 
-                if params:
+                if ctx:
                     # 将参数解包传给 C 引擎进行真实涂抹与归一化
-                    processor.process_stroke(
-                        brush_mode=params.brush_mode,
-                        weights_value=params.weights_value,
-                        influences_indices=params.influences_indices,
-                        pressure=params.pressure,
-                        clamp_min=params.clamp_min,
-                        clamp_max=params.clamp_max,
-                        iterations=params.iterations,
-                        normalize=not is_mask,  # 蒙版不归一化，权重归一化
-                    )
+                    hit_count, hit_indices, _ = processor.process_stroke(ctx, normalize=not is_mask)
+                    if hit_count > 0:
+                        dirty_vtx_view = hit_indices[:hit_count]
+                        if base_processor:
+                            self.update_composite(dirty_vtx_view, out_processor=base_processor)
 
         except GeneratorExit:
             # 4. 外部调用 .close() 时，会触发此异常（相当于拦截了 doRelease）
@@ -916,15 +802,153 @@ class WeightsManager(_DeferredTaskMixin):
 
                     def redo():
                         self.set_sparse_weights(layer_idx, is_mask, mod_vtx, mod_ch, new_sparse)
+                        self.update_composite(mod_vtx)
                         self.updateDG()
 
                     def undo():
                         self.set_sparse_weights(layer_idx, is_mask, mod_vtx, mod_ch, old_sparse)
+                        self.update_composite(mod_vtx)
                         self.updateDG()
 
                     apiundo.commit(redo, undo, execute=False)
 
-    def addLayer(self, name: str = "NewLayer") -> int:
+    @defer_task
+    def allocate_and_set_weights(
+        self,
+        layer_idx,
+        is_mask,
+        vtx_count,
+        inf_count,
+        influence_indices,
+        weights_1d,
+        normalize=False,
+        backup=True,
+    ):
+        """
+        [全量重建/覆盖图层]
+        Python 负责重建 Maya 的底层物理内存和结构,然后移交 Cython 引擎进行纯数据的光速覆写。
+        """
+        handle = self.get_handle(layer_idx, is_mask)
+        if handle is None:
+            return False
+
+        # --- [1. 记录图层全量结构快照] ---
+        if backup:
+            old_v_cnt, old_i_cnt, old_g_bones, _, _, old_w_1d = self.get_weights(layer_idx, is_mask)  # get weights 是拷贝,无需再次拷贝
+
+            # 传入进来的数据可能是引用,这个数据要用来处理 redo, 一定要拷贝数据
+            safe_new_idx = array.array("i", BufferManager.auto(influence_indices, "i").view)
+            safe_new_w = array.array("f", BufferManager.auto(weights_1d, "f").view)
+
+            def redo():
+                self.allocate_and_set_weights(layer_idx, is_mask, vtx_count, inf_count, safe_new_idx, safe_new_w, backup=False)
+
+            def undo():
+                self.allocate_and_set_weights(layer_idx, is_mask, old_v_cnt, old_i_cnt, old_g_bones, old_w_1d, backup=False)
+
+            apiundo.commit(redo, undo, execute=False)
+
+        if vtx_count == 0:
+            handle.clear()
+            return True
+
+        # --- [2. Python 负责重建底层物理内存与骨骼 Header (搭地基)] ---
+        handle.resize(vtx_count, len(influence_indices))
+
+        if influence_indices:
+            _view = handle.memory.view
+            _int = _view.cast("B").cast("i")
+            _int[2 : 2 + len(influence_indices)] = BufferManager.auto(influence_indices, "i").view
+
+        # 🚀 修复 2:召唤 Cython 引擎,执行全量底层 Replace 覆写
+        if weights_1d is not None:
+            processor = self._create_processor(layer_idx, is_mask)
+            if processor:
+                processor.set_custom_array(
+                    source_values=BufferManager.auto(weights_1d, "f").view,
+                    blend_mode=2,
+                    vertex_indices=None,
+                    channel_indices=None,
+                )
+                if normalize:
+                    processor.normalize_weights(vertex_indices=None, priority_influence=-1)
+
+        return True
+
+    @update_dg
+    def set_sparse_weights(
+        self,
+        layer_idx: int,
+        is_mask: bool,
+        vtx_indices,
+        channel_indices,
+        sparse_values,
+    ):
+        """
+        设置稀疏权重
+        专供 Undo / Redo 调用。
+        直接使用 C 级覆盖能力还原快照
+        """
+        processor = self._create_processor(layer_idx, is_mask)
+        if not processor:
+            return
+
+        # 撤销时不需要记录新的 Undo 快照,也不需要复杂的模式,直接暴力 Replace (blend_mode=2)
+        processor.set_custom_array(
+            source_values=sparse_values,
+            blend_mode=2,
+            vertex_indices=vtx_indices,
+            channel_indices=channel_indices,
+        )
+
+    @defer_task
+    def blend_weights(
+        self,
+        layer_idx: int,
+        is_mask: bool,
+        weights_1d,
+        vtx_indices,
+        influence_indices=None,
+        blend_mode: int = 2,
+        alpha: float = 1.0,
+        falloff_weights=None,
+        normalize=True,
+        backup: bool = True,
+    ):
+        """
+        [混合/覆写权重] (统一高级接口)
+        支持加减乘除、透明度混合、蒙版衰减、自动归一化与稀疏撤销。
+        """
+        # 开启引擎会话
+        with self.processor_session(layer_idx, is_mask, backup) as processor:
+            # 如果没拿到引擎,直接退出
+            if not processor:
+                return False
+
+            # --- 纯粹的数据转换与计算 ---
+            # fmt:off
+            v_view   = BufferManager.auto(vtx_indices              , "i").view    if vtx_indices              is not None else None
+            b_view   = BufferManager.auto(influence_indices        , "i").view    if influence_indices        is not None else None
+            src_view = BufferManager.auto(weights_1d               , "f").view
+            fal_view = BufferManager.auto(falloff_weights          , "f").view    if falloff_weights          is not None else None
+            # fmt:on
+
+            # Cython 执行带混合模式的覆写
+            processor.set_custom_array( source_values   = src_view   ,
+                                        blend_mode      = blend_mode ,
+                                        vertex_indices  = v_view     ,
+                                        channel_indices = b_view     ,
+                                        alpha           = alpha      ,
+                                        falloff_weights = fal_view   )  # fmt:skip
+
+            # 权重归一化
+            if not is_mask and normalize:
+                priority = b_view[0] if (b_view is not None and len(b_view) > 0) else -1
+                processor.normalize_weights(v_view, priority)
+
+        return True
+
+    def add_layer(self, name: str = "NewLayer", weights_value=0.0, mask_weights_value=1.0) -> int:
         """
         添加一个新图层，自动分配并初始化底层物理内存。
         - 蒙版 (Mask) 初始化为全 1.0 (完全无遮挡)
@@ -952,7 +976,7 @@ class WeightsManager(_DeferredTaskMixin):
 
         if base_v_cnt > 0:
             # --- 初始化 Mask (全 1.0) ---
-            mask_weights = array.array("f", [0.0] * base_v_cnt)
+            mask_weights = array.array("f", [mask_weights_value] * base_v_cnt)
 
             # 由于 allocate_and_set_weights 带有 @_defer_task 装饰器，
             # 这里并不会立刻执行，而是压入队列。当下方的 updateDG() 唤醒节点后，
@@ -960,7 +984,7 @@ class WeightsManager(_DeferredTaskMixin):
             self.allocate_and_set_weights(layer_idx=new_idx, is_mask=True, vtx_count=base_v_cnt, inf_count=1, influence_indices=array.array("i", [0]), weights_1d=mask_weights, backup=True)
 
             # --- 初始化 Weights (全 0.0) ---
-            layer_weights = array.array("f", [0.0] * (base_v_cnt * base_i_cnt))
+            layer_weights = array.array("f", [weights_value] * (base_v_cnt * base_i_cnt))
 
             self.allocate_and_set_weights(layer_idx=new_idx, is_mask=False, vtx_count=base_v_cnt, inf_count=base_i_cnt, influence_indices=base_infs, weights_1d=layer_weights, backup=True)
 
@@ -969,7 +993,7 @@ class WeightsManager(_DeferredTaskMixin):
 
         return new_idx
 
-    def deleteLayer(self, layer_idx: int) -> bool:
+    def delete_layer(self, layer_idx: int) -> bool:
         """
         删除指定图层并释放关联资源。
         """
@@ -993,3 +1017,121 @@ class WeightsManager(_DeferredTaskMixin):
             return True
 
         return False
+
+    @defer_task
+    def update_influences(self, new_influence_indices: list[int]):
+        """
+        [专属骨骼重组器] - 极致 O(I) 优化版
+        前提：模型的顶点数绝对不变！
+        支持：骨骼的新增、删除、打乱顺序。
+        """
+        if not new_influence_indices:
+            return False
+
+        new_i_cnt = len(new_influence_indices)
+        layer_indices_to_update = [-1, *self.layer_indices]
+
+        for layer_idx in layer_indices_to_update:
+            # 1. 提取当前图层的旧数据
+            v_cnt, old_i_cnt, old_g_bones, _, _, old_w_1d = self.get_weights(layer_idx, is_mask=False)
+
+            if v_cnt <= 0 or old_i_cnt <= 0 or not old_w_1d:
+                new_w_1d = array.array("f", [0.0] * (v_cnt * new_i_cnt))
+                self.allocate_and_set_weights(
+                    layer_idx,
+                    False,
+                    v_cnt,
+                    new_i_cnt,
+                    new_influence_indices,
+                    new_w_1d,
+                    normalize=True,
+                    backup=True,
+                )
+                continue
+
+            # 2. 建立新旧骨骼的“映射字典”
+            bone_mapping = []
+            old_bones_list = list(old_g_bones)
+            for new_j, bone_id in enumerate(new_influence_indices):
+                if bone_id in old_bones_list:
+                    bone_mapping.append((old_bones_list.index(bone_id), new_j))
+
+            # 3. 创建全新容器，并获取 1D 内存视图
+            new_w_1d = array.array("f", [0.0] * (v_cnt * new_i_cnt))
+            old_view = memoryview(old_w_1d).cast("B").cast("f")
+            new_view = memoryview(new_w_1d).cast("B").cast("f")
+
+            # =========================================================
+            # 🚀 4. 终极性能魔法：按步长 (Stride) 在 C 层面整列拷贝！
+            # 我们将 O(V) 的 10万次循环，降维成了 O(I) 的几十次循环！
+            # =========================================================
+            for old_j, new_j in bone_mapping:
+                # 语法：view[start :: step]
+                # 从旧视图提取第 old_j 根骨骼的所有顶点数据
+                # 直接赋值给新视图第 new_j 根骨骼的所有顶点位置
+                new_view[new_j::new_i_cnt] = old_view[old_j::old_i_cnt]
+
+            # 5. 提交底层物理内存重组
+            self.allocate_and_set_weights(
+                layer_idx=layer_idx,
+                is_mask=False,
+                vtx_count=v_cnt,
+                inf_count=new_i_cnt,
+                influence_indices=array.array("i", new_influence_indices),
+                weights_1d=new_w_1d,
+                normalize=True,
+                backup=True,
+            )
+
+        return True
+
+    def update_composite(self, vtx_indices=None, out_processor=None):
+        """
+        图层混合器
+        """
+        is_sparse = vtx_indices is not None and len(vtx_indices) > 0
+        v_view = BufferManager.auto(vtx_indices, "i").view if is_sparse else None
+
+        # 提取激活的图层
+        active_layers = [idx for idx in sorted(self.layer_indices) if self.get_layer(idx).enabled]
+        if not active_layers:
+            return
+
+        def _do_blend(processor_inst: cBrushCoreCython.SkinWeightProcessor):
+            # 1. 瞬间清空幕布 (直接调用底层 C 算子，0 毫秒)
+            processor_inst.clear_buffer_sparse(vertex_indices=v_view)
+
+            # 2. 遍历图层，扔给 C 引擎进行极速加法
+            for layer_idx in active_layers:
+                handle_w = self.get_handle(layer_idx, False)
+                handle_m = self.get_handle(layer_idx, True)
+                if not handle_w or not handle_m:
+                    continue
+                    
+                _, _, _, w_in_1d = handle_w.parse_raw_weights()
+                _, _, _, m_in_1d = handle_m.parse_raw_weights()
+                if not w_in_1d or not m_in_1d:
+                    continue
+                    
+                w_in_view = memoryview(w_in_1d).cast("B").cast("f")
+                m_in_view = memoryview(m_in_1d).cast("B").cast("f")
+                
+                # 🚀 绝杀：将底层指针直接抛给 C 引擎执行循环，全过程纯 C 级运算！
+                processor_inst.add_layer_weights(
+                    layer_weights=w_in_view, 
+                    layer_mask=m_in_view, 
+                    vertex_indices=v_view
+                )
+
+            # 3. 最后在 C 引擎中执行强制归一化
+            processor_inst.normalize_weights(vertex_indices=v_view, priority_influence=-1)
+
+        # ---------------------------------------------------------
+        # 引擎会话调度分流
+        # ---------------------------------------------------------
+        if out_processor:
+            _do_blend(out_processor)
+        else:
+            with self.processor_session(-1, is_mask=False, backup=False) as temp_processor:
+                if temp_processor:
+                    _do_blend(temp_processor)

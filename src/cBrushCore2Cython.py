@@ -1162,75 +1162,54 @@ class BrushUndoRecorder:
 
 # fmt:off
 @cython.cclass
-class BrushMathContext:
-    """笔刷数学运算上下文 封装所有计算所需的局部环境变量"""
-
-    # 1. 输入数据
-    values: cython.float[::1]
-    pressure: cython.float
+class BrushStrokeContext:
+    """
+    笔刷终极上下文 (The Ultimate Context)
+    完美合并了 UI 配置参数与底层物理内存视图！
+    """
+    # ==========================================
+    # 1. 静态参数区 (由 Python 在鼠标按下时填入)
+    # ==========================================
+    brush_mode     : cython.int
+    values         : cython.float[::1]
     channel_indices: cython.int[::1]
+    pressure       : cython.float
+    clamp_min      : cython.float
+    clamp_max      : cython.float
+    iterations     : cython.int
+    normalize      : cython.bint
 
-    # 2. 限制条件
-    clamp_min: cython.float
-    clamp_max: cython.float
-
-    # 3. 命中范围数据
-    vertex_count: cython.int
-    vertex_buffer: cython.int[::1]
-    falloff_buffer: cython.float[::1]
-
-    undo_buffer: cython.float[:, ::1]
+    # ==========================================
+    # 2. 动态内存区 (由 Cython 在射线命中后挂载)
+    # ==========================================
+    vertex_count      : cython.int
+    vertex_buffer     : cython.int[::1]
+    falloff_buffer    : cython.float[::1]
+    undo_buffer       : cython.float[:, ::1]
     max_falloff_buffer: cython.float[::1]
-    """
-    最大衰减缓存 (Max Falloff Buffer)
-        - 核心作用: 防止高频 Tick 导致笔刷权重无限叠加(印章累加问题).
-        - 触发重置: 每一次鼠标按下开始新的一笔时, 清空上一笔的最大衰减记录, 让顶点的最大衰减归零 (发生在 UtilBrushProcessor 中).
-    
-    Example:
-        - 假设某顶点初始权重为 0.0, 笔刷强度设置为 0.2.
-        - Tick 1: 笔刷边缘扫到该点
-            * 距离中心较远, 计算出 fal = 0.5.
-            * 因为 0.5 > 0.0 (初始的 max_falloff), 通过拦截.
-            * 更新 max_falloff_buffer = 0.5.
-            * 提取快照值 orig_val = 0.0.
-            * 0.0 + (0.5 * 0.2) = 0.1.当前顶点被写为 0.1.
-            
-        - Tick 2: 笔刷中心正好移动到该点上方
-            * 距离中心极近, 计算出 fal = 1.0.
-            * 因为 1.0 > 0.5 (历史最高记录), 再次通过拦截.
-            * 更新 max_falloff_buffer = 1.0.
-            * 提取快照值依然是 orig_val = 0.0 (永远基于按下鼠标那一刻的原始快照数据计算).
-            * 0.0 + (1.0 * 0.2) = 0.2.当前顶点被覆盖写为 0.2.
-            
-        - Tick 3: 笔刷在原地停留或微微偏移
-            * 算出的 fal = 0.9.
-            * 拦截网触发: 0.9 不大于 历史最高记录 1.0.
-            * 直接跳过计算.顶点维持在完美的 0.2, 绝不会继续累加.
-    """
 
     def __init__(
         self,
-        values: cython.float[::1],
-        pressure: cython.float,
-        channel_indices: cython.int[::1],    
-        clamp_min: cython.float,             
-        clamp_max: cython.float,             
-        vertex_count: cython.int,            
-        vertex_buffer: cython.int[::1],      
-        falloff_buffer: cython.float[::1],
-        undo_buffer: cython.float[:, ::1],    
-        max_falloff_buffer: cython.float[::1] 
+        brush_mode      : cython.int,
+        values          : cython.float[::1],
+        channel_indices : cython.int[::1],
+        pressure        : cython.float = 1.0,
+        clamp_min       : cython.float = 0.0,
+        clamp_max       : cython.float = 1.0,
+        iterations      : cython.int = 1,
+        normalize       : cython.bint = True
     ):
-        self.values             = values
-        self.pressure           = pressure
-        self.channel_indices    = channel_indices
-        self.clamp_min          = clamp_min
-        self.clamp_max          = clamp_max
-        self.vertex_count       = vertex_count
-        self.vertex_buffer      = vertex_buffer
-        self.falloff_buffer     = falloff_buffer
-        self.undo_buffer        = undo_buffer
-        self.max_falloff_buffer = max_falloff_buffer
+        self.brush_mode      = brush_mode
+        self.values          = values
+        self.channel_indices = channel_indices
+        self.pressure        = pressure
+        self.clamp_min       = clamp_min
+        self.clamp_max       = clamp_max
+        self.iterations      = iterations
+        self.normalize       = normalize
+
+        # 动态内存区初始化为 0 或 None，等引擎来挂载
+        self.vertex_count = 0
 # fmt:on
 
 
@@ -1259,10 +1238,11 @@ class BrushMathEngine:
 
     # region ---------- Exec Math
     @cython.cfunc
-    def _execute_math_step(self, brush_mode: cython.int, ctx: BrushMathContext) -> cython.void:
+    def _execute_math_step(self, ctx: BrushStrokeContext) -> cython.void:
         """动态分发: 0-3使用防重叠绝对计算, 4-5使用原始的相对迭代计算"""
+        brush_mode = ctx.brush_mode
         if brush_mode == 0 or brush_mode == 1 or brush_mode == 2 or brush_mode == 3:
-            self._math_standard_stroke(brush_mode, ctx)
+            self._math_standard_stroke(ctx)
         elif brush_mode == 4:
             self._math_smooth(ctx)
         elif brush_mode == 5:
@@ -1274,7 +1254,10 @@ class BrushMathEngine:
     @cython.wraparound(False)
     @cython.initializedcheck(False)
     @cython.ccall
-    def _math_standard_stroke(self, brush_mode: cython.int, ctx: BrushMathContext) -> cython.void:
+    def _math_standard_stroke(self, ctx: BrushStrokeContext) -> cython.void:
+
+        brush_mode = ctx.brush_mode
+
         i: cython.int = 0
         j: cython.int = 0
         row: cython.int = 0
@@ -1349,7 +1332,7 @@ class BrushMathEngine:
     @cython.cdivision(True)
     @cython.initializedcheck(False)
     @cython.ccall
-    def _math_smooth(self, ctx: BrushMathContext) -> cython.void:
+    def _math_smooth(self, ctx: BrushStrokeContext) -> cython.void:
         if self.adj_offsets is None or self.adj_indices is None:
             raise RuntimeError("Smooth Error: Topology (adj_offsets/indices) is not initialized.")
 
@@ -1408,7 +1391,7 @@ class BrushMathEngine:
     @cython.wraparound(False)
     @cython.initializedcheck(False)
     @cython.ccall
-    def _math_sharp(self, ctx: BrushMathContext) -> cython.void:
+    def _math_sharp(self, ctx: BrushStrokeContext) -> cython.void:
         i: cython.int = 0
         j: cython.int = 0
         row: cython.int = 0
@@ -1662,52 +1645,38 @@ class UtilBrushProcessor:
     @cython.boundscheck(False)
     @cython.wraparound(False)
     @cython.ccall
-    def process_stroke(
-        self,
-        brush_mode: cython.int,
-        values: cython.float[::1],
-        channel_indices: cython.int[::1],
-        pressure: cython.float = 1.0,
-        clamp_min: cython.float = 0.0,
-        clamp_max: cython.float = 1.0,
-        iterations: cython.int = 1,
-    ) -> tuple:
+    def process_stroke(self, brush_stroke_context: BrushStrokeContext) -> tuple:
         """
         统一笔刷计算入口.
         命中检测 -> 构造上下文 -> 记录快照 -> 数学迭代.
         """
-        _core = self.core
+        raycast_core = self.core
 
         # 1. 命中检测拦截
-        if _core.active_hit_count == 0:
-            return (0, _core.active_hit_indices, self.modified_buffer)
+        if raycast_core.active_hit_count == 0:
+            return (0, raycast_core.active_hit_indices, self.modified_buffer)
 
         # 2. 调度快照引擎:在修改前备份受影响顶点的原始数据
-        self.recorder.record_snapshot(_core.active_hit_indices)
+        self.recorder.record_snapshot(raycast_core.active_hit_indices)
 
-        # 3. 构造算上下文 (Context)
-        ctx = BrushMathContext(
-            values=values,
-            channel_indices=channel_indices,
-            pressure=pressure,
-            clamp_min=clamp_min,
-            clamp_max=clamp_max,
-            vertex_count=_core.active_hit_count,
-            vertex_buffer=_core.active_hit_indices,
-            falloff_buffer=_core.active_hit_falloff,
-            undo_buffer=self.undo_buffer,
-            max_falloff_buffer=self.max_falloff_buffer,
-        )
+        # ==========================================
+        # UI 层传进来的 ctx 里只有静态配置，我们在这里把 raycast/falloff 层的物理内存给它
+        # ==========================================
+        brush_stroke_context.vertex_count = self.core.active_hit_count
+        brush_stroke_context.vertex_buffer = self.core.active_hit_indices
+        brush_stroke_context.falloff_buffer = self.core.active_hit_falloff
+        brush_stroke_context.undo_buffer = self.undo_buffer
+        brush_stroke_context.max_falloff_buffer = self.max_falloff_buffer
 
         # 4. 执行数学运算迭代
         _iter: cython.int = 0
-        for _iter in range(iterations):
+        for _iter in range(brush_stroke_context.iterations):
             # 衔接新的 MathEngine 分发接口
-            self.math_engine._execute_math_step(brush_mode, ctx)
+            self.math_engine._execute_math_step(brush_stroke_context)
 
         return (
-            _core.active_hit_count,
-            _core.active_hit_indices,
+            raycast_core.active_hit_count,
+            raycast_core.active_hit_indices,
             self.modified_buffer,
         )
 
@@ -1745,6 +1714,67 @@ class UtilBrushProcessor:
             clamp_min,
             clamp_max,
         )
+
+    # =========================================================================
+    # 🚀 图层合成专属  (Layer Compositing Native Operators)
+    # =========================================================================
+    @cython.boundscheck(False)
+    @cython.wraparound(False)
+    @cython.ccall
+    def clear_buffer_sparse(self, vertex_indices=None) -> cython.void:
+        """ 局部或全量清零画布，替代 Python 的 memset 或循环"""
+        _out = self.modified_buffer
+        _channels: cython.int = _out.shape[1]
+
+        use_all_v: cython.bint = True
+        if (vertex_indices is not None) and (len(vertex_indices) > 0):
+            use_all_v = False
+
+        _vtx_view: cython.int[::1] = None if use_all_v else vertex_indices
+        _v_count: cython.int = _out.shape[0] if use_all_v else _vtx_view.shape[0]
+
+        i: cython.int
+        j: cython.int
+        row: cython.int
+
+        for i in range(_v_count):
+            row = i if use_all_v else _vtx_view[i]
+            for j in range(_channels):
+                _out[row, j] = 0.0
+
+    @cython.boundscheck(False)
+    @cython.wraparound(False)
+    @cython.ccall
+    def add_layer_weights(self, layer_weights: cython.float[::1], layer_mask: cython.float[::1], vertex_indices=None) -> cython.void:
+        """
+        专为加法蒙版合成 (Additive Compositing) 设计
+        完美处理：全量输入数组 + 稀疏索引拦截
+        """
+        _out = self.modified_buffer
+        _channels: cython.int = _out.shape[1]
+
+        use_all_v: cython.bint = True
+        if (vertex_indices is not None) and (len(vertex_indices) > 0):
+            use_all_v = False
+
+        _vtx_view: cython.int[::1] = None if use_all_v else vertex_indices
+        _v_count: cython.int = _out.shape[0] if use_all_v else _vtx_view.shape[0]
+
+        i: cython.int
+        j: cython.int
+        row: cython.int
+        mask_val: cython.float
+
+        for i in range(_v_count):
+            row = i if use_all_v else _vtx_view[i]
+            mask_val = layer_mask[row]
+
+            if mask_val <= 0.000001:
+                continue
+
+            for j in range(_channels):
+                # 公式: Out[v, c] += Layer[v, c] * Mask[v]
+                _out[row, j] += layer_weights[row * _channels + j] * mask_val
 
     # endregion
 
@@ -1787,36 +1817,16 @@ class SkinWeightProcessor(UtilBrushProcessor):
 
     # region ---------------------- Apply Weight
     @cython.ccall
-    def process_stroke(
-        self,
-        brush_mode: cython.int,
-        weights_value: cython.float[::1],  # 保持为 view外部传入时包装
-        influences_indices: cython.int[::1],
-        pressure: cython.float = 1.0,
-        clamp_min: cython.float = 0.0,
-        clamp_max: cython.float = 1.0,
-        iterations: cython.int = 1,
-        normalize:cython.bint = True,
-    ) -> tuple:
+    def process_stroke(self, brush_stroke_context: BrushStrokeContext, normalize: bool = True) -> tuple:
         """执行蒙皮权重运算 支持单骨骼或多骨骼统一调度."""
 
         # 1. 调用父类核心逻辑
-        # 无论是一根骨骼还是多根骨骼 MathEngine 都能通过 channel_indices 处理
-        res = UtilBrushProcessor.process_stroke(
-            self,
-            brush_mode,
-            weights_value,
-            influences_indices,
-            pressure,
-            clamp_min,
-            clamp_max,
-            iterations,
-        )
+        res = UtilBrushProcessor.process_stroke(self, brush_stroke_context)
 
         # 2. 判定有效修改并执行归一化
         if res[0] > 0:
-            # 以 influences_indices 的第一个元素作为“抢占优先级”骨骼
-            priority_idx: cython.int = influences_indices[0]
+            # 以 channel_indices 中的第一根骨骼作为优先级骨骼，即当前正在绘制的骨骼，保护它的权重不被随意缩放
+            priority_idx: cython.int = brush_stroke_context.channel_indices[0]
 
             # 只对命中的顶点切片进行归一化
             hit_indices_view = res[1][: res[0]]
@@ -1840,7 +1850,24 @@ class SkinWeightProcessor(UtilBrushProcessor):
         vertex_indices                 = None, 
         priority_influence: cython.int = -1,
     ) -> cython.float[:, ::1]:  # fmt:skip
-        """权重归一化."""
+        """
+        权重归一化 (Normalize Weights)
+
+        Args:
+            vertex_indices (Optional[cython.int[::1]]):
+                目标顶点的物理索引数组。
+                - 【局部稀疏】：在笔刷拖拽时，传入被画笔影响的局部顶点，实现光速归一化。
+                - 【全量操作】：如果传入 None 或空数组，则对当前图层的所有顶点执行全量归一化。
+
+            priority_influence (cython.int):
+                最高优先级骨骼（主权骨骼）的通道索引。默认值为 -1（无优先级，众生平等）。
+                - 在笔刷涂抹时，当前正在绘制的骨骼就是 priority_influence。
+                  归一化系统会**绝对保护**它的权重值不被随意缩放，而是强迫其他未锁定的骨骼
+
+        Returns:
+            cython.float[:, ::1]: 返回修改后的完整 2D 权重内存视图。
+
+        """
         _locks = self.influences_locks_buffer
         _w2D = self.modified_buffer
         num_influences: cython.int = self.channel_count

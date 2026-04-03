@@ -100,6 +100,7 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
     # fmt:off
     aGeomMatrix       = om1.MObject()
     aWeights          = om1.MObject()
+    aLayerMaskAll     = om1.MObject()
     aLayerWeights     = om1.MObject()
     aLayerMask        = om1.MObject()
     aLayerEnabled     = om1.MObject()
@@ -488,7 +489,7 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
                 self.weights_manager.sync_layer_cache(dataBlock)
                 # 执行异步权重修改
                 # 为了优化性能, 权重修改是放在deform内部进行, 通过dataBlock拿到rawPoint直接修改内存, 而非外部直接修改mPlug
-                self.weights_manager.execute_deferred_tasks()
+                self.weights_manager.task_manager.execute_tasks()
 
                 self.isDirty_weights = True
 
@@ -572,6 +573,8 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         CythonSkinDeformer.aWeights = tAttr.create("cWeights", "cw", om1.MFnData.kVectorArray)
         tAttr.setHidden(True)
         # --- layer weights children
+        CythonSkinDeformer.aLayerMask = tAttr.create("layerMaskAll", "lma", om1.MFnData.kVectorArray)
+        tAttr.setHidden(True)
         default_str = om1.MFnStringData().create("layer")
         CythonSkinDeformer.aLayerName = tAttr.create("layerName", "ln", om1.MFnData.kString, default_str)
         tAttr.setHidden(True)
@@ -608,7 +611,8 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         for attr in  (CythonSkinDeformer.aGeomMatrix, 
                       CythonSkinDeformer.aBindPreMatrix, 
                       CythonSkinDeformer.aInfluenceMatrix, 
-                      CythonSkinDeformer.aWeights, 
+                      CythonSkinDeformer.aWeights,
+                      CythonSkinDeformer.aLayerMaskAll,
                       CythonSkinDeformer.aLayerCompound, 
                       CythonSkinDeformer.aRefresh,
                       CythonSkinDeformer.aCurrentPaintLayerIndex,
