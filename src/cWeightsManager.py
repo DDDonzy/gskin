@@ -9,7 +9,9 @@ import contextlib
 from collections import deque
 
 
+from maya import cmds
 import maya.OpenMaya as om1  # type:ignore
+
 
 from . import apiundo
 from . import cBrushCore2Cython as cBrushCoreCython
@@ -19,6 +21,100 @@ from .cBufferManager import BufferManager
 
 if typing.TYPE_CHECKING:
     from .cSkinDeform import CythonSkinDeformer  # type: ignore
+
+
+class StrokeParameters:
+    __slot__ = (
+        "brush_mode",
+        "weights_value",
+        "influences_indices",
+        "pressure",
+        "clamp_min",
+        "clamp_max",
+        "iterations",
+    )
+    brush_mode: int
+    weights_value: array.array
+    influences_indices: array.array
+    pressure: float
+    clamp_min: float
+    clamp_max: float
+    iterations: int
+
+    def __init__(
+        self,
+        brush_mode,
+        weights_value,
+        influences_indices,
+        pressure,
+        clamp_min=0.0,
+        clamp_max=1.0,
+        iterations=1,
+    ):
+        self.brush_mode = brush_mode
+        self.weights_value = weights_value
+        self.influences_indices = influences_indices
+        self.pressure = pressure
+        self.clamp_min = clamp_min
+        self.clamp_max = clamp_max
+        self.iterations = iterations
+
+
+class _DeferredTaskMixin:
+    """
+    专为 Maya 节点计算周期设计的任务调度器与刷新锁。
+    提供队列管理、并发锁以及 updateDG 的执行防抖。
+    """
+
+    def __init__(self):
+        # 全部声明为保护属性,向子类隐藏实现细节
+        self._deferred_tasks = deque()
+        self._tasks_lock = threading.Lock()
+        self._is_dg_updating = False
+
+    @staticmethod
+    def _update_dg(func):
+        """防抖锁:确保唯一次视口刷新"""
+
+        @functools.wraps(func)
+        def wrapper(self: WeightsManager, *args, **kwargs):
+            is_top_level = not getattr(self, "_is_dg_updating", False)
+            if is_top_level:
+                self._is_dg_updating = True
+            try:
+                return func(self, *args, **kwargs)
+            finally:
+                if is_top_level:
+                    self._is_dg_updating = False
+                    if hasattr(self, "updateDG") and callable(self.updateDG):
+                        self.updateDG()
+
+        return wrapper
+
+    @staticmethod
+    def _defer_task(func):
+        """延迟执行:推入队列并唤醒节点"""
+
+        @functools.wraps(func)
+        def wrapper(self: WeightsManager, *args, **kwargs):
+            task = functools.partial(func, self, *args, **kwargs)
+            with self._tasks_lock:
+                self._deferred_tasks.append(task)
+
+            if hasattr(self, "updateDG") and callable(self.updateDG):
+                self.updateDG()
+
+        return wrapper
+
+    def execute_deferred_tasks(self):
+        """[高内聚] 暴露给子类,用于消化队列"""
+        if not self._deferred_tasks:
+            return
+
+        with self._tasks_lock:
+            while self._deferred_tasks:
+                task = self._deferred_tasks.popleft()
+                task()
 
 
 class WeightsHandle:
@@ -356,63 +452,6 @@ class WeightsLayerItem:
         self.name = new_name
 
 
-class _DeferredTaskMixin:
-    """
-    专为 Maya 节点计算周期设计的任务调度器与刷新锁。
-    提供队列管理、并发锁以及 updateDG 的执行防抖。
-    """
-
-    def __init__(self):
-        # 全部声明为保护属性,向子类隐藏实现细节
-        self._deferred_tasks = deque()
-        self._tasks_lock = threading.Lock()
-        self._is_dg_updating = False
-
-    @staticmethod
-    def _update_dg(func):
-        """防抖锁:确保唯一次视口刷新"""
-
-        @functools.wraps(func)
-        def wrapper(self: WeightsManager, *args, **kwargs):
-            is_top_level = not getattr(self, "_is_dg_updating", False)
-            if is_top_level:
-                self._is_dg_updating = True
-            try:
-                return func(self, *args, **kwargs)
-            finally:
-                if is_top_level:
-                    self._is_dg_updating = False
-                    if hasattr(self, "updateDG") and callable(self.updateDG):
-                        self.updateDG()
-
-        return wrapper
-
-    @staticmethod
-    def _defer_task(func):
-        """延迟执行:推入队列并唤醒节点"""
-
-        @functools.wraps(func)
-        def wrapper(self: WeightsManager, *args, **kwargs):
-            task = functools.partial(func, self, *args, **kwargs)
-            with self._tasks_lock:
-                self._deferred_tasks.append(task)
-
-            if hasattr(self, "updateDG") and callable(self.updateDG):
-                self.updateDG()
-
-        return wrapper
-
-    def execute_deferred_tasks(self):
-        """[高内聚] 暴露给子类,用于消化队列"""
-        if not self._deferred_tasks:
-            return
-
-        with self._tasks_lock:
-            while self._deferred_tasks:
-                task = self._deferred_tasks.popleft()
-                task()
-
-
 class WeightsManager(_DeferredTaskMixin):
     def __init__(self, cSkin: CythonSkinDeformer):
         super().__init__()
@@ -602,7 +641,7 @@ class WeightsManager(_DeferredTaskMixin):
                     pass
 
     @_DeferredTaskMixin._defer_task
-    def set_weights(
+    def blend_weights(
         self,
         layer_idx: int,
         is_mask: bool,
@@ -616,7 +655,7 @@ class WeightsManager(_DeferredTaskMixin):
         backup: bool = True,
     ):
         """
-        将所有输入丢给 Cython 无头引擎,
+        [混合/覆写权重] (统一高级接口)
         支持加减乘除、透明度混合、蒙版衰减、自动归一化与稀疏撤销。
         """
         # 开启引擎会话
@@ -649,7 +688,7 @@ class WeightsManager(_DeferredTaskMixin):
         return True
 
     @_DeferredTaskMixin._defer_task
-    def init_handle_data(
+    def allocate_and_set_weights(
         self,
         layer_idx,
         is_mask,
@@ -676,10 +715,10 @@ class WeightsManager(_DeferredTaskMixin):
             safe_new_w = array.array("f", BufferManager.auto(weights_1d, "f").view)
 
             def redo():
-                self.init_handle_data(layer_idx, is_mask, vtx_count, inf_count, safe_new_idx, safe_new_w, backup=False)
+                self.allocate_and_set_weights(layer_idx, is_mask, vtx_count, inf_count, safe_new_idx, safe_new_w, backup=False)
 
             def undo():
-                self.init_handle_data(layer_idx, is_mask, old_v_cnt, old_i_cnt, old_g_bones, old_w_1d, backup=False)
+                self.allocate_and_set_weights(layer_idx, is_mask, old_v_cnt, old_i_cnt, old_g_bones, old_w_1d, backup=False)
 
             apiundo.commit(redo, undo, execute=False)
 
@@ -735,6 +774,19 @@ class WeightsManager(_DeferredTaskMixin):
         )
 
     def _create_processor(self, layer_idx: int, is_mask: bool):
+        """
+        创建一个 Cython 笔刷引擎实例,并传入完美复用的共享内存池视图。
+        用户可以根据这个实例进行高性能的局部权重提取或修改。
+
+        Example:
+        ```python
+            with self._processor_session(layer_idx, is_mask) as processor:
+                if processor:
+                    processor.get_custom_array(vertex_indices=..., channel_indices=...)
+                    processor.set_custom_array( source_values=..., blend_mode=..., vertex_indices=..., channel_indices=..., alpha=..., falloff_weights=... )
+                    processor.normalize_weights(vertex_indices=..., priority=...)
+        ```
+        """
         handle = self.get_handle(layer_idx, is_mask)
 
         if handle is None or not handle.is_valid:
@@ -764,15 +816,23 @@ class WeightsManager(_DeferredTaskMixin):
 
         # 4. Undo 2D 矩阵池 (vtx_count * inf_count)
         req_undo_elements = vtx_count * inf_count
-        curr_undo_elements = self._pool_undo_buffer.shape[0] * self._pool_undo_buffer.shape[1] if self._pool_undo_buffer else 0
+        # 计算当前物理池的真实总容量
+        curr_capacity = 0
+        if self._pool_undo_buffer:
+            if len(self._pool_undo_buffer.shape) == 2:  # noqa: SIM108
+                curr_capacity = self._pool_undo_buffer.shape[0] * self._pool_undo_buffer.shape[1]
+            else:
+                curr_capacity = self._pool_undo_buffer.shape[0]
 
-        if curr_undo_elements < req_undo_elements:
-            # 容量不足，重新申请大内存
-            self._pool_undo_buffer = BufferManager.allocate("f", (vtx_count, inf_count))
-        else:
-            # 容量足够，直接零拷贝 Reshape 出当前图层所需的二维形状！
-            # (比如从 80 个骨骼的权重层 切到 1 个通道的 Mask 层，直接把大内存切成瘦长条)
-            self._pool_undo_buffer = self._pool_undo_buffer.reshape((vtx_count, inf_count))
+        # 保证底层物理池足够大 (统一用 1D 存储以保留最大容量)
+        if curr_capacity < req_undo_elements:
+            self._pool_undo_buffer = BufferManager.allocate("f", (req_undo_elements,))
+
+        # 🌟 核心修复：从物理池中切出精确的尺寸，然后再转 2D
+        # 注意：这里我们产生一个局部变量 _undo_2d_view 传给引擎，绝不覆盖 self._pool_undo_buffer
+        _flat_view = self._pool_undo_buffer.view.cast("B").cast("f")  # 强制统一为 1D 浮点视图
+        _exact_slice = _flat_view[:req_undo_elements]  # 精确切取本次所需的数据量
+        _undo_2d_view = _exact_slice.cast("B").cast("f", shape=(vtx_count, inf_count))  # 完美 2D 塑形
 
         # =========================================================
 
@@ -783,13 +843,39 @@ class WeightsManager(_DeferredTaskMixin):
             self._pool_vtx_idx.view,
             self._pool_vtx_bool.view,
             self._pool_inf_locks.view,
-            self._pool_undo_buffer.view,
+            _undo_2d_view,  # 🌟 传入精确塑形后的 2D 视图
         )
 
-    def paint_stroke_coroutine(self, layer_idx: int, is_mask: bool, backup: bool = True):
+    def paint_stroke_coroutine(self, layer_idx: int, is_mask: bool, backup: bool = True) -> typing.Generator[bool, StrokeParameters, None]:
         """
-        基于 yield 的跨帧笔刷状态机。
-        完美接管 begin_stroke -> N次过程计算 -> end_stroke。
+        [笔刷涂抹协程]
+        这是一个专为笔刷涂抹设计的协程函数，提供了一个高性能的上下文环境，让用户可以在其中安全地调用 Cython 引擎进行实时权重修改。
+        使用时,在 BrushManager 的涂抹循环中调用 .send(kwargs) 将当前帧的涂抹参数传入协程,在协程内部调用 processor.set_custom_array(...) 进行权重修改。
+        Example:
+        ```python
+            #  =========================================================
+            #  在 BrushManager 的涂抹循环中使用这个协程
+            #  =========================================================
+            stroke_coroutine = weights_manager.paint_stroke_coroutine(layer_idx, is_mask)
+            next(stroke_coroutine)  # 启动协程
+
+            # ===========================================================
+            # 涂抹循环中与这个协程进行交互
+            # ===========================================================
+            while True:
+                params = StrokeParameters(
+                    brush_mode         = self.settings.mode,
+                    weights_value      = array.array("f", [self.settings.strength]),
+                    influences_indices = array.array("i", [self._active_influence_idx]),
+                    pressure           = pressure,
+                    iterations         = self.settings.iter,
+                )  # 构造当前帧的参数
+                stroke_coroutine.send(params)  # 将参数传入协程进行处理
+
+            # ============================================================
+            # 涂抹结束时调用 .close() 来触发协程的安全收尾与撤销注册
+            # ============================================================
+            stroke_coroutine.close()  # 结束涂抹,触发收尾与撤销注册
         """
         # 1. 获取底层算力引擎（它内部已经自动分配好了当前层精确所需的 Undo 缓存）
         processor = self._create_processor(layer_idx, is_mask)
@@ -805,11 +891,20 @@ class WeightsManager(_DeferredTaskMixin):
             while True:
                 # 3. 核心魔法：在此挂起协程，等待 BrushManager 发来这一帧的涂抹参数
                 # .send(kwargs) 传进来的数据会被赋值给 stroke_kwargs
-                stroke_kwargs = yield True
+                params: StrokeParameters = yield True
 
-                if stroke_kwargs:
+                if params:
                     # 将参数解包传给 C 引擎进行真实涂抹与归一化
-                    processor.process_stroke(**stroke_kwargs)
+                    processor.process_stroke(
+                        brush_mode=params.brush_mode,
+                        weights_value=params.weights_value,
+                        influences_indices=params.influences_indices,
+                        pressure=params.pressure,
+                        clamp_min=params.clamp_min,
+                        clamp_max=params.clamp_max,
+                        iterations=params.iterations,
+                        normalize=not is_mask,  # 蒙版不归一化，权重归一化
+                    )
 
         except GeneratorExit:
             # 4. 外部调用 .close() 时，会触发此异常（相当于拦截了 doRelease）
@@ -828,3 +923,73 @@ class WeightsManager(_DeferredTaskMixin):
                         self.updateDG()
 
                     apiundo.commit(redo, undo, execute=False)
+
+    def addLayer(self, name: str = "NewLayer") -> int:
+        """
+        添加一个新图层，自动分配并初始化底层物理内存。
+        - 蒙版 (Mask) 初始化为全 1.0 (完全无遮挡)
+        - 权重 (Weights) 初始化为全 0.0 (空权重)
+        """
+        node_name = self.mFnDepend_node.name()
+        compound_plug = om1.MPlug(self.mObject_node, self.cSkin.aLayerCompound)
+
+        # 1. 寻找可用 Logical Index
+        max_idx = -1
+        for i in range(compound_plug.numElements()):
+            elem = compound_plug.elementByPhysicalIndex(i)
+            if elem.logicalIndex() > max_idx:
+                max_idx = elem.logicalIndex()
+        new_idx = max_idx + 1
+
+        plug_base = f"{node_name}.layers[{new_idx}]"
+
+        # 2. 访问创建并设置基础属性 (利用 cmds 完美融入 Maya 原生撤销栈)
+        cmds.setAttr(f"{plug_base}.layerName", name, type="string")
+        cmds.setAttr(f"{plug_base}.layerEnabled", True)
+
+        # 3. 获取 Base 层拓扑信息，用于精确开辟物理内存
+        base_v_cnt, base_i_cnt, base_infs, _, _, _ = self.get_weights(-1, False)
+
+        if base_v_cnt > 0:
+            # --- 初始化 Mask (全 1.0) ---
+            mask_weights = array.array("f", [0.0] * base_v_cnt)
+
+            # 由于 allocate_and_set_weights 带有 @_defer_task 装饰器，
+            # 这里并不会立刻执行，而是压入队列。当下方的 updateDG() 唤醒节点后，
+            # sync_layer_cache 会首先执行识别到新图层，紧接着安全消费这里的修改任务！
+            self.allocate_and_set_weights(layer_idx=new_idx, is_mask=True, vtx_count=base_v_cnt, inf_count=1, influence_indices=array.array("i", [0]), weights_1d=mask_weights, backup=True)
+
+            # --- 初始化 Weights (全 0.0) ---
+            layer_weights = array.array("f", [0.0] * (base_v_cnt * base_i_cnt))
+
+            self.allocate_and_set_weights(layer_idx=new_idx, is_mask=False, vtx_count=base_v_cnt, inf_count=base_i_cnt, influence_indices=base_infs, weights_1d=layer_weights, backup=True)
+
+        # 4. 脏标记：唤醒节点求值，让 Maya 处理上述延迟队列！
+        self.updateDG()
+
+        return new_idx
+
+    def deleteLayer(self, layer_idx: int) -> bool:
+        """
+        删除指定图层并释放关联资源。
+        """
+        # 基础层 (Base Layer) 拦截，防止误删
+        if layer_idx == -1:
+            return False
+
+        node_name = self.mFnDepend_node.name()
+        plug_base = f"{node_name}.layers[{layer_idx}]"
+
+        if cmds.objExists(plug_base):
+            # 1. 移除多实例属性 (原生撤销栈支持)
+            cmds.removeMultiInstance(plug_base, b=True)
+
+            # 2. 清理 Python 层的字典路由映射
+            if layer_idx in self.layers:
+                del self.layers[layer_idx]
+
+            # 3. 唤醒 DG，下一次 compute 将通过 sync_layer_cache 重新梳理图层列表
+            self.updateDG()
+            return True
+
+        return False

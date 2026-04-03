@@ -125,10 +125,10 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         self.plug_refresh   : om1.MPlug             = None
 
         # --- context
-        self.weights_manager : WeightsManager      = None
-        self.mesh_context    : MeshTopologyContext = None
-        self.brush_context   : BrushHitContext     = None
-        self.brush_engine    : CoreBrushEngine     = None
+        self.weights_manager   : WeightsManager      = None
+        self.mesh_context      : MeshTopologyContext = None
+        self.brush_hit_context : BrushHitContext     = None
+        self.brush_engine      : CoreBrushEngine     = None
 
         # --- influences
         self.influences_count        : int           = 0
@@ -175,7 +175,7 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         self.plug_refresh       = om1.MPlug(self.mObject, self.aRefresh)
         # --- context
         self.mesh_context       = MeshTopologyContext()
-        self.brush_context      = BrushHitContext()
+        self.brush_hit_context  = BrushHitContext()
         self.weights_manager    = WeightsManager(self)
         # fmt:on
 

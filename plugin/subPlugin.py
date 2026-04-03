@@ -68,8 +68,8 @@ class RenderData:
 
         self.wire_color            = (0.0, 1.0, 1.0, 1.0) # 彩色线色
         self.vertex_color          = (1.0, 0.0, 0.0, 1.0) # 彩色点色
-        self.mask_remap_a_color    = (0.1, 0.1, 0.1, 1.0) # 遮罩渐变色 A
-        self.mask_remap_b_color    = (0.1, 1.0, 0.1, 1.0) # 遮罩渐变色 B
+        self.mask_remap_a_color    = (0.0, 0.0, 0.0, 1.0) # 遮罩渐变色 A
+        self.mask_remap_b_color    = (1.0, 1.0, 1.0, 1.0) # 遮罩渐变色 B
         self.weights_remap_a_color = (0.0, 0.0, 0.0, 1.0) # 权重渐变色 A
         self.weights_remap_b_color = (1.0, 1.0, 1.0, 1.0) # 权重渐变色 B
         self.brush_remap_a_color   = (1.0, 0.0, 0.0, 1.0) # 笔刷渐变色 A
@@ -283,8 +283,8 @@ class TriangleShape(om.MPxSurfaceShape):
         # New color attributes
         TriangleShape.wireColorAttr = add_color("renderWireColor", "wcl", (0.0, 1.0, 1.0))
         TriangleShape.vertexColorAttr = add_color("renderVertexColor", "vcl", (1.0, 0.0, 0.0))
-        TriangleShape.maskRemapAColorAttr = add_color("maskRemapAColor", "mra", (0.1, 0.1, 0.1))
-        TriangleShape.maskRemapBColorAttr = add_color("maskRemapBColor", "mrb", (0.1, 1.0, 0.1))
+        TriangleShape.maskRemapAColorAttr = add_color("maskRemapAColor", "mra", (0.0, 0.0, 0.0))
+        TriangleShape.maskRemapBColorAttr = add_color("maskRemapBColor", "mrb", (1.0, 1.0, 1.0))
         TriangleShape.weightsRemapAColorAttr = add_color("weightsRemapAColor", "wra", (0.0, 0.0, 0.0))
         TriangleShape.weightsRemapBColorAttr = add_color("weightsRemapBColor", "wrb", (1.0, 1.0, 1.0))
         TriangleShape.brushRemapAColorAttr = add_color("brushRemapAColor", "bra", (1.0, 0.0, 0.0))

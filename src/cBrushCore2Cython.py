@@ -766,7 +766,7 @@ class CoreBrushEngine:
                         hit_count += 1
 
             self.active_hit_count = hit_count
-            return (hit_count, self.active_hit_indices, self.active_hit_falloff)
+            return (hit_count, self.active_hit_indices[:hit_count], self.active_hit_falloff[:hit_count])
         # endregion
 
         # -------------------------------------------------------------
@@ -775,7 +775,7 @@ class CoreBrushEngine:
         # region ---------- surface mode
         if hit_tri_idx < 0:
             self.active_hit_count = 0
-            return (0, self.active_hit_indices, self.active_hit_falloff)
+            return (0, self.active_hit_indices[:0], self.active_hit_falloff[:0])
 
         v0: cython.int = _tris_2d[hit_tri_idx, 0]  # 面片顶点 0
         v1: cython.int = _tris_2d[hit_tri_idx, 1]  # 面片顶点 1
@@ -893,7 +893,7 @@ class CoreBrushEngine:
                 _out_w[i] = weight
 
         self.active_hit_count = total_found
-        return (total_found, self.active_hit_indices, self.active_hit_falloff)
+        return (total_found, self.active_hit_indices[:total_found], self.active_hit_falloff[:total_found])
         # endregion
 
     # endregion
@@ -902,7 +902,7 @@ class CoreBrushEngine:
 @cython.cclass
 class BrushUndoRecorder:
     """
-    记录内存中的数据快照
+    记录内存中的数据快照[[[[[[]]]]]]
     在修改内存中数据前后调用类中方法 以记录原始数据 后修改后的数据
     数据以稀疏方式保存 并且赋值返回
 
@@ -1796,6 +1796,7 @@ class SkinWeightProcessor(UtilBrushProcessor):
         clamp_min: cython.float = 0.0,
         clamp_max: cython.float = 1.0,
         iterations: cython.int = 1,
+        normalize:cython.bint = True,
     ) -> tuple:
         """执行蒙皮权重运算 支持单骨骼或多骨骼统一调度."""
 
@@ -1820,8 +1821,9 @@ class SkinWeightProcessor(UtilBrushProcessor):
             # 只对命中的顶点切片进行归一化
             hit_indices_view = res[1][: res[0]]
 
-            # 执行归一化
-            self.normalize_weights(hit_indices_view, priority_idx)
+            if normalize is True:
+                # 执行归一化
+                self.normalize_weights(hit_indices_view, priority_idx)
 
         return res
 

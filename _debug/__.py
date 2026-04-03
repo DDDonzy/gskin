@@ -37,7 +37,7 @@ maya_weights, _ = get_skinWeights(sk_node)
 vertex_count = cmds.polyEvaluate(shape, vertex=True)
 influence_indices = cmds.getAttr(f"{sk_node}.matrix", mi=1)
 manager = wm.WeightsManager.from_node("cSkinDeformer1")
-manager.init_handle_data(-1, 0, vertex_count, len(influence_indices), influence_indices, list(maya_weights))
+manager.allocate_and_set_weights(-1, 0, vertex_count, len(influence_indices), influence_indices, list(maya_weights))
 
 
 shape = cmds.createNode("triangleShape")
@@ -52,7 +52,7 @@ if cmds.contextInfo("cBrush", exists=True):
 
 
 
-from gskin.src.cBrushManager import BrushSettings
+from gskin.src.cBrushSettings import BrushSettings
 
 BrushSettings.radius = 2
 
