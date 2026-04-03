@@ -13,9 +13,6 @@ from .cBrushCore2Cython import CoreBrushEngine
 
 from ._cProfilerCython import MayaNativeProfiler, maya_profile
 
-from typing import TYPE_CHECKING
-
-# if TYPE_CHECKING:
 from .cSkinContext import BrushHitContext
 
 

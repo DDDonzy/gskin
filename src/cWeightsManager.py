@@ -427,7 +427,6 @@ class WeightsManager(_DeferredTaskMixin):
         self.plug_refresh: om1.MPlug = cSkin.plug_refresh
         self.plug_weights: om1.MPlug = om1.MPlug(cSkin.mObject, cSkin.aWeights)
 
-
         # =========================================================
         # 笔刷引擎的共享物理内存池 (Object Pool)
         # 寿命与节点等长，避免鼠标按下时疯狂申请内存引发 GC 卡顿
@@ -719,9 +718,10 @@ class WeightsManager(_DeferredTaskMixin):
         sparse_values,
     ):
         """
+        设置稀疏权重
         专供 Undo / Redo 调用。
-        直接使用 C 级覆盖能力还原快照,彻底告别 Python 循环！
-        """  
+        直接使用 C 级覆盖能力还原快照
+        """
         processor = self._create_processor(layer_idx, is_mask)
         if not processor:
             return
@@ -753,19 +753,19 @@ class WeightsManager(_DeferredTaskMixin):
         # 1. 顶点索引池 (vtx_count)
         if not self._pool_vtx_idx or self._pool_vtx_idx.shape[0] < vtx_count:
             self._pool_vtx_idx = BufferManager.allocate("i", (vtx_count,))
-            
+
         # 2. 顶点布尔防重录池 (vtx_count)
         if not self._pool_vtx_bool or self._pool_vtx_bool.shape[0] < vtx_count:
             self._pool_vtx_bool = BufferManager.allocate("B", (vtx_count,))
-            
+
         # 3. 骨骼锁定池 (inf_count)
         if not self._pool_inf_locks or self._pool_inf_locks.shape[0] < inf_count:
             self._pool_inf_locks = BufferManager.allocate("B", (inf_count,))
-            
+
         # 4. Undo 2D 矩阵池 (vtx_count * inf_count)
         req_undo_elements = vtx_count * inf_count
         curr_undo_elements = self._pool_undo_buffer.shape[0] * self._pool_undo_buffer.shape[1] if self._pool_undo_buffer else 0
-        
+
         if curr_undo_elements < req_undo_elements:
             # 容量不足，重新申请大内存
             self._pool_undo_buffer = BufferManager.allocate("f", (vtx_count, inf_count))
@@ -780,21 +780,21 @@ class WeightsManager(_DeferredTaskMixin):
         return cBrushCoreCython.SkinWeightProcessor(
             self.cSkin.brush_engine,
             weights_2d,
-            self._pool_vtx_idx.view, 
-            self._pool_vtx_bool.view,  
-            self._pool_inf_locks.view,  
-            self._pool_undo_buffer.view,  
+            self._pool_vtx_idx.view,
+            self._pool_vtx_bool.view,
+            self._pool_inf_locks.view,
+            self._pool_undo_buffer.view,
         )
-    
+
     def paint_stroke_coroutine(self, layer_idx: int, is_mask: bool, backup: bool = True):
         """
-        [魔法生成器] 基于 yield 的跨帧笔刷状态机。
+        基于 yield 的跨帧笔刷状态机。
         完美接管 begin_stroke -> N次过程计算 -> end_stroke。
         """
         # 1. 获取底层算力引擎（它内部已经自动分配好了当前层精确所需的 Undo 缓存）
         processor = self._create_processor(layer_idx, is_mask)
         if not processor:
-            yield False # 启动失败
+            yield False  # 启动失败
             return
 
         # 2. 初始化录制（相当于拦截了 doPress）
@@ -810,7 +810,7 @@ class WeightsManager(_DeferredTaskMixin):
                 if stroke_kwargs:
                     # 将参数解包传给 C 引擎进行真实涂抹与归一化
                     processor.process_stroke(**stroke_kwargs)
-                    
+
         except GeneratorExit:
             # 4. 外部调用 .close() 时，会触发此异常（相当于拦截了 doRelease）
             # 我们在这里安全收尾，并生成 Maya 撤销栈
