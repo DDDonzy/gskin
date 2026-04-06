@@ -1745,7 +1745,7 @@ class UtilBrushProcessor:
     @cython.boundscheck(False)
     @cython.wraparound(False)
     @cython.ccall
-    def add_layer_weights(self, layer_weights: cython.float[::1], layer_mask: cython.float[::1], vertex_indices=None) -> cython.void:
+    def add_layer_weights(self, layer_weights: cython.float[:1], layer_mask: cython.float[:1], vertex_indices=None) -> cython.void:
         """
         专为加法蒙版合成 (Additive Compositing) 设计
         完美处理：全量输入数组 + 稀疏索引拦截

@@ -1,6 +1,10 @@
 from __future__ import annotations
 import ctypes
 
+import threading
+from collections import deque
+from logging import warning
+
 import maya.OpenMaya as om1  # type:ignore
 import maya.OpenMayaMPx as ompx  # type:ignore
 
@@ -14,6 +18,8 @@ from .cBrushCore2Cython import CoreBrushEngine
 from ._cProfilerCython import MayaNativeProfiler, maya_profile
 
 from .cSkinContext import BrushHitContext
+from . import cBrushCore2Cython
+
 
 
 class MeshTopologyContext:
@@ -66,7 +72,41 @@ class MeshTopologyContext:
         self.v2f_indices       = None
         # fmt:on
 
+class DeferredTaskManager:
+    """
+    将被作为实例挂载到 cSkin 节点上。
+    """
+    def __init__(self):
+        self._deferred_tasks = deque()
+        self._tasks_lock = threading.RLock()
+        self._is_executing = False
 
+    def add_task(self, task):
+        """仅推入队列"""
+        with self._tasks_lock:
+            self._deferred_tasks.append(task)
+
+    def execute_tasks(self) -> bool:
+        """
+        消化队列。
+        如果执行了任何任务返回 True，否则返回 False。
+        """
+        if not self._deferred_tasks:
+            return False
+
+        self._is_executing = True
+        executed_any = False
+        try:
+            with self._tasks_lock:
+                while self._deferred_tasks:
+                    task = self._deferred_tasks.popleft()
+                    task()
+                    executed_any = True
+        finally:
+            self._is_executing = False
+            
+        return executed_any
+    
 class CythonSkinDeformer(ompx.MPxDeformerNode):
     __slots__ = (# 基础属性与 API 对象 (Base & API Objects) # noqa: RUF023
                  "hashCode",
@@ -100,9 +140,10 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
     # fmt:off
     aGeomMatrix       = om1.MObject()
     aWeights          = om1.MObject()
-    aLayerMaskAll     = om1.MObject()
+    aMaskWeights      = om1.MObject()
+    aLockMaskWeights  = om1.MObject()
     aLayerWeights     = om1.MObject()
-    aLayerMask        = om1.MObject()
+    aLockInfluences   = om1.MObject()
     aLayerEnabled     = om1.MObject()
     aLayerName        = om1.MObject()
     aLayerCompound    = om1.MObject()
@@ -148,6 +189,8 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         self.isDirty_bindPreMatrix    : bool = True
         self.isDirty_influencesMatrix : bool = True
         self.isDirty_brushFastPreview : bool = False
+        self.isDirty_lockWeights      : bool = True
+
 
         # --------------------
         self._geo_matrix             : om1.MMatrix = None
@@ -161,7 +204,52 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
 
         self.rawPoints_original = None
         self._skinWeights = None
+        # 
+        # 单节点常驻内存池, 用于笔刷处理 
+        self._pool_vtx_idx: BufferManager = None
+        self._pool_vtx_bool: BufferManager = None
+        self._pool_inf_locks: BufferManager = None
+        self._pool_undo_buffer: BufferManager = None
+        # deferred task
+        self.task_manager: DeferredTaskManager = DeferredTaskManager()
         # fmt:on
+
+    def get_processor(self, weights_2d: memoryview) -> cBrushCore2Cython.SkinWeightProcessor:
+        """
+        返回该节点专属的 Processor。
+        """
+        v_count, stride_count = weights_2d.shape
+
+        req_undo_elements = v_count * stride_count
+
+        # 自动扩容常驻内存池
+        if not self._pool_vtx_idx or self._pool_vtx_idx.shape[0] < v_count:
+            self._pool_vtx_idx = BufferManager.allocate("i", (v_count,))
+
+        if not self._pool_vtx_bool or self._pool_vtx_bool.shape[0] < v_count:
+            self._pool_vtx_bool = BufferManager.allocate("B", (v_count,))
+
+        if not self._pool_inf_locks or self._pool_inf_locks.shape[0] < stride_count:
+            self._pool_inf_locks = BufferManager.allocate("B", (stride_count,))
+
+        # 2. Undo Buffer 扩容检查
+        curr_undo_capacity = self._pool_undo_buffer.shape[0] if self._pool_undo_buffer else 0
+        if curr_undo_capacity < req_undo_elements:
+            self._pool_undo_buffer = BufferManager.allocate("f", (req_undo_elements,))
+
+        # 3. 从池中切出精确的 2D Undo 视图
+        _undo_slice = self._pool_undo_buffer.view.cast("B").cast("f")[:req_undo_elements]
+        undo_2d_view = _undo_slice.cast("B").cast("f", shape=(v_count, stride_count))
+
+        # 4. 实例化并返回
+        return cBrushCore2Cython.SkinWeightProcessor(
+            self.brush_engine,
+            weights_2d,
+            self._pool_vtx_idx.view,
+            self._pool_vtx_bool.view,
+            self._pool_inf_locks.view,
+            undo_2d_view,
+        )
 
     def postConstructor(self):
         """
@@ -184,17 +272,27 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
 
     def setDirty(self):
         """
-        - 用于笔刷调用 提醒 `Deform` 更新权重
+        - 强行标记节点数据脏 以触发 Maya 的求值机制
         """
         self.plug_refresh.setInt(self.plug_refresh.asInt() + 1)
         self.isDirty_weights = True
+        self.isDirty = True
+
+    def forceRefresh(self):
+        """
+        - 强行向 Maya 索要输出数据 以触发 deform 求值 适用于笔刷修改权重后需要立刻更新模型的场景
+        """
+        self.setDirty()
+        mPlug: om1.MPlug = om1.MPlug(self.mObject, ompx.cvar.MPxGeometryFilter_outputGeom).elementByLogicalIndex(0)
+        mPlug.asMObject()
+        return True
 
     def setDependentsDirty(self, plug: om1.MPlug, dirtyPlugArray: om1.MPlugArray):
         """DG模式下脏数据标签 性能优化"""
         # --- weights
         if plug in (self.aWeights,
                     self.aLayerCompound,
-                    self.aLayerMask,
+                    self.aLockInfluences,
                     self.aLayerWeights,
                     self.aLayerEnabled,
                     self.aRefresh,
@@ -223,6 +321,10 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
              plug == ompx.cvar.MPxGeometryFilter_input:  # fmt:skip
             self.isDirty = True
             self.isDirty_inputGeometry = True
+        # --- lock weights
+        elif plug == self.aLockMaskWeights or plug == self.aLockInfluences:
+            self.isDirty = True
+            self.isDirty_lockWeights = True
 
         return super().setDependentsDirty(plug, dirtyPlugArray)
 
@@ -251,10 +353,15 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
                 self.isDirty = True
                 self.isDirty_bindPreMatrix = True
 
+            # --- lock weights
+            if evaluationNode.dirtyPlugExists(self.aLockMaskWeights) or evaluationNode.dirtyPlugExists(self.aLockInfluences):
+                self.isDirty = True
+                self.isDirty_lockWeights = True
+
             # --- weights
             if (   evaluationNode.dirtyPlugExists(self.aWeights)
                 or evaluationNode.dirtyPlugExists(self.aLayerCompound)
-                or evaluationNode.dirtyPlugExists(self.aLayerMask)
+                or evaluationNode.dirtyPlugExists(self.aLockInfluences)
                 or evaluationNode.dirtyPlugExists(self.aLayerWeights)
                 or evaluationNode.dirtyPlugExists(self.aLayerEnabled)
                 or evaluationNode.dirtyPlugExists(self.aRefresh)
@@ -343,36 +450,48 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
             self.mesh_context.v2f_indices.view,
         )
 
-    def get_active_paint_weights(self) -> memoryview | None:
+    def update_lock_pool(self):
         """
-        直接从 manager 提取当前需要绘制的的权重视图。
-
-        Returns:
-            tuple: (layer_index, is_mask, influences_index, weights_view)
-                - layer_index (int): layer index
-                - is_mask (bool): is mask
-                - influences_index (int): influences index
-                - weights_view (memoryview): weights view
+        根据当前权重视图的维度 更新锁定状态的内存池
         """
+        print("need updating lock pool...")
+        self.isDirty_lockWeights = False
 
+    def get_active_paint_weights(self) -> tuple:
+        """
+        直接从 manager 提取当前需要绘制的权重视图
+        Returns: tuple: (layer_index, is_mask, influences_index, weights_view)
+        """
         if self.weights_manager is None:
-            return None
+            raise RuntimeError("WeightsManager is not initialized.")
 
         manager = self.weights_manager
+        handle = manager.mask_handle if self.is_mask else manager.get_weights_handle(self.layer_index)
 
-        handle = manager.get_handle(self.layer_index, self.is_mask)
         if handle is None:
+            warning(f"Failed to get weights handle for layer {self.layer_index} (is_mask={self.is_mask}).")
+            return self.layer_index, self.is_mask, self.influences_index, None
+        if not handle.is_valid:
+            warning(f"Weights handle for layer {self.layer_index} (is_mask={self.is_mask}) is not valid.")
             return self.layer_index, self.is_mask, self.influences_index, None
 
-        _, inf_count, _, weights_view = handle.parse_raw_weights()
-
-        if inf_count <= 0 or not weights_view:
+        _, channel_count, indices_view, raw_1d = handle.parse_raw_weights()
+        if channel_count <= 0 or not raw_1d:
+            warning(f"Failed to parse weights for layer {self.layer_index} (is_mask={self.is_mask}).")
             return self.layer_index, self.is_mask, self.influences_index, None
 
-        # 2. 计算安全偏移量
-        safe_idx = max(0, min(self.influences_index, inf_count - 1))
+        # 物理列偏移量 (channel index) 根据当前绘制的 layer 和 mask 状态确定
+        # 如果是蒙版层 则 channel_idx = layer_index
+        # 如果是权重层 则 channel_idx = influences_index
+        channel_idx = self.layer_index if self.is_mask else self.influences_index
+        try:
+            col_idx = list(indices_view).index(channel_idx)
+        except ValueError:
+            warning(f"Channel index {channel_idx} not found in weights handle for layer {self.layer_index} (is_mask={self.is_mask}).")
+            return self.layer_index, self.is_mask, self.influences_index, None
 
-        return self.layer_index, self.is_mask, self.influences_index, weights_view[safe_idx::inf_count]
+        sliced_view = raw_1d.cast("B").cast("f")[col_idx::channel_count]
+        return self.layer_index, self.is_mask, self.influences_index, sliced_view
 
     @maya_profile("Compute", 0)
     def compute(self, plug, dataBlock):
@@ -386,10 +505,13 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         if not self.isDirty:
             return None
 
+        if self.isDirty_lockWeights:
+            self.update_lock_pool()
+
         # 获取当前绘制 layer 数据
         self.layer_index = dataBlock.inputValue(self.aCurrentPaintLayerIndex).asInt()
         self.is_mask = dataBlock.inputValue(self.aCurrentPaintMaskBool).asBool()
-        self.influences_index = dataBlock.inputValue(self.aCurrentPaintInfluenceIndex).asInt() if not self.is_mask else 0
+        self.influences_index = dataBlock.inputValue(self.aCurrentPaintInfluenceIndex).asInt() if not self.is_mask else self.layer_index
 
         res = super().compute(plug, dataBlock)
         self.isDirty = False
@@ -489,12 +611,13 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
                 self.weights_manager.sync_layer_cache(dataBlock)
                 # 执行异步权重修改
                 # 为了优化性能, 权重修改是放在deform内部进行, 通过dataBlock拿到rawPoint直接修改内存, 而非外部直接修改mPlug
-                self.weights_manager.task_manager.execute_tasks()
+                self.task_manager.execute_tasks()
 
                 self.isDirty_weights = True
+        print("deform start...")
 
         with MayaNativeProfiler("Cython Cal matrix", 1):
-            _, _, _, self._skinWeights = self.weights_manager.get_handle(-1, 0).parse_raw_weights()
+            _, _, _, self._skinWeights = self.weights_manager.get_weights_handle(-1).parse_raw_weights()
             if self._skinWeights is None:
                 return
 
@@ -572,18 +695,23 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         # --- weights
         CythonSkinDeformer.aWeights = tAttr.create("cWeights", "cw", om1.MFnData.kVectorArray)
         tAttr.setHidden(True)
-        # --- layer weights children
-        CythonSkinDeformer.aLayerMask = tAttr.create("layerMaskAll", "lma", om1.MFnData.kVectorArray)
+        # --- layer mask weights
+        CythonSkinDeformer.aMaskWeights = tAttr.create("layerMask", "lm", om1.MFnData.kVectorArray)
         tAttr.setHidden(True)
-        default_str = om1.MFnStringData().create("layer")
-        CythonSkinDeformer.aLayerName = tAttr.create("layerName", "ln", om1.MFnData.kString, default_str)
+        # --- lock mask
+        CythonSkinDeformer.aLockMaskWeights = nAttr.create("lockMaskWeights", "lmw", om1.MFnNumericData.kBoolean, False)
+        nAttr.setArray(True)
+        nAttr.setHidden(True)
+        # --- layer weights children
+        CythonSkinDeformer.aLayerName = tAttr.create("layerName", "ln", om1.MFnData.kString, om1.MFnStringData().create("layer"))
         tAttr.setHidden(True)
         CythonSkinDeformer.aLayerEnabled = nAttr.create("layerEnabled", "le", om1.MFnNumericData.kBoolean, False)
         nAttr.setHidden(True)
         CythonSkinDeformer.aLayerWeights = tAttr.create("layerWeights", "lw", om1.MFnData.kVectorArray)
         tAttr.setHidden(True)
-        CythonSkinDeformer.aLayerMask = tAttr.create("layerMask", "lm", om1.MFnData.kVectorArray)
-        tAttr.setHidden(True)
+        CythonSkinDeformer.aLockInfluences = nAttr.create("lockInfluences", "li", om1.MFnNumericData.kBoolean, False)
+        nAttr.setArray(True)
+        nAttr.setHidden(True)
         # --- layer comp
         CythonSkinDeformer.aLayerCompound = cAttr.create("layers", "lays")
         cAttr.setArray(True)
@@ -592,7 +720,7 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         cAttr.addChild(CythonSkinDeformer.aLayerName)
         cAttr.addChild(CythonSkinDeformer.aLayerEnabled)
         cAttr.addChild(CythonSkinDeformer.aLayerWeights)
-        cAttr.addChild(CythonSkinDeformer.aLayerMask)
+        cAttr.addChild(CythonSkinDeformer.aLockInfluences)
         # --- refresh
         CythonSkinDeformer.aRefresh = nAttr.create("cRefresh", "cr", om1.MFnNumericData.kInt, False)
         nAttr.setKeyable(False)
@@ -612,7 +740,8 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
                       CythonSkinDeformer.aBindPreMatrix, 
                       CythonSkinDeformer.aInfluenceMatrix, 
                       CythonSkinDeformer.aWeights,
-                      CythonSkinDeformer.aLayerMaskAll,
+                      CythonSkinDeformer.aMaskWeights,
+                      CythonSkinDeformer.aLockMaskWeights,
                       CythonSkinDeformer.aLayerCompound, 
                       CythonSkinDeformer.aRefresh,
                       CythonSkinDeformer.aCurrentPaintLayerIndex,
