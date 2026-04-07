@@ -10,18 +10,19 @@ class MWeightsHandle(MFloatArrayProxy):
     num_influences: int
 
     def __init__(self, dataHandle, num_vertices):
+        """
+        Args:
+            dataHandle (OpenMaya.MDataHandle): MDataHandle 可以来自 `MPlug.asMDataHandle` 或节点内部 `MDataBlock.inputValue`
+            num_vertices (int): 模型顶点数量
+        """
         if num_vertices <= 0:
             raise ValueError(f"num_vertices must be greater than 0, got {num_vertices}.")
-        
+
         super().__init__(dataHandle)
 
         if self.length % num_vertices != 0:
-            raise ValueError(
-                f"Data length mismatch! Total float count ({self.length}) is not "
-                f"exactly divisible by num_vertices ({num_vertices}). "
-                f"Cannot determine a valid num_influences."
-            )
-        
+            raise ValueError(f"Data length mismatch! Total float count ({self.length}) is not exactly divisible by num_vertices ({num_vertices}). Cannot determine a valid num_influences.")
+
         self.num_vertices = num_vertices
         self.num_influences = self.length // self.num_vertices
 
@@ -39,9 +40,25 @@ class MWeightsHandle(MFloatArrayProxy):
             self.view[:] = array.array("f", weights)
 
     def get_influence_weights(self, influence_index: int) -> list:
+        """
+        获取指定骨骼的权重, 返回的是原始数据的拷贝
+
+        Args:
+            influence_index (int): 骨骼索引
+        Return:
+            weights (list): 权重数据列表
+        """
         return self.get_influence_weights_raw(influence_index).tolist()
 
     def get_influence_weights_raw(self, influence_index: int) -> memoryview:
+        """
+        获取指定骨骼的权重, 返回的是原始数据的视图
+
+        Args:
+            influence_index (int): 骨骼索引
+        Return:
+            weights (memoryview): 权重数据视图
+        """
         if (  influence_index < 0 
            or influence_index >= self.num_influences):  # fmt:skip
             raise IndexError(f"Influence index {influence_index} out of range. Must be between 0 and {self.num_influences - 1}.")
@@ -49,9 +66,21 @@ class MWeightsHandle(MFloatArrayProxy):
         return self.view[influence_index :: self.num_influences]
 
     def get_weights(self) -> list:
+        """
+        获取权重, 返回的是原始数据的拷贝
+
+        Return:
+            weights (list): 权重数据列表
+        """
         return self.get_weights_raw().tolist()
 
     def get_weights_raw(self) -> memoryview:
+        """
+        获取权重, 返回的是原始数据的视图
+
+        Return:
+            weights (memoryview): 权重数据视图
+        """
         return self.view
 
     def remap_influences(
@@ -67,7 +96,7 @@ class MWeightsHandle(MFloatArrayProxy):
         新增骨骼默认权重为 0.0
 
         Args:
-            source_influence_indices: 当前句柄中对应的骨骼标识列表 (可以是逻辑索引 int，也可以是骨骼名字 str)
+            source_influence_indices: 当前句柄中对应的骨骼标识列表 (可以是逻辑索引 int, 也可以是骨骼名字 str)
             target_influence_indices: 期望的目标骨骼标识列表
 
         Update:
@@ -89,7 +118,7 @@ class MWeightsHandle(MFloatArrayProxy):
         source_map = {influence_index: i for i, influence_index in enumerate(source_influence_indices)}
         # 开辟全新的, 默认全为 0.0 的内存块
         new_data = array.array("f", [0.0]) * (num_vertices * new_num_influences)
-        # 遍历目标列表，按需搬运数据
+        # 遍历目标列表, 按需搬运数据
         for i, target_influence_index in enumerate(target_influence_indices):
             old_influence_index = source_map.get(target_influence_index)
 

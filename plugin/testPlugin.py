@@ -13,6 +13,7 @@ NODE_ID = om1.MTypeId(0x87001)  # 自定义测试 ID
 class MemTestNode(mpx.MPxNode):
     # 属性对象
     aCustomData = om1.MObject()
+    aCustomDataP = om1.MObject()
     aRefresh = om1.MObject()
     aDummy = om1.MObject()
 
@@ -33,8 +34,10 @@ class MemTestNode(mpx.MPxNode):
             handle[0] += 1.0
         except:
             pass
+        dataHandle = dataBlock.inputValue(MemTestNode.aCustomDataP)
 
-        # 3. 设置输出 dummy 告知 Maya 计算完成
+        print(int(om1.MFnPointArrayData(dataHandle.data()).array()[0].this))
+
         h_dummy = dataBlock.outputValue(MemTestNode.aDummy)
         h_dummy.setFloat(1.0 if refresh_val else 0.0)
 
@@ -54,8 +57,10 @@ def nodeInitializer():
     MemTestNode.aCustomData = tAttr.create("customData", "cd", om1.MFnData.kVectorArray)
     tAttr.setStorable(True)
     tAttr.setKeyable(False)
-    # 建议设置断开连接后的行为，保持最后的数据
-    tAttr.setDisconnectBehavior(om1.MFnAttribute.kNothing)
+
+    MemTestNode.aCustomDataP = tAttr.create("customDataP", "cdp", om1.MFnData.kPointArray)
+    tAttr.setStorable(True)
+    tAttr.setKeyable(False)
 
     # 2. Refresh 属性
     MemTestNode.aRefresh = nAttr.create("refresh", "ref", om1.MFnNumericData.kBoolean, False)
@@ -69,11 +74,13 @@ def nodeInitializer():
 
     # 添加并设置依赖
     MemTestNode.addAttribute(MemTestNode.aCustomData)
+    MemTestNode.addAttribute(MemTestNode.aCustomDataP)
     MemTestNode.addAttribute(MemTestNode.aRefresh)
     MemTestNode.addAttribute(MemTestNode.aDummy)
 
     MemTestNode.attributeAffects(MemTestNode.aRefresh, MemTestNode.aDummy)
     MemTestNode.attributeAffects(MemTestNode.aCustomData, MemTestNode.aDummy)
+    MemTestNode.attributeAffects(MemTestNode.aCustomDataP, MemTestNode.aDummy)
 
 
 # 注册插件的标配函数

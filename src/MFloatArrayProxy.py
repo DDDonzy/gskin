@@ -15,9 +15,9 @@ class MFloatArrayProxy:
 
     本类通过内存映射, 将双精度 `MVectorArray` (8-byte double) 重新解释为单精度 `Float` (4-byte)
 
-    一个 `MVector` 包含 3 个 Double (24字节)，可承载 6 个 Float。
+    一个 `MVector` 包含 3 个 Double (24字节), 可承载 6 个 Float。
 
-    为了保证可以写入任意数量的 `Float`, 把 `MVectorArray` 解析位两部分，具体内存布局如下：
+    为了保证可以写入任意数量的 `Float`, 把 `MVectorArray` 解析位两部分, 具体内存布局如下：
     ```
     -----------------------------------------------------------------------------------------
     |  Header[0] (size_t)  |  Header[1] (size_t)  |    Header[2]   |      DATA (c_float)    |
@@ -53,6 +53,10 @@ class MFloatArrayProxy:
     _src_address: int
 
     def __init__(self, dataHandle: OpenMaya.MDataHandle):
+        """
+        Args:
+            dataHandle (OpenMaya.MDataHandle): MDataHandle 可以来自 `MPlug.asMDataHandle` 或节点内部 `MDataBlock.inputValue`
+        """
         self.mDataHandle = dataHandle
         self.length = 0
         self.view = None
@@ -190,7 +194,7 @@ class MFloatArrayProxy:
 
     def set_to_mPlug(self, plug: OpenMaya.MPlug, copy: bool = False):
         """
-        将实例传递给用户输入的 MPlug, 以通知Maya更新数据
+        将实例传递给用户输入的MPlug, 以通知Maya节点更新数据
         Args:
             plug (OpenMaya.MPlug): Maya MPlug
             copy (bool): True = 拷贝, False = 引用
@@ -272,12 +276,12 @@ class MFloatArrayProxy:
         mb_size = byte_size / (1024)
 
         # 数据预览
-        # 为了防止 300 万个数据直接 print 导致 Maya 卡死，我们只截取头尾
+        # 为了防止 300 万个数据直接 print 导致 Maya 卡死, 我们只截取头尾
         preview_str = ""
         if float_count == 0:
             preview_str = "[]"
         elif float_count <= 7:
-            # 数据量小，全部显示，保留 5 位有效数字
+            # 数据量小, 全部显示, 保留 5 位有效数字
             preview_str = "[" + ", ".join(f"{x:.5f}" for x in self.view) + "]"
         else:
             # 数据量大掐头去尾显示
