@@ -97,15 +97,11 @@ class MFloatArrayProxy:
             print("MVectorArray is empty.")
             return
 
-        byte_capacity = (
-            MFloatArrayProxy._DOUBLE_SIZE * 3 * vAry_length
-        )  # vector array byte 大小
+        byte_capacity = MFloatArrayProxy._DOUBLE_SIZE * 3 * vAry_length  # vector array byte 大小
         _src_address = int(self.array[0].this)  # 第一个元素内存地址
         data_address = _src_address + MFloatArrayProxy._HEADER_SIZE  # 跳过 header
 
-        header = ctypes.cast(
-            _src_address, ctypes.POINTER(ctypes.c_size_t)
-        )  # 获取 header
+        header = ctypes.cast(_src_address, ctypes.POINTER(ctypes.c_size_t))  # 获取 header
         self.length = header[0]  # 数组大小 - float 数量
         data_byte_size = header[1]  # 不包含header的数据的大小 byte
 
@@ -116,11 +112,7 @@ class MFloatArrayProxy:
             raise ValueError("Data byte size must be a multiple of 4.")
 
         #
-        full_view = (
-            memoryview((ctypes.c_char * data_byte_size).from_address(data_address))
-            .cast("B")
-            .cast("f")
-        )
+        full_view = memoryview((ctypes.c_char * data_byte_size).from_address(data_address)).cast("B").cast("f")
         self.view = full_view[: self.length]
         self._src_address = _src_address
         self.address = data_address
@@ -146,9 +138,7 @@ class MFloatArrayProxy:
         total_needed_bytes = self._HEADER_SIZE + data_byte_size
 
         # 即使 float_count 为 0, 也会分配 1 个 Vector 给 Header
-        needed_vector_count = (
-            total_needed_bytes + self._MVECTOR_SIZE - 1
-        ) // self._MVECTOR_SIZE
+        needed_vector_count = (total_needed_bytes + self._MVECTOR_SIZE - 1) // self._MVECTOR_SIZE
 
         if self.array is None:  # 如果还未分配数组
             self.array = OpenMaya.MVectorArray()
@@ -313,9 +303,7 @@ class MFloatArrayProxy:
         else:
             # 数据量大掐头去尾显示
             head = ", ".join(f"{self.view[i]:.5f}" for i in range(5))
-            tail = ", ".join(
-                f"{self.view[i]:.5f}" for i in range(float_count - 2, float_count)
-            )
+            tail = ", ".join(f"{self.view[i]:.5f}" for i in range(float_count - 2, float_count))
             preview_str = f"[{head}, ......, {tail}]"
 
         return (f"<{self.__class__.__name__} at {hex_addr} | "
