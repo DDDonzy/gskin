@@ -902,7 +902,7 @@ class CoreBrushEngine:
 @cython.cclass
 class BrushUndoRecorder:
     """
-    记录内存中的数据快照[[[[[[]]]]]]
+    记录内存中的数据快照
     在修改内存中数据前后调用类中方法 以记录原始数据 后修改后的数据
     数据以稀疏方式保存 并且赋值返回
 

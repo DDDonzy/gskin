@@ -4,7 +4,6 @@ import maya.OpenMayaMPx as mpx
 from gskin.src.MFloatArrayProxy import MFloatArrayProxy
 
 
-
 # 节点名称和 ID
 NODE_NAME = "MemTestNode"
 NODE_ID = om1.MTypeId(0x87001)  # 自定义测试 ID
@@ -25,18 +24,19 @@ class MemTestNode(mpx.MPxNode):
         # 1. 获取输入触发值 (refresh)
         refresh_val = dataBlock.inputValue(MemTestNode.aRefresh).asBool()
 
-        # 2. 获取 VectorArray 句柄
-        # 注意：在 compute 中，我们使用 dataBlock 提供的句柄是最高效且安全的
-        h_data = dataBlock.outputValue(MemTestNode.aCustomData)
-        handle = MFloatArrayProxy(h_data)
-        print(handle)
         try:
-            handle[0] += 1.0
+            dataHandle = dataBlock.inputValue(MemTestNode.aCustomDataP)
+            data = dataHandle.data()
+            print(hex(int(om1.MFnPointArrayData(data).array()[0].this)))
         except:
             pass
-        dataHandle = dataBlock.inputValue(MemTestNode.aCustomDataP)
 
-        print(int(om1.MFnPointArrayData(dataHandle.data()).array()[0].this))
+        try:
+            dataHandle = dataBlock.inputValue(MemTestNode.aCustomData)
+            data = dataHandle.data()
+            print(hex(int(om1.MFnVectorArrayData(data).array()[0].this)))
+        except:
+            pass
 
         h_dummy = dataBlock.outputValue(MemTestNode.aDummy)
         h_dummy.setFloat(1.0 if refresh_val else 0.0)
@@ -54,16 +54,26 @@ def nodeInitializer():
 
     # 1. 创建 MVectorArray 属性
     # 使用 om1.MFnData.kVectorArray 正确指定类型
-    MemTestNode.aCustomData = tAttr.create("customData", "cd", om1.MFnData.kVectorArray)
+    MemTestNode.aCustomData = tAttr.create(
+        "customData",
+        "cd",
+        om1.MFnData.kVectorArray,
+        om1.MFnVectorArrayData().create(om1.MVectorArray()),
+    )
     tAttr.setStorable(True)
     tAttr.setKeyable(False)
 
-    MemTestNode.aCustomDataP = tAttr.create("customDataP", "cdp", om1.MFnData.kPointArray)
+    MemTestNode.aCustomDataP = tAttr.create(
+        "customDataP", "cdp", om1.MFnData.kPointArray
+    )
     tAttr.setStorable(True)
     tAttr.setKeyable(False)
 
     # 2. Refresh 属性
-    MemTestNode.aRefresh = nAttr.create("refresh", "ref", om1.MFnNumericData.kBoolean, False)
+
+    MemTestNode.aRefresh = nAttr.create(
+        "refresh", "ref", om1.MFnNumericData.kBoolean, False
+    )
     nAttr.setKeyable(True)
     nAttr.setStorable(True)
 
