@@ -19,20 +19,21 @@ class MWeightsHandle(MFloatArrayProxy):
             dataHandle (OpenMaya.MDataHandle): MDataHandle 可以来自 `MPlug.asMDataHandle` 或节点内部 `MDataBlock.inputValue`
             num_vertices (int): 模型顶点数量
         """
+
         if num_vertices <= 0:
-            raise ValueError(
-                f"num_vertices must be greater than 0, got {num_vertices}."
-            )
+            raise ValueError(f"num_vertices must be greater than 0, got {num_vertices}.")
 
         super().__init__(dataHandle)
 
         if self.length % num_vertices != 0:
-            raise ValueError(
-                f"Data length mismatch! Total float count ({self.length}) is not exactly divisible by num_vertices ({num_vertices}). Cannot determine a valid num_influences."
-            )
+            raise ValueError(f"Data length mismatch! Total float count ({self.length}) is not exactly divisible by num_vertices ({num_vertices}). Cannot determine a valid num_influences.")
 
-        self.num_vertices = num_vertices
-        self.num_influences = self.length // self.num_vertices
+        if self.is_initialized:
+            self.num_vertices = num_vertices
+            self.num_influences = self.length // self.num_vertices
+        else:
+            self.num_vertices = 0
+            self.num_influences = 0
 
     def set_array(self, *args, **kwargs):
         raise NotImplementedError("This method is disabled, Please use set_weights.")
@@ -46,9 +47,7 @@ class MWeightsHandle(MFloatArrayProxy):
             `- self.array`
         """
         if len(weights) != self.length:
-            raise ValueError(
-                f"Weights length mismatch. Expected {self.length}, got {len(weights)}."
-            )
+            raise ValueError(f"Weights length mismatch. Expected {self.length}, got {len(weights)}.")
         try:
             self.view[:] = weights
         except (TypeError, ValueError):
@@ -76,9 +75,7 @@ class MWeightsHandle(MFloatArrayProxy):
         """
         if (  influence_index < 0 
            or influence_index >= self.num_influences):  # fmt:skip
-            raise IndexError(
-                f"Influence index {influence_index} out of range. Must be between 0 and {self.num_influences - 1}."
-            )
+            raise IndexError(f"Influence index {influence_index} out of range. Must be between 0 and {self.num_influences - 1}.")
 
         return self.view[influence_index :: self.num_influences]
 
@@ -129,15 +126,10 @@ class MWeightsHandle(MFloatArrayProxy):
 
         # 确保源长度和当前数据列数对应
         if len(source_influence_indices) != old_num_influences:
-            raise ValueError(
-                f"Length of source_influence_indices ({len(source_influence_indices)}) must match current num_influences ({old_num_influences})."
-            )
+            raise ValueError(f"Length of source_influence_indices ({len(source_influence_indices)}) must match current num_influences ({old_num_influences}).")
 
         # 映射字典
-        source_map = {
-            influence_index: i
-            for i, influence_index in enumerate(source_influence_indices)
-        }
+        source_map = {influence_index: i for i, influence_index in enumerate(source_influence_indices)}
         # 开辟全新的, 默认全为 0.0 的内存块
         new_data = array.array("f", [0.0]) * (num_vertices * new_num_influences)
         # 遍历目标列表, 按需搬运数据
@@ -146,9 +138,7 @@ class MWeightsHandle(MFloatArrayProxy):
 
             if old_influence_index is not None:
                 # 这根骨骼在原来的列表里存在,保留或挪动位置, 将旧列数据 整列 复制到新列
-                new_data[i::new_num_influences] = array.array(
-                    "f", self.view[old_influence_index::old_num_influences]
-                )
+                new_data[i::new_num_influences] = array.array("f", self.view[old_influence_index::old_num_influences])
             else:
                 # 这是一根全新的骨骼,什么都不用做因为 new_data 就是 0.0
                 pass
@@ -179,3 +169,11 @@ class MWeightsHandle(MFloatArrayProxy):
         plug = OpenMaya.MPlug()
         sel.getPlug(0, plug)
         return cls.from_mPlug(plug, num_vertices)
+
+    def __repr__(self) -> str:
+        res = super().__repr__()
+        if self.is_initialized:
+            return (f"{res}\n"
+                    f"{' '*4}num_vertices  : {self.num_vertices}\n"
+                    f"{' '*4}num_influences: {self.num_influences}\n")  # fmt:skip
+        return res

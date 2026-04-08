@@ -6,8 +6,17 @@ import ctypes
 import maya.OpenMaya as OpenMaya  # type: ignore
 
 
-class MeshTopologyContext:
+__all__ = [
+    "TopologyContext",
+]
+
+
+class TopologyContext:
     """
+    Topology 数据上下文
+    支持从OpenMaya.MFnMesh解析Topology数据
+    支持构建CSR邻边表
+
     CSR Data:
     ```
     ===================================================================================
@@ -69,6 +78,28 @@ class MeshTopologyContext:
         if mFnMesh:
             self.mFnMesh:OpenMaya.MFnMesh = mFnMesh
 
+    def init_default(self):
+        # fmt:off
+        self.mFnMesh      = None
+        self.num_vertices = 0
+        self.num_edges    = 0
+        self.num_polygons = 0
+        self.num_triangles= 0
+        # position
+        self.position = None
+        # 基础拓扑
+        self.tri_face_indices  = None
+        self.tri_edge_indices  = None
+        self.quad_face_indices = None
+        self.quad_edge_indices = None
+        # v2v CSR
+        self.v2v_offsets = None
+        self.v2v_indices = None
+        # v2f CSR
+        self.v2f_offsets = None
+        self.v2f_indices = None
+        # fmt:on
+
     def update_position(self, mFnMesh: OpenMaya.MFnMesh = None):
         """
         更新顶点位置数据
@@ -87,11 +118,22 @@ class MeshTopologyContext:
 
         self.position = memoryview(raw_buffer).cast("B").cast("f")
 
-    def update_topology(
-        self,
-        mFnMesh: OpenMaya.MFnMesh = None,
-        update_csr: bool = True,
-    ):
+    def update_topology(self, mFnMesh: OpenMaya.MFnMesh = None, update_csr: bool = True):
+        """
+        更新顶点位置数据
+        Args:
+            mFnMesh (OpenMaya.MFnMesh): 输入mFnMesh, 如果不输入, 自动使用`self.mFnMesh`
+            update_csr (bool): 是否更新 csr 邻边数据. Default = True.
+        Update:
+            - `self.tri_face_indices`
+            - `self.tri_edge_indices`
+            - `self.quad_face_indices`
+            - `self.quad_edge_indices`
+            - `self.v2v_offsets`
+            - `self.v2v_indices`
+            - `self.v2f_offsets`
+            - `self.v2f_indices`
+        """
         mFnMesh = mFnMesh if mFnMesh else self.mFnMesh
         if mFnMesh is None:
             raise RuntimeError("mFnMesh is not set.")
@@ -168,7 +210,7 @@ class MeshTopologyContext:
         return tri_edge_indices
 
     @staticmethod
-    def get_v2v_adjacency(num_vertices: int, edge_indices: memoryview):
+    def get_v2v_adjacency(num_vertices, edge_indices):
         """
         构建顶点到顶点 (Vertex-to-Vertex) 的 CSR 格式邻接表
         Args:
@@ -204,7 +246,7 @@ class MeshTopologyContext:
         return offset_view, indices_view
 
     @staticmethod
-    def get_v2f_adjacency(num_vertices: int, tri_face_indices: memoryview):
+    def get_v2f_adjacency(num_vertices, tri_face_indices):
         """
         构建顶点到面 (Vertex-to-Face) 的 CSR 格式邻接表
         Args:
@@ -282,35 +324,26 @@ class MeshTopologyContext:
         fnMesh = OpenMaya.MFnMesh(dag_path)
         return cls(fnMesh)
 
-    def init_default(self):
-        # fmt:off
-        self.mFnMesh      = None
-        self.num_vertices = 0
-        self.num_edges    = 0
-        self.num_polygons = 0
-        self.num_triangles= 0
-        # position
-        self.position = None
-        # 基础拓扑
-        self.tri_face_indices  = None
-        self.tri_edge_indices  = None
-        self.quad_face_indices = None
-        self.quad_edge_indices = None
-        # v2v CSR
-        self.v2v_offsets = None
-        self.v2v_indices = None
-        # v2f CSR
-        self.v2f_offsets = None
-        self.v2f_indices = None
-        # fmt:on
+    def __repr__(self) -> str:
+        status = "Loaded" if self.position is not None else "Empty"
+        return (
+            f"<{self.__class__.__name__} [{status}]>\n"
+            f"    Vertices:  {self.num_vertices}\n"
+            f"    Edges:     {self.num_edges}\n"
+            f"    Polygons:  {self.num_polygons}\n"
+            f"    Triangles: {self.num_triangles}\n"
+            f"    CSR_V2V:   {'Yes' if self.v2v_indices is not None else 'No'}\n"
+            f"    CSR_V2F:   {'Yes' if self.v2f_indices is not None else 'No'}\n"
+        )
 
 
 if __name__ == "__main__":
-    a = MeshTopologyContext()
-    a.update_fnMesh_from_string("pPlane1")
+    a = TopologyContext()
+    a.update_fnMesh_from_string("pCube1")
     a.update_position()
     a.update_topology()
     print(list(a.position))
     print(list(a.tri_edge_indices))
     print(list(a.v2v_offsets))
     print(list(a.v2v_indices))
+    print(a)

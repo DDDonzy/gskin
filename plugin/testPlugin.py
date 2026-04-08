@@ -63,17 +63,13 @@ def nodeInitializer():
     tAttr.setStorable(True)
     tAttr.setKeyable(False)
 
-    MemTestNode.aCustomDataP = tAttr.create(
-        "customDataP", "cdp", om1.MFnData.kPointArray
-    )
+    MemTestNode.aCustomDataP = tAttr.create("customDataP", "cdp", om1.MFnData.kPointArray)
     tAttr.setStorable(True)
     tAttr.setKeyable(False)
 
     # 2. Refresh 属性
 
-    MemTestNode.aRefresh = nAttr.create(
-        "refresh", "ref", om1.MFnNumericData.kBoolean, False
-    )
+    MemTestNode.aRefresh = nAttr.create("refresh", "ref", om1.MFnNumericData.kBoolean, False)
     nAttr.setKeyable(True)
     nAttr.setStorable(True)
 

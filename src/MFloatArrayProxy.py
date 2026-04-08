@@ -241,6 +241,10 @@ class MFloatArrayProxy:
         return self.set_to_mPlug(plug, copy)
 
     @property
+    def is_initialized(self):
+        return not (self.array is None or self.view is None)
+
+    @property
     def __array_interface__(self):
         """
         让底层库(如 Numpy, Cython)将此实例直接视为 C 连续数组。
@@ -280,8 +284,7 @@ class MFloatArrayProxy:
         return self.view.tolist()
 
     def __repr__(self) -> str:
-        if self.array is None or self.view is None:
-            # 如果还未分配内存
+        if not self.is_initialized:
             return f"<{self.__class__.__name__} [Uninitialized]>"
 
         # 核心信息提取
