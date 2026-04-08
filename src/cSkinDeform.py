@@ -621,7 +621,7 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
             if self._skinWeights is None:
                 return
 
-            cSkinDeformCython.compute_deform_matrices(
+            cSkinDeformCython.cal_deform_matrices(
                 int(self._geo_matrix.this),
                 int(self._get_matrix_i.this),
                 self._bindPreMatrix_buffer.view,

@@ -1,32 +1,39 @@
 from __future__ import annotations
 import ctypes
 
-import maya.OpenMaya as om1  # type:ignore
-import maya.OpenMayaMPx as ompx  # type:ignore
+import maya.OpenMaya as OpenMaya  # type:ignore
+import maya.OpenMayaMPx as OpenMayaMPx  # type:ignore
 
 from . import _cRegistry
 from . import cSkinDeformCython
 
 
-
-class cls(ompx.MPxDeformerNode):
+class CythonSkinDeformer(OpenMayaMPx.MPxDeformerNode):
     # fmt:off
-    aGeomMatrix       = om1.MObject()
-    aWeights          = om1.MObject()
-    aMaskWeights      = om1.MObject()
-    aLockWeights  = om1.MObject()
-    aLayerWeights     = om1.MObject()
-    aLockInfluences   = om1.MObject()
-    aLayerEnabled     = om1.MObject()
-    aLayerName        = om1.MObject()
-    aLayerCompound    = om1.MObject()
-    aInfluenceMatrix  = om1.MObject()
-    aBindPreMatrix    = om1.MObject()
-    aRefresh          = om1.MObject()
-    # ---
-    aCurrentPaintLayerIndex     = om1.MObject()
-    aCurrentPaintInfluenceIndex = om1.MObject()
-    aCurrentPaintMaskBool       = om1.MObject()
+    aGeomMatrix          = OpenMaya.MObject()
+    aBindPreMatrix       = OpenMaya.MObject()
+    aInfluenceMatrix     = OpenMaya.MObject()
+
+    aWeights             = OpenMaya.MObject()
+
+    aLayer               = OpenMaya.MObject()
+    aMaskWeights         = OpenMaya.MObject()
+    aLockMasks           = OpenMaya.MObject()
+
+    aLayerCompound       = OpenMaya.MObject()
+    aLayerName           = OpenMaya.MObject()
+    aLayerEnabled        = OpenMaya.MObject()
+    aLayerWeights        = OpenMaya.MObject()
+    aLayerLockInfluences = OpenMaya.MObject()
+
+    aForceDirty          = OpenMaya.MObject()
+
+    aCurrentPaintLayerIndex     = OpenMaya.MObject()
+    aCurrentPaintInfluenceIndex = OpenMaya.MObject()
+    aCurrentPaintMaskBool       = OpenMaya.MObject()
+
+    aInputGeometry : OpenMaya.MObject  = OpenMayaMPx.cvar.MPxGeometryFilter_inputGeom
+    aOutputGeometry : OpenMaya.MObject = OpenMayaMPx.cvar.MPxGeometryFilter_outputGeom
     # fmt:on
 
     def __init__(self):
@@ -34,28 +41,30 @@ class cls(ompx.MPxDeformerNode):
 
         # fmt:off
         # --- maya
-        self.hashCode       : int                   = None
-        self.mObject        : om1.MObject           = None
-        self.mFnDep         : om1.MFnDependencyNode = None
-        self.plug_refresh   : om1.MPlug             = None
+        self.hashCode       : int                        = None
+        self.mObject        : OpenMaya.MObject           = None
+        self.mFnDep         : OpenMaya.MFnDependencyNode = None
+        self.plug_refresh   : OpenMaya.MPlug             = None
 
-        # --- influences
-        self.influences_count        : int           = 0
 
+        # cache 缓存实例节点数据, 避免每次计算都调用api
         # --- current paint data
+        self.influences_count : int           = 0
+
         self.layer_index      :int  = -1
         self.is_mask          :bool = False
         self.influences_count :int  = 0
 
-        # --------------------
-        self._geo_matrix             : om1.MMatrix = None
-        self._get_matrix_i           : om1.MMatrix = None
-        self._geo_matrix_is_identity : bool        = True
+        self._geo_matrix             : OpenMaya.MMatrix = None
+        self._get_matrix_i           : OpenMaya.MMatrix = None
+        self._geo_matrix_is_identity : bool             = True
 
-        self._bindPreMatrix_buffer       : BufferManager = None
-        self._influencesMatrix_buffer    : BufferManager = None
-        self._rotateMatrix_buffer        : BufferManager = None
-        self._translateVector_buffer     : BufferManager = None
+        self._bindPreMatrix_buffer       : memoryview = None
+        self._influencesMatrix_buffer    : memoryview = None
+        self._rotateMatrix_buffer        : memoryview = None
+        self._translateVector_buffer     : memoryview = None
+        # dirty flag
+        self.is_dirty = True
 
         # fmt:on
 
@@ -65,38 +74,42 @@ class cls(ompx.MPxDeformerNode):
         - 绑定节点实例 注册到全局 方便别的节点调用。
         """
         # fmt:off
-        # --- maya
-        self.mObject            = self.thisMObject()
-        self.mFnDep             = om1.MFnDependencyNode(self.mObject)
-        self.hashCode           = om1.MObjectHandle(self.mObject).hashCode()
-        self.plug_refresh       = om1.MPlug(self.mObject, self.aRefresh)
+        self.mObject       = self.thisMObject()
+        self.mFnDependNode = OpenMaya.MFnDependencyNode(self.mObject)
+        self.hashCode      = OpenMaya.MObjectHandle(self.mObject).hashCode()
         # fmt:on
 
         _cRegistry.SkinRegistry.register(self.mObject, self)
 
-    def setDirty(self):
+    def set_dirty(self):
         """
-        - 强行标记节点数据脏 以触发 Maya 的求值机制
-        """
-        self.plug_refresh.setInt(self.plug_refresh.asInt() + 1)
-        self.isDirty_weights = True
-        self.isDirty = True
+        标记节点位脏, 在需要的时候Maya自行求值.
 
-    def forceRefresh(self):
+        通常情况需要搭配 `set_dirty` 先标记为脏, 再使用 `pull_output` 强行求值.
+
+        此方法只能外部调用, 节点内部严禁调用.
         """
-        - 强行向 Maya 索要输出数据 以触发 deform 求值 适用于笔刷修改权重后需要立刻更新模型的场景
+        self.is_dirty = True
+        self.plug_refresh.setInt(self.plug_refresh.asInt() + 1)
+
+    def pull_output(self):
         """
-        self.setDirty()
-        mPlug: om1.MPlug = om1.MPlug(self.mObject, ompx.cvar.MPxGeometryFilter_outputGeom).elementByLogicalIndex(0)
+        强行向 Maya 索要输出数据 以触发 deform 求值 适用于笔刷修改权重后需要立刻更新模型的场景.
+
+        通常情况需要搭配 `set_dirty` 先标记为脏, 再使用 `pull_output` 强行求值.
+        此方法只能外部调用, 节点内部严禁调用.
+        """
+        self.set_dirty()
+        mPlug: OpenMaya.MPlug = OpenMaya.MPlug(self.mObject, self.aOutputGeometry).elementByLogicalIndex(0)
         mPlug.asMObject()
         return True
 
-    def setDependentsDirty(self, plug: om1.MPlug, dirtyPlugArray: om1.MPlugArray):
+    def setDependentsDirty(self, plug: OpenMaya.MPlug, dirtyPlugArray: OpenMaya.MPlugArray):
         """DG模式下脏数据标签 性能优化"""
 
         return super().setDependentsDirty(plug, dirtyPlugArray)
 
-    def preEvaluation(self, context: om1.MDGContext, evaluationNode: om1.MEvaluationNode):
+    def preEvaluation(self, context: OpenMaya.MDGContext, evaluationNode: OpenMaya.MEvaluationNode):
         """并行模式下脏数据标签 性能优化"""
 
         return super().preEvaluation(context, evaluationNode)
@@ -109,25 +122,28 @@ class cls(ompx.MPxDeformerNode):
         所以前面配置了`setDependentsDirty`标记 只有在input的数据改变的时候 才会触发 `Deform` 函数。
         后续获取蒙皮后的模型数据 可以用任意方法求值 不会造成多余的 `Deform` 函数调用 以节约资源。
         """
-        if not self.isDirty:
+        if self.is_dirty is False:
             return None
 
         res = super().compute(plug, dataBlock)
-        self.isDirty = False
+        # self.is_dirty = False
+        print("compute")
         return res
 
-    def deform(self, dataBlock: om1.MDataBlock, geoIter, localToWorldMatrix, multiIndex):
+    def deform(self, dataBlock: OpenMaya.MDataBlock, geoIter, localToWorldMatrix, multiIndex):
+        print("deform")
+        return
 
         self.isDirty_brushFastPreview = False
 
-        self.envelope_value = dataBlock.inputValue(ompx.cvar.MPxGeometryFilter_envelope).asFloat()
+        self.envelope_value = dataBlock.inputValue(OpenMayaMPx.cvar.MPxGeometryFilter_envelope).asFloat()
 
-        input_handle = dataBlock.inputArrayValue(ompx.cvar.MPxGeometryFilter_input)
+        input_handle = dataBlock.inputArrayValue(OpenMayaMPx.cvar.MPxGeometryFilter_input)
         input_handle.jumpToElement(multiIndex)
-        _input_geom_obj = input_handle.outputValue().child(ompx.cvar.MPxGeometryFilter_inputGeom)
+        _input_geom_obj = input_handle.outputValue().child(OpenMayaMPx.cvar.MPxGeometryFilter_inputGeom)
         input_geom_obj = _input_geom_obj.asMesh()
 
-        output_handle = dataBlock.outputArrayValue(ompx.cvar.MPxGeometryFilter_outputGeom)
+        output_handle = dataBlock.outputArrayValue(OpenMayaMPx.cvar.MPxGeometryFilter_outputGeom)
         output_handle.jumpToElement(multiIndex)
         _output_geom_obj = output_handle.outputValue()
         output_geom_obj = _output_geom_obj.asMesh()
@@ -135,7 +151,7 @@ class cls(ompx.MPxDeformerNode):
         if input_geom_obj.isNull() or output_geom_obj.isNull():
             return
 
-        mFnMesh_out = om1.MFnMesh(output_geom_obj)
+        mFnMesh_out = OpenMaya.MFnMesh(output_geom_obj)
         vertex_count = mFnMesh_out.numVertices()
         self.mesh_context.vertex_positions = BufferManager.from_ptr(int(mFnMesh_out.getRawPoints()), "f", (vertex_count * 3,))
 
@@ -148,7 +164,7 @@ class cls(ompx.MPxDeformerNode):
                 # 没有原始数据 or topology 变了才申请内存
                 self.rawPoints_original = BufferManager.allocate("f", (vertex_count * 3,))
             #  将原始数据复制到 original 内存中
-            mFnMesh_in = om1.MFnMesh(input_geom_obj)
+            mFnMesh_in = OpenMaya.MFnMesh(input_geom_obj)
             ctypes.memmove(
                 self.rawPoints_original.ptr,
                 int(mFnMesh_in.getRawPoints()),
@@ -181,7 +197,7 @@ class cls(ompx.MPxDeformerNode):
         if self.isDirty_bindPreMatrix:
             bind_data_obj = dataBlock.inputValue(self.aBindPreMatrix).data()
             if not bind_data_obj.isNull():
-                fn_bind_array = om1.MFnMatrixArrayData(bind_data_obj)
+                fn_bind_array = OpenMaya.MFnMatrixArrayData(bind_data_obj)
                 bind_m_array = fn_bind_array.array()
                 if bind_m_array.length() > 0:
                     addr_base = int(bind_m_array[0].this)
@@ -191,7 +207,7 @@ class cls(ompx.MPxDeformerNode):
         if self.isDirty_geoMatrix:
             self._geo_matrix = dataBlock.inputValue(self.aGeomMatrix).asMatrix()
             self._get_matrix_i = self._geo_matrix.inverse()
-            self._geo_matrix_is_identity = self._geo_matrix.isEquivalent(om1.MMatrix.identity)
+            self._geo_matrix_is_identity = self._geo_matrix.isEquivalent(OpenMaya.MMatrix.identity)
             self.isDirty_geoMatrix = False
 
         if self.isDirty_weights:
@@ -207,7 +223,7 @@ class cls(ompx.MPxDeformerNode):
         if self._skinWeights is None:
             return
 
-        cSkinDeformCython.compute_deform_matrices(
+        cSkinDeformCython.cal_deform_matrices(
             int(self._geo_matrix.this),
             int(self._get_matrix_i.this),
             self._bindPreMatrix_buffer.view,
@@ -260,66 +276,66 @@ class cls(ompx.MPxDeformerNode):
 
     @classmethod
     def nodeInitializer(cls):
-        nAttr = om1.MFnNumericAttribute()
-        tAttr = om1.MFnTypedAttribute()
-        mAttr = om1.MFnMatrixAttribute()
-        cAttr = om1.MFnCompoundAttribute()
+        # fmt:off
+        nAttr = OpenMaya.MFnNumericAttribute()
+        tAttr = OpenMaya.MFnTypedAttribute()
+        mAttr = OpenMaya.MFnMatrixAttribute()
+        cAttr = OpenMaya.MFnCompoundAttribute()
 
-        # --- geo matrix
-        cls.aGeomMatrix = mAttr.create("geomMatrix", "gm")
-        # --- bind pre matrix
-        cls.aBindPreMatrix = tAttr.create("bindPreMatrixArray", "bpm", om1.MFnData.kMatrixArray)
-        # --- influences matrix
+        cls.aGeomMatrix      = mAttr.create("geomMatrix", "gm")
+        cls.aBindPreMatrix   = tAttr.create("bindPreMatrixArray", "bpm", OpenMaya.MFnData.kMatrixArray)
         cls.aInfluenceMatrix = mAttr.create("matrix", "bm")
         mAttr.setArray(True)
         mAttr.setUsesArrayDataBuilder(True)
         # --- weights
-        cls.aWeights = tAttr.create("weightsData", "wd", om1.MFnData.kVectorArray)
-        cls.aLockWeights = nAttr.create("lockWeights", "lw", om1.MFnData.kIntArray)
-        # --- layer mask weights
-        cls.aMaskWeights = tAttr.create("layerMask", "lm", om1.MFnData.kVectorArray)
-        cls.aLockWeights = nAttr.create("lockMaskWeights", "lmw", om1.MFnNumericData.kBoolean, False)
-        nAttr.setArray(True)
-        # --- layer weights children
-        cls.aLayerName = tAttr.create("layerName", "ln", om1.MFnData.kString)
-        cls.aLayerEnabled = nAttr.create("layerEnabled", "le", om1.MFnNumericData.kBoolean, False)
-        cls.aLayerWeights = tAttr.create("layerWeights", "lw", om1.MFnData.kVectorArray)
-        cls.aLockInfluences = nAttr.create("lockInfluences", "li", om1.MFnNumericData.kBoolean, False)
-        nAttr.setArray(True)
-        # --- layer comp
-        cls.aLayerCompound = cAttr.create("layers", "lays")
+        cls.aWeights             = tAttr.create("weightsData", "wd", OpenMaya.MFnData.kVectorArray)
+        cls.aLayerCompound       = cAttr.create("layerData", "lds")
+        cls.aLayerName           = tAttr.create("layerName", "ln", OpenMaya.MFnData.kString)
+        cls.aLayerEnabled        = nAttr.create("layerEnabled", "le", OpenMaya.MFnNumericData.kBoolean, False)
+        cls.aLayerWeights        = tAttr.create("layerWeightsData", "lwd", OpenMaya.MFnData.kVectorArray)
+        cls.aLayerLockInfluences = tAttr.create("layerLockInfluences", "lli", OpenMaya.MFnData.kIntArray)
         cAttr.setArray(True)
-        cAttr.setHidden(True)
         cAttr.setUsesArrayDataBuilder(True)
         cAttr.addChild(cls.aLayerName)
         cAttr.addChild(cls.aLayerEnabled)
         cAttr.addChild(cls.aLayerWeights)
-        cAttr.addChild(cls.aLockInfluences)
+        cAttr.addChild(cls.aLayerLockInfluences)
+        # --- layer compound
+        cls.aLayer       = cAttr.create("layers", "lyd")
+        cls.aMaskWeights = tAttr.create("layersMaskData", "lmd", OpenMaya.MFnData.kVectorArray)
+        cls.aLockMasks   = tAttr.create("layersLockMask", "llm", OpenMaya.MFnData.kIntArray)
+        cAttr.addChild(cls.aMaskWeights)
+        cAttr.addChild(cls.aLockMasks)
+        cAttr.addChild(cls.aLayerCompound)
+
         # --- refresh
-        cls.aRefresh = nAttr.create("cRefresh", "cr", om1.MFnNumericData.kInt, False)
-        nAttr.setKeyable(False)
+        cls.aForceDirty = nAttr.create("forceDirty", "di", OpenMaya.MFnNumericData.kInt, False)
+        nAttr.setChannelBox(True)
         nAttr.setStorable(False)
-        nAttr.setCached(False)
         # --- Paint current weights
-        cls.aCurrentPaintLayerIndex = nAttr.create("currentPaintLayer", "cpl", om1.MFnNumericData.kInt, -1)
+        cls.aCurrentPaintLayerIndex = nAttr.create("currentPaintLayer", "cpl", OpenMaya.MFnNumericData.kInt, -1)
         nAttr.setMin(-1)
         nAttr.setKeyable(True)
-        cls.aCurrentPaintInfluenceIndex = nAttr.create("currentPaintInfluence", "cpi", om1.MFnNumericData.kInt, 0)
+        cls.aCurrentPaintInfluenceIndex = nAttr.create("currentPaintInfluence", "cpi", OpenMaya.MFnNumericData.kInt, 0)
         nAttr.setMin(0)
         nAttr.setKeyable(True)
-        cls.aCurrentPaintMaskBool = nAttr.create("currentPaintMask", "cpm", om1.MFnNumericData.kBoolean, False)
+        cls.aCurrentPaintMaskBool = nAttr.create("currentPaintMask", "cpm", OpenMaya.MFnNumericData.kBoolean, False)
         nAttr.setKeyable(True)
         # ====================================
         for attr in  (cls.aGeomMatrix, 
                       cls.aBindPreMatrix, 
                       cls.aInfluenceMatrix, 
+
                       cls.aWeights,
-                      cls.aMaskWeights,
-                      cls.aLockWeights,
-                      cls.aLayerCompound, 
-                      cls.aRefresh,
+                      cls.aLayer, 
+
+                      cls.aForceDirty, 
+                      
                       cls.aCurrentPaintLayerIndex,
                       cls.aCurrentPaintInfluenceIndex,
                       cls.aCurrentPaintMaskBool):  # fmt:skip
             cls.addAttribute(attr)
-            cls.attributeAffects(attr, ompx.cvar.MPxGeometryFilter_outputGeom)
+            cls.attributeAffects(attr, cls.aOutputGeometry)
+
+
+        # fmt:on
