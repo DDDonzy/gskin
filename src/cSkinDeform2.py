@@ -132,6 +132,7 @@ class CythonSkinDeformer(OpenMayaMPx.MPxDeformerNode):
 
     def deform(self, dataBlock: OpenMaya.MDataBlock, geoIter, localToWorldMatrix, multiIndex):
         print("deform")
+
         return
 
         self.isDirty_brushFastPreview = False
