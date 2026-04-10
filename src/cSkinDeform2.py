@@ -3,9 +3,13 @@ from __future__ import annotations
 import ctypes
 from tkinter.filedialog import Open
 
+from numpy import isin
+
 from gskin.src import MWeightsHandle
+import maya.api.OpenMaya as OpenMaya2  # type:ignore
 import maya.OpenMaya as OpenMaya  # type:ignore
 import maya.OpenMayaMPx as OpenMayaMPx  # type:ignore
+from maya import cmds
 
 from . import _cRegistry
 from . import cSkinDeformCython
@@ -212,6 +216,7 @@ class CSkinDeform(OpenMayaMPx.MPxDeformerNode):
             return
         fn_matrix = OpenMaya.MFnMatrixArrayData(array_mObject)
         array: OpenMaya.MMatrixArray = fn_matrix.array()
+        print(array)
         length = array.length()
         if length == 0:
             return
@@ -452,25 +457,26 @@ class FnCSkinDeform:
         mPlug: OpenMaya.MPlug = OpenMaya.MPlug(self.instance.mObject, self.instance.aOutputGeometry).elementByLogicalIndex(0)
         return mPlug.asMObject()
 
-    def set_bind_pre_matrix(self, bind_pre_matrix_array: OpenMaya.MMatrixArray | memoryview | list):
+    def set_bind_pre_matrix(self, bind_pre_matrix_array: OpenMaya.MMatrixArray | OpenMaya2.MMatrixArray | memoryview):
         """
-        TODO 想办法优化，最好可以直接支持UNDO REDO
+        TODO 想办法优化，最好可以直接支持UNDO
         """
-
-        if isinstance(bind_pre_matrix_array, memoryview):
-            array = OpenMaya.MMatrixArray()
-            length = bind_pre_matrix_array.shape[0]
-            array.setLength(length)
-            address = int(array[0].this)
-            src_address = ctypes.addressof(bind_pre_matrix_array.obj)
-            ctypes.memmove(address, src_address, length * 128)  # 128 = (4*4) * ctypes.sizeof(ctypes.c_double)
-
-        else:
-            array = bind_pre_matrix_array
-
-        mObject = OpenMaya.MFnMatrixArrayData().create(array)
         plug = OpenMaya.MPlug(self.instance.mObject, self.instance.aBindPreMatrix)
-        plug.setMObject(mObject)
+        if isinstance(bind_pre_matrix_array, memoryview):
+            data = bind_pre_matrix_array.cast(bind_pre_matrix_array.format)
+            length = data.shape[0] // 16
+        elif isinstance(bind_pre_matrix_array, OpenMaya.MMatrixArray):
+            length = bind_pre_matrix_array.length()
+            address = int(bind_pre_matrix_array[0].this)
+            flat_buffer = (ctypes.c_double * (length * 16)).from_address(address)
+            data = memoryview(flat_buffer)
+        elif isinstance(bind_pre_matrix_array, OpenMaya2.MMatrixArray):
+            length = len(bind_pre_matrix_array)
+            data = bind_pre_matrix_array
+        else:
+            raise ValueError("Input value must be MMatrixArray or memoryview")
+
+        cmds.setAttr(plug.name(), length, *data, type="matrixArray")
         return True
 
     def transfer_bind_pre_matrix_from_skinCluster(self, skinCluster_name: str):
