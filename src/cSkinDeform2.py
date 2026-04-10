@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import ctypes
 
 import maya.OpenMaya as OpenMaya  # type:ignore
@@ -7,6 +8,59 @@ import maya.OpenMayaMPx as OpenMayaMPx  # type:ignore
 from . import _cRegistry
 from . import cSkinDeformCython
 from . import cDirtyManager
+from .MTopologyContext import TopologyContext
+
+
+class CSkinContext:
+    # fmt:off
+    input_mFnMesh : OpenMaya.MFnMesh
+    output_mFnMesh: OpenMaya.MFnMesh
+
+    current_paint_layer_index    : int
+    current_paint_influence_index: int
+    current_paint_mask_bool      : bool
+
+    out_position : memoryview
+    orig_position: memoryview
+    skin_weights : memoryview
+
+    geo_matrix            : memoryview
+    geo_matrix_i          : memoryview
+    geo_matrix_is_identity: bool
+
+    bind_pre_matrix  : memoryview
+    influences_matrix: memoryview
+    rotate_matrix    : memoryview
+    translate_vector : memoryview
+
+    topology: TopologyContext
+      # fmt:on
+
+    def __init__(self):
+        # fmt:off
+        self.input_mFnMesh  = None
+        self.output_mFnMesh = None
+
+        self.current_paint_layer_index     = -1
+        self.current_paint_influence_index = 0
+        self.current_paint_mask_bool       = False
+
+
+        self.out_position  = None
+        self.orig_position = None
+        self.skin_weights  = None
+
+        self.geo_matrix             = None
+        self.geo_matrix_i           = None
+        self.geo_matrix_is_identity = True
+
+        self.bind_pre_matrix   = None
+        self.influences_matrix = None
+        self.rotate_matrix     = None
+        self.translate_vector  = None
+
+        self.topology = TopologyContext()
+        # fmt:on
 
 
 class CythonSkinDeformer(OpenMayaMPx.MPxDeformerNode):
@@ -47,30 +101,13 @@ class CythonSkinDeformer(OpenMayaMPx.MPxDeformerNode):
         self.mFnDep         : OpenMaya.MFnDependencyNode = None
         self.plug_refresh   : OpenMaya.MPlug             = None
 
-
-        # cache 缓存实例节点数据, 避免每次计算都调用api
-        # --- current paint data
-        self.influences_count : int           = 0
-
-        self.layer_index      :int  = -1
-        self.is_mask          :bool = False
-        self.influences_count :int  = 0
-
-        self._geo_matrix             : OpenMaya.MMatrix = None
-        self._get_matrix_i           : OpenMaya.MMatrix = None
-        self._geo_matrix_is_identity : bool             = True
-
-        self._bindPreMatrix_buffer       : memoryview = None
-        self._influencesMatrix_buffer    : memoryview = None
-        self._rotateMatrix_buffer        : memoryview = None
-        self._translateVector_buffer     : memoryview = None
+        self.ctx = CSkinContext()
 
         self.init_dirtyEvent()
         # fmt:on
 
     def init_dirtyEvent(self):
         # dirty flag
-        self.is_dirty = True
         self.dirtyEvent = cDirtyManager.DirtyEventManager()
 
         self.dirtyEvent.add_handler(
@@ -89,7 +126,7 @@ class CythonSkinDeformer(OpenMayaMPx.MPxDeformerNode):
         self.dirtyEvent.sync_from_evaluation(evaluationNode)
         return super().preEvaluation(context, evaluationNode)
 
-    def _print_v(self,dataBlock):
+    def _print_v(self, dataBlock):
         print(self.dataBlock.inputValue(self.aForceDirty).asInt())
 
     def postConstructor(self):
@@ -136,23 +173,22 @@ class CythonSkinDeformer(OpenMayaMPx.MPxDeformerNode):
         """
         # if self.is_dirty is False:
         #     return None
-
-        res = super().compute(plug, dataBlock)
-        # self.is_dirty = False
         print("compute")
-        self.dataBlock = dataBlock
         self.dirtyEvent.execute(dataBlock)
+        res = super().compute(plug, dataBlock)
         return res
 
     def deform(self, dataBlock: OpenMaya.MDataBlock, geoIter, localToWorldMatrix, multiIndex):
         print("deform")
-
         return
 
-    def fast_preview_deform(self, hit_indices: memoryview | None = None, hit_count: int = 0):
+    def fast_preview_deform(
+        self,
+        vertex_indices: memoryview | None = None,
+    ):
         """
         局部蒙皮算法, 专供笔刷调用
-        根据笔刷的 hit_indices 和 hit_count 来局部计算蒙皮,
+        根据笔刷的 hit_indices 来局部计算蒙皮,
         不唤醒 deform 函数, 不触发maya dg, 直接通知渲染节点更新
         """
 
