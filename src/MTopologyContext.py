@@ -107,12 +107,15 @@ class TopologyContext:
             mFnMesh (OpenMaya.MFnMesh): 输入mFnMesh, 如果不输入, 自动使用`self.mFnMesh`
         Update:
             - `self.position`
+            - `self.num_vertices`
         """
         fnMesh = mFnMesh if mFnMesh else self.mFnMesh
         if fnMesh is None:
             raise RuntimeError("mFnMesh is not set.")
 
         num_vertices: int = fnMesh.numVertices()
+        self.num_vertices = num_vertices
+
         address = int(fnMesh.getRawPoints())
         raw_buffer = (ctypes.c_float * (num_vertices * 3)).from_address(address)
 

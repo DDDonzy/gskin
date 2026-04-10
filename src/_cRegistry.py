@@ -62,7 +62,7 @@ class SkinRegistry:
         return None
 
     @classmethod
-    def from_instance_by_string(cls, cSkinNodeName: str):
+    def get_instance_by_string(cls, cSkinNodeName: str):
         """通过字符串路径直接获取 Handle，严格遵循显式装配规范"""
         sel: om2.MSelectionList = om2.MSelectionList()
         try:

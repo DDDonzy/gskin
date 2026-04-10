@@ -81,7 +81,7 @@ class WeightsManager:
 
     @classmethod
     def from_node(cls, node_name: str):
-        cSkin: CythonSkinDeformer = SkinRegistry.from_instance_by_string(node_name)
+        cSkin: CythonSkinDeformer = SkinRegistry.get_instance_by_string(node_name)
         return cSkin.weights_manager
 
     def sync_layer_cache(self, mDataBlock: om1.MDataBlock):

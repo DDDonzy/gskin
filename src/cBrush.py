@@ -295,7 +295,7 @@ class WeightBrushContext(omui.MPxContext):
             self.fn_mesh = om.MFnMesh(self.mesh_dag_path)
 
             cSkin_node_name = "cSkinDeformer1"
-            self.cSkin: CythonSkinDeformer = SkinRegistry.from_instance_by_string(cSkin_node_name)
+            self.cSkin: CythonSkinDeformer = SkinRegistry.get_instance_by_string(cSkin_node_name)
 
             if not self.cSkin:
                 raise RuntimeError("未提取到 cSkinDeformer 的 Python 实例。")

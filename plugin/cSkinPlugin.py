@@ -14,7 +14,7 @@ NODE_ID = om1.MTypeId(0x00080033)
 
 def nodeCreator():
     # creator 必须返回一个由 asMPxPtr 包装的指针
-    return ompx.asMPxPtr(cSkinDeform.CythonSkinDeformer())
+    return ompx.asMPxPtr(cSkinDeform.CSkinDeform())
 
 
 def initializePlugin(mObj):
@@ -25,7 +25,7 @@ def initializePlugin(mObj):
             NODE_NAME,
             NODE_ID,
             nodeCreator,
-            cSkinDeform.CythonSkinDeformer.nodeInitializer,
+            cSkinDeform.CSkinDeform.nodeInitializer,
             ompx.MPxNode.kDeformerNode,
         )
         om.MGlobal.displayInfo(f"{NODE_NAME} (OM1 Node) loaded successfully.")
