@@ -4,7 +4,7 @@ import math
 import array
 
 
-from gskin.src.cSkinDeform import MeshTopologyContext
+from gskin.old.cSkinDeform import MeshTopologyContext
 import maya.cmds as cmds
 import maya.api.OpenMaya as om
 import maya.api.OpenMayaUI as omui
@@ -18,9 +18,9 @@ from .cBrushCore2Cython import BrushStrokeContext
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .cSkinDeform import CythonSkinDeformer
+    from ..old.cSkinDeform import CythonSkinDeformer
     from .cBrushCore2Cython import CoreBrushEngine
-    from .cSkinContext import BrushHitContext
+    from ..old.cSkinContext import BrushHitContext
 
 
 def maya_useNewAPI():

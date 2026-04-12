@@ -1,34 +1,51 @@
 from __future__ import annotations
-
+import array
 import ctypes
 from tkinter.filedialog import Open
 
-from numpy import isin
 
-from gskin.src import MWeightsHandle
+from maya import cmds, mel
 import maya.api.OpenMaya as OpenMaya2  # type:ignore
+import maya.api.OpenMayaAnim as OpenMayaAnim2  # type:ignore
 import maya.OpenMaya as OpenMaya  # type:ignore
 import maya.OpenMayaMPx as OpenMayaMPx  # type:ignore
-from maya import cmds
 
 from . import _cRegistry
 from . import cSkinDeformCython
 from . import cDirtyEvent
 from .MTopologyContext import TopologyContext
+from .MWeightsHandle import MWeightsHandle
+
+
+__all__ = ("FnCSkinDeform",)
 
 
 class CSkinContext:
+    __slots__ = (
+        "envelope",
+        "current_paint_layer_index",
+        "current_paint_influence_index",
+        "current_paint_mask_bool",
+        "skin_weights",
+        "geo_matrix",
+        "geo_matrix_i",
+        "geo_matrix_is_identity",
+        "bind_pre_matrix",
+        "influences_matrix",
+        "rotate_matrix",
+        "translate_vector",
+        "input_mesh",
+        "output_mesh",
+    )
+
     # fmt:off
-    input_mFnMesh : OpenMaya.MFnMesh
-    output_mFnMesh: OpenMaya.MFnMesh
+    envelope: float
 
     current_paint_layer_index    : int
     current_paint_influence_index: int
     current_paint_mask_bool      : bool
 
-    out_position : memoryview
-    orig_position: memoryview
-    skin_weights : MWeightsHandle.MWeightsHandle
+    skin_weights : MWeightsHandle
 
     geo_matrix            : memoryview
     geo_matrix_i          : memoryview
@@ -39,11 +56,15 @@ class CSkinContext:
     rotate_matrix    : memoryview
     translate_vector : memoryview
 
-    topology: TopologyContext
+    input_mesh : TopologyContext
+    output_mesh : TopologyContext
+
     # fmt:on
 
     def __init__(self):
         # fmt:off
+        self.envelope = 1.0
+
         self.current_paint_layer_index     = -1
         self.current_paint_influence_index = 0
         self.current_paint_mask_bool       = False
@@ -65,6 +86,9 @@ class CSkinContext:
 
 
 class CSkinDeform(OpenMayaMPx.MPxDeformerNode):
+    NODE_TYPE = r"cSkinDeformer"
+    NODE_ID = OpenMaya.MTypeId(0x00080033)
+
     # fmt:off
     aGeomMatrix          = OpenMaya.MObject()
     aBindPreMatrix       = OpenMaya.MObject()
@@ -88,9 +112,10 @@ class CSkinDeform(OpenMayaMPx.MPxDeformerNode):
     aCurrentPaintInfluenceIndex = OpenMaya.MObject()
     aCurrentPaintMaskBool       = OpenMaya.MObject()
 
-    aInput :OpenMaya.MObject = OpenMayaMPx.cvar.MPxGeometryFilter_input
-    aInputGeometry : OpenMaya.MObject  = OpenMayaMPx.cvar.MPxGeometryFilter_inputGeom
+    aInput          :OpenMaya.MObject  = OpenMayaMPx.cvar.MPxGeometryFilter_input
+    aInputGeometry  : OpenMaya.MObject = OpenMayaMPx.cvar.MPxGeometryFilter_inputGeom
     aOutputGeometry : OpenMaya.MObject = OpenMayaMPx.cvar.MPxGeometryFilter_outputGeom
+    aEnvelope       : OpenMaya.MObject = OpenMayaMPx.cvar.MPxGeometryFilter_envelope
     # fmt:on
 
     def __init__(self):
@@ -100,30 +125,55 @@ class CSkinDeform(OpenMayaMPx.MPxDeformerNode):
         # --- maya
         self.hashCode       : int                        = None
         self.mObject        : OpenMaya.MObject           = None
-        self.mFnDep         : OpenMaya.MFnDependencyNode = None
+        self.mFnDependNode  : OpenMaya.MFnDependencyNode = None
         self.plug_refresh   : OpenMaya.MPlug             = None
 
         self.ctx = CSkinContext()
+        self.layer_manager = WeightsLayerManager()
 
         self.init_dirtyEvent()
+
         # fmt:on
 
     def init_dirtyEvent(self):
         # dirty flag
         # fmt:off
-        self.event_update_mesh              = cDirtyEvent.DirtyEventHandler(self.aInputGeometry, self._update_mesh)
-        self.event_update_influences_matrix = cDirtyEvent.DirtyEventHandler(self.aInfluenceMatrix, self._update_influences_matrix)
-        self.event_update_bind_pre_matrix   = cDirtyEvent.DirtyEventHandler(self.aBindPreMatrix, self._update_bind_pre_matrix)
-        self.event_update_geo_matrix        = cDirtyEvent.DirtyEventHandler(self.aGeomMatrix, self._update_geo_matrix)
-        self.event_update_deform_matrix     = cDirtyEvent.DirtyEventHandler((self.aInfluenceMatrix, self.aBindPreMatrix, self.aGeomMatrix),
-                                                                              self._update_deform_matrices,)  # fmt:skip
-        self.event_update_paint_information = cDirtyEvent.DirtyEventHandler((self.aCurrentPaintLayerIndex, self.aCurrentPaintInfluenceIndex, self.aCurrentPaintMaskBool),
-                                                                              self._update_paint_information)  # fmt:skip
-        self.event_update_weights           = cDirtyEvent.DirtyEventHandler(self.aWeights, self._update_weights)
+        self.event_envelope                 = cDirtyEvent.DirtyEventHandler(self.aEnvelope, 
+                                                                            self._update_envelope)
+        self.event_update_mesh              = cDirtyEvent.DirtyEventHandler(self.aInputGeometry, 
+                                                                            self._update_mesh)
+        self.event_update_influences_matrix = cDirtyEvent.DirtyEventHandler(self.aInfluenceMatrix, 
+                                                                            self._update_influences_matrix)
+        self.event_update_bind_pre_matrix   = cDirtyEvent.DirtyEventHandler(self.aBindPreMatrix, 
+                                                                            self._update_bind_pre_matrix)
+        self.event_update_geo_matrix        = cDirtyEvent.DirtyEventHandler(self.aGeomMatrix, 
+                                                                            self._update_geo_matrix)
+        self.event_update_deform_matrix     = cDirtyEvent.DirtyEventHandler((self.aInfluenceMatrix,
+                                                                             self.aBindPreMatrix,
+                                                                             self.aGeomMatrix),
+                                                                            self._update_deform_matrices,)  # fmt:skip
+        self.event_update_paint_information = cDirtyEvent.DirtyEventHandler((self.aCurrentPaintLayerIndex,
+                                                                             self.aCurrentPaintInfluenceIndex,
+                                                                             self.aCurrentPaintMaskBool),
+                                                                            self._update_paint_information)  # fmt:skip
+        self.event_update_weights           = cDirtyEvent.DirtyEventHandler((self.aWeights,
+                                                                             self.aMaskWeights,
+                                                                             self.aLockMasks), 
+                                                                             self._update_weights)
+        self.event_update_layer_manager     = cDirtyEvent.DirtyEventHandler((self.aMaskWeights,
+                                                                             self.aLockMasks,
+                                                                             self.aLayerCompound,
+                                                                             self.aLayerName,
+                                                                             self.aLayerEnabled,
+                                                                             self.aLayerWeights,
+                                                                             self.aLayerLockInfluences),
+                                                                            self._update_layer_manager)  # fmt:skip
+
         # fmt:on
 
     def setDependentsDirty(self, plug: OpenMaya.MPlug, dirtyPlugArray: OpenMaya.MPlugArray):
         """DG模式下脏数据标签 性能优化"""
+        self.event_envelope.sync_from_plug(plug)
         self.event_update_mesh.sync_from_plug(plug)
         self.event_update_influences_matrix.sync_from_plug(plug)
         self.event_update_bind_pre_matrix.sync_from_plug(plug)
@@ -135,6 +185,7 @@ class CSkinDeform(OpenMayaMPx.MPxDeformerNode):
 
     def preEvaluation(self, context: OpenMaya.MDGContext, evaluationNode: OpenMaya.MEvaluationNode):
         """并行模式下脏数据标签 性能优化"""
+        self.event_envelope.sync_from_evaluation(evaluationNode)
         self.event_update_mesh.sync_from_evaluation(evaluationNode)
         self.event_update_influences_matrix.sync_from_evaluation(evaluationNode)
         self.event_update_bind_pre_matrix.sync_from_evaluation(evaluationNode)
@@ -148,6 +199,10 @@ class CSkinDeform(OpenMayaMPx.MPxDeformerNode):
         """
         - 节点创建后 立刻通过api获取这些常用api对象 避免后续频繁调用api开销
         - 绑定节点实例 注册到全局 方便别的节点调用。
+        Update:
+            - `self.mObject`
+            - `self.mFnDependNode`
+            - `self.hashCode`
         """
         # fmt:off
         self.mObject       = self.thisMObject()
@@ -156,6 +211,13 @@ class CSkinDeform(OpenMayaMPx.MPxDeformerNode):
         # fmt:on
         _cRegistry.SkinRegistry.register(self.mObject, self)
 
+    def _update_envelope(self, dataBlock: OpenMaya.MDataBlock):
+        """
+        Update:
+            - `self.ctx.envelope`
+        """
+        self.ctx.envelope = dataBlock.inputValue(self.aEnvelope).asFloat()
+
     def _update_mesh(self, dataBlock: OpenMaya.MDataBlock, multiIndex: int):
         """
         Updata:
@@ -163,21 +225,22 @@ class CSkinDeform(OpenMayaMPx.MPxDeformerNode):
             - `self.ctx.output_mesh`
         """
         ctx = self.ctx
-
+        # input/orig meshes
         input_handle = dataBlock.inputArrayValue(self.aInput)
         input_handle.jumpToElement(multiIndex)
         input_geom_obj = input_handle.outputValue().child(self.aInputGeometry).asMesh()
         ctx.input_mesh.update_fnMesh(OpenMaya.MFnMesh(input_geom_obj))
-
+        ctx.input_mesh.update_position()
+        # output meshes
         output_handle = dataBlock.outputArrayValue(self.aOutputGeometry)
         output_handle.jumpToElement(multiIndex)
         output_geom_obj = output_handle.outputValue().asMesh()
         ctx.output_mesh.update_fnMesh(OpenMaya.MFnMesh(output_geom_obj))
-
-        ctx.input_mesh.update_position()
         ctx.output_mesh.update_position()
+        # topology
+        # TODO 需要优化避免每次都更新topology
         ctx.output_mesh.update_topology()
-        print("update_input_mesh")
+        # print("update_input_mesh")
 
     def _update_influences_matrix(self, dataBlock: OpenMaya.MDataBlock):
         """
@@ -186,7 +249,7 @@ class CSkinDeform(OpenMayaMPx.MPxDeformerNode):
         """
         ctx = self.ctx
 
-        influence_handle: OpenMaya.MDataHandle = dataBlock.inputArrayValue(self.aInfluenceMatrix)
+        influence_handle: OpenMaya.MArrayDataHandle = dataBlock.inputArrayValue(self.aInfluenceMatrix)
         num_influences = influence_handle.elementCount()
         if num_influences == 0:
             return
@@ -201,7 +264,7 @@ class CSkinDeform(OpenMayaMPx.MPxDeformerNode):
             i_matrix_address = int(influence_handle.inputValue().asMatrix().this)
             dst_address = (i * 128) + influences_matrix_address  # 128 = (4*4) * ctypes.sizeof(ctypes.c_double)
             ctypes.memmove(dst_address, i_matrix_address, 128)  # 128 = (4*4) * ctypes.sizeof(ctypes.c_double)
-        print(f"update_influences_matrix: {ctx.influences_matrix.tolist()}")
+        # print(f"update_influences_matrix: {ctx.influences_matrix.tolist()}")
 
     def _update_bind_pre_matrix(self, dataBlock: OpenMaya.MDataBlock):
         """
@@ -210,21 +273,22 @@ class CSkinDeform(OpenMayaMPx.MPxDeformerNode):
         """
         ctx = self.ctx
 
-        bind_pre_matrix_handle: OpenMaya.MDataHandle = dataBlock.inputValue(self.aBindPreMatrix)
-        array_mObject = bind_pre_matrix_handle.data()
-        if array_mObject.isNull():
+        bindPreMatrix_handle: OpenMaya.MArrayDataHandle = dataBlock.inputArrayValue(self.aBindPreMatrix)
+        num_influences = bindPreMatrix_handle.elementCount()
+        if num_influences == 0:
             return
-        fn_matrix = OpenMaya.MFnMatrixArrayData(array_mObject)
-        array: OpenMaya.MMatrixArray = fn_matrix.array()
-        print(array)
-        length = array.length()
-        if length == 0:
-            return
-        array_address = int(array[0].this)
-        # maya 提供连续内存地址, 咱就不自己申请了, 直接使用 maya 内存地址
-        _c = (ctypes.c_double * (length * 16)).from_address(array_address)
-        ctx.bind_pre_matrix = memoryview(_c).cast("B").cast("d", (length, 16))
-        print(f"update_bind_pre_matrix: {ctx.bind_pre_matrix.tolist()}")
+        # 申请内存池
+        # TODO 需要优化, 避免每帧都申请新内存池, 尽量复用
+        _c = (ctypes.c_double * (num_influences * 16))()
+        ctx.bind_pre_matrix = memoryview(_c).cast("B").cast("d", (num_influences, 16))
+        # 把maya数据填充到内存池
+        bindPreMatrix_address = ctypes.addressof(ctx.bind_pre_matrix.obj)
+        for i in range(num_influences):
+            bindPreMatrix_handle.jumpToArrayElement(i)
+            i_matrix_address = int(bindPreMatrix_handle.inputValue().asMatrix().this)
+            dst_address = (i * 128) + bindPreMatrix_address  # 128 = (4*4) * ctypes.sizeof(ctypes.c_double)
+            ctypes.memmove(dst_address, i_matrix_address, 128)  # 128 = (4*4) * ctypes.sizeof(ctypes.c_double)
+        # print(f"update_influences_matrix: {ctx.influences_matrix.tolist()}")
 
     def _update_geo_matrix(self, dataBlock: OpenMaya.MDataBlock):
         """
@@ -244,7 +308,7 @@ class CSkinDeform(OpenMayaMPx.MPxDeformerNode):
         self.ctx.geo_matrix_i = memoryview(_c).cast("B").cast("d")
 
         self.ctx.geo_matrix_is_identity = geo_matrix.isEquivalent(OpenMaya.MMatrix.identity)
-        print(f"update_geo_matrix: {self.ctx.geo_matrix.tolist()}")
+        # print(f"update_geo_matrix: {self.ctx.geo_matrix.tolist()}")
 
     def _update_paint_information(self, dataBlock: OpenMaya.MDataBlock):
         """
@@ -267,12 +331,9 @@ class CSkinDeform(OpenMayaMPx.MPxDeformerNode):
         ctx = self.ctx
 
         weights_handle = dataBlock.inputValue(self.aWeights)
-        ctx.skin_weights = MWeightsHandle.MWeightsHandle(weights_handle, ctx.input_mesh.num_vertices)
+        ctx.skin_weights = MWeightsHandle(weights_handle)
 
-        if ctx.skin_weights.is_initialized:
-            print(f"update_weights: {ctx.skin_weights.tolist()}")
-        else:
-            print("update_weights: None")
+        print(ctx.skin_weights)
 
     def _update_deform_matrices(self):
         """
@@ -282,18 +343,21 @@ class CSkinDeform(OpenMayaMPx.MPxDeformerNode):
         """
         ctx = self.ctx
 
+        # 校验 influences_matrix 和 bind_pre_matrix 真实存在
         if ctx.influences_matrix is None or ctx.bind_pre_matrix is None:
             OpenMaya.MGlobal.displayWarning("influences_matrix or bind_pre_matrix is None!")
             return
         num_influences = ctx.bind_pre_matrix.shape[0]
         num_bind_pre_matrix = ctx.bind_pre_matrix.shape[0]
-
+        # 校验 num_influences 和 num_bind_pre_matrix 不为空
         if num_influences < 1 or num_bind_pre_matrix < 1:
             OpenMaya.MGlobal.displayWarning("num_influences <1 or num_bind_pre_matrix <1!")
             return
+        # 校验 num_influences 和 num_bind_pre_matrix 数量一致
         if num_influences != num_bind_pre_matrix:
             OpenMaya.MGlobal.displayWarning("num_influences != num_bind_pre_matrix!")
             return
+
         # 申请内存
         # TODO 后续优化, 不要每一帧都申请新内存
         # 旋转矩阵是3*3,位移向量1*3
@@ -311,9 +375,45 @@ class CSkinDeform(OpenMayaMPx.MPxDeformerNode):
             ctx.geo_matrix_i,
             ctx.geo_matrix_is_identity,
         )
-        print(f"update_deform_matrices: {ctx.translate_vector.tolist()}")
+        # print(f"update_deform_matrices: {ctx.translate_vector.tolist()}")
 
-    def compute(self, plug, dataBlock):
+    def _run_skinning(self):
+        ctx = self.ctx
+        num_influences = ctx.skin_weights.num_influences
+        num_vertices = ctx.skin_weights.num_vertices
+        # 校验数据
+        if (ctx.output_mesh.position is None or
+            ctx.input_mesh.position  is None or
+            ctx.skin_weights         is None or
+            ctx.rotate_matrix        is None or
+            ctx.translate_vector     is None):  # fmt:skip
+            OpenMaya.MGlobal.displayWarning("data error!")
+            return
+        if (ctx.output_mesh.position.shape[0] != num_vertices * 3 or 
+            ctx.skin_weights.view.shape[0]    != num_influences * num_vertices or 
+            ctx.rotate_matrix.shape[0]        != num_influences or 
+            ctx.translate_vector.shape[0]     != num_influences):  # fmt:skip
+            OpenMaya.MGlobal.displayWarning("data error!")
+            return
+
+        cSkinDeformCython.run_skinning_core(
+            ctx.output_mesh.position,
+            ctx.input_mesh.position,
+            ctx.skin_weights.view,
+            ctx.rotate_matrix,
+            ctx.translate_vector,
+            ctx.envelope,
+        )
+
+    def _update_layer_manager(self, dataBlock: OpenMaya.MDataBlock):
+        """
+        Update:
+            - `self.layer_manager`
+        """
+        self.layer_manager.update_from_dataBlock(dataBlock)
+        print(self.layer_manager)
+
+    def compute(self, plug, dataBlock: OpenMaya.MDataBlock):
         """
         很蛋疼的是`DG`模式下 如果`.outputGeometry[i]`输出给多个模型
         每个模型求值都会触发一次 `Deform` 函数 非常消耗性能 尤其是在绘制权重的时候
@@ -321,22 +421,23 @@ class CSkinDeform(OpenMayaMPx.MPxDeformerNode):
         所以前面配置了`setDependentsDirty`标记 只有在input的数据改变的时候 才会触发 `Deform` 函数。
         后续获取蒙皮后的模型数据 可以用任意方法求值 不会造成多余的 `Deform` 函数调用 以节约资源。
         """
-        # if self.is_dirty is False:
-        #     return None
-        print("compute")
-        res = super().compute(plug, dataBlock)
-        return res
+        # 涉及并行模式内存地址问题, 强制每帧更新
+        self.event_update_mesh.set_dirty(True)
+
+        return super().compute(plug, dataBlock)
 
     def deform(self, dataBlock: OpenMaya.MDataBlock, geoIter, localToWorldMatrix, multiIndex):
-        print("deform")
+        # print("deform")
+        self.event_envelope.execute(dataBlock)
         self.event_update_mesh.execute(dataBlock, multiIndex)
         self.event_update_influences_matrix.execute(dataBlock)
         self.event_update_bind_pre_matrix.execute(dataBlock)
         self.event_update_geo_matrix.execute(dataBlock)
         self.event_update_paint_information.execute(dataBlock)
         self.event_update_weights.execute(dataBlock)
+        self.event_update_layer_manager.execute(dataBlock)
         self.event_update_deform_matrix.execute()
-
+        self._run_skinning()
         return
 
     @classmethod
@@ -348,7 +449,10 @@ class CSkinDeform(OpenMayaMPx.MPxDeformerNode):
         cAttr = OpenMaya.MFnCompoundAttribute()
 
         cls.aGeomMatrix      = mAttr.create("geomMatrix", "gm")
-        cls.aBindPreMatrix   = tAttr.create("bindPreMatrixArray", "bpm", OpenMaya.MFnData.kMatrixArray)
+        cls.aBindPreMatrix   = mAttr.create("bindPreMatrix", "bpm")
+        mAttr.setArray(True)
+        mAttr.setUsesArrayDataBuilder(True)
+        mAttr.setDisconnectBehavior(OpenMaya.MFnAttribute.kDelete)
         cls.aInfluenceMatrix = mAttr.create("matrix", "bm")
         mAttr.setArray(True)
         mAttr.setUsesArrayDataBuilder(True)
@@ -402,15 +506,212 @@ class CSkinDeform(OpenMayaMPx.MPxDeformerNode):
                       cls.aCurrentPaintMaskBool):  # fmt:skip
             cls.addAttribute(attr)
             cls.attributeAffects(attr, cls.aOutputGeometry)
+
+        for attr in (cls.aLayerCompound,
+                     cls.aLayerName,
+                     cls.aLayerEnabled,
+                     cls.aLayerWeights,
+                     cls.aLayerLockInfluences,
+                     cls.aMaskWeights,
+                     cls.aLockMasks):
+            cls.attributeAffects(attr, cls.aOutputGeometry)
         # fmt:on
+
+    @classmethod
+    def nodeCreator(cls):
+        return OpenMayaMPx.asMPxPtr(CSkinDeform())
+
+
+class WeightLayerItem:
+    __slots__ = (
+        "name",
+        "enabled",
+        "weights",
+        "lock_influences",
+        "item_mDataHandle",
+    )
+    item_mDataHandle: OpenMaya.MDataHandle
+
+    name: str
+    enabled: bool
+    weights: MWeightsHandle
+    lock_influences: list | None | OpenMaya.MIntArray
+
+    def __init__(
+        self,
+        dataHandle: OpenMaya.MDataHandle,
+    ):
+        self.item_mDataHandle = dataHandle
+
+        self.name = dataHandle.child(CSkinDeform.aLayerName).asString()
+        self.enabled = dataHandle.child(CSkinDeform.aLayerEnabled).asBool()
+        self.weights = MWeightsHandle(dataHandle.child(CSkinDeform.aLayerWeights))
+        self.lock_influences = WeightsLayerManager.get_MIntArray(dataHandle.child(CSkinDeform.aLayerLockInfluences))
+
+    def __repr__(self) -> str:
+        # 1. 安全处理 lock_influences (可能是 None, list, 或 MIntArray)
+        if self.lock_influences is None:
+            locks_info = "None"
+        elif hasattr(self.lock_influences, "length"):  # MIntArray 鸭子类型检测
+            locks_info = f"<MIntArray length={self.lock_influences.length()}>"
+        elif isinstance(self.lock_influences, list):
+            locks_info = f"[{len(self.lock_influences)} items]"
+        else:
+            locks_info = type(self.lock_influences).__name__
+
+        # 2. 安全处理 weights (极大概率是 MWeightsHandle 或 list)
+        if isinstance(self.weights, list):
+            weights_info = f"[{len(self.weights)} items]"
+        elif self.weights is None:
+            weights_info = "None"
+        else:
+            # 如果 MWeightsHandle 自己写了很好的 __repr__，这里会直接调用
+            # 如果没写，至少打印出它的类名，而不会引发海量数据输出
+            weights_info = f"<{self.weights.__class__.__name__}>"
+
+        return f"<{self.__class__.__name__}(name={self.name!r}, enabled={self.enabled}, weights={weights_info}, lock_influences={locks_info})>"
+
+
+class WeightsLayerManager:
+    """
+    CSkinDeform 权重Layer管理器.
+
+    提供节点内部和节点外部两种更新模式
+    """
+
+    __slots__ = (
+        "mDependNode",
+        "node_name",
+        "mask_weights",
+        "mask_weights_lock",
+        "_items_dict",
+    )
+
+    node_name: str
+
+    mask_weights: MWeightsHandle
+    mask_weights_lock: list | OpenMaya.MIntArray | None
+    _items_dict: dict[int, WeightLayerItem]
+
+    def __init__(self, node_name=None):
+        self.node_name = node_name
+        self.mDependNode = None
+        self.mask_weights = None
+        self.mask_weights_lock = None
+        self._items_dict = {}
+
+        if self.node_name:
+            sel = OpenMaya.MSelectionList()
+            try:
+                sel.add(self.node_name)
+            except RuntimeError as e:
+                raise RuntimeError(f"'{self.node_name}' is not a valid node") from e
+
+            self.node_name = self.node_name
+            obj = OpenMaya.MObject()
+            sel.getDependNode(0, obj)
+            self.update_from_dependNode(obj)
+            self.mDependNode = obj
+
+    @staticmethod
+    def get_MIntArray(dataHandle: OpenMaya.MDataHandle):
+        """
+        获取 MIntArray
+        Return:
+            array (OpenMaya.MIntArray | None): 返回 `MIntArray`
+        """
+        obj: OpenMaya.MObject = dataHandle.data()
+        if obj.isNull():
+            return None
+        array = OpenMaya.MFnIntArrayData(obj).array()
+        if array.length() == 0:
+            return None
+        return array
+
+    def update(self):
+        """
+        更新 `Layer` 信息组
+        仅供节点外部调用, 如果是节点内部, 请使用 `update_from_dataBlock`
+        """
+        self.update_from_dependNode(self.mDependNode)
+
+    def update_from_dataBlock(self, dataBlock: OpenMaya.MDataBlock):
+        """
+        从节点内部 DataBlock 更新 Layer 信息组.
+        Args:
+            dataBlock (OpenMaya.MDataBlock): 输入节点内部 `DataBlock`
+        Update:
+            - `self.mask_weights`
+            - `self.mask_weights_lock`
+            - `self._items_dict`
+        """
+        self.mask_weights = MWeightsHandle(dataBlock.outputValue(CSkinDeform.aMaskWeights))
+        self.mask_weights_lock = self.get_MIntArray(dataBlock.outputValue(CSkinDeform.aLockMasks))
+        arrayDataHandle = dataBlock.outputArrayValue(CSkinDeform.aLayerCompound)
+        self._update_items_from_arrayDataHandle(arrayDataHandle)
+
+    def update_from_dependNode(self, depend_node: OpenMaya.MObject):
+        """
+        从根据`CSkinDeform`的`Attributes Object` 查找 `MPlug` 更新 Layer 信息组.
+        等同 `update_from_string`
+        Args:
+            depend_node (OpenMaya.MObject): 输入`CSkinDeform`节点实例的 `MObject`
+        Update:
+            - `self.mask_weights`
+            - `self.mask_weights_lock`
+            - `self._items_dict`
+        """
+        compound_plug = OpenMaya.MPlug(depend_node, CSkinDeform.aLayerCompound)
+        mask_plug = OpenMaya.MPlug(depend_node, CSkinDeform.aMaskWeights)
+        lock_plug = OpenMaya.MPlug(depend_node, CSkinDeform.aLockMasks)
+        self.mask_weights = MWeightsHandle(mask_plug.asMDataHandle())
+        self.mask_weights_lock = self.get_MIntArray(lock_plug.asMDataHandle())
+
+        arrayDataHandle = OpenMaya.MArrayDataHandle(compound_plug.asMDataHandle())
+        self._update_items_from_arrayDataHandle(arrayDataHandle)
+
+    def _update_items_from_arrayDataHandle(self, arrayDataHandle: OpenMaya.MArrayDataHandle):
+        """
+        私有方法, 根据 MDataBlock/MPlug 获取的 `MArrayDataHandle` 更新 Layer 信息组.
+        DataBlock/MPlug 迭代查找ArrayHandle方法相同, 这里就提为单独函数.
+        Args:
+            arrayDataHandle (OpenMaya.MArrayDataHandle): 输入 `MArrayDataHandle`
+        Update:
+            - `self._items_dict`
+        """
+        self._items_dict.clear()
+        count = arrayDataHandle.elementCount()
+        for i in range(count):
+            arrayDataHandle.jumpToArrayElement(i)
+            logical_index = arrayDataHandle.elementIndex()
+            dataHandle: OpenMaya.MDataHandle = arrayDataHandle.outputValue()
+            item = WeightLayerItem(dataHandle)
+            self._items_dict[logical_index] = item
+        return True
+
+    def get_layer(self, layer_index: int) -> WeightLayerItem | None:
+        return self._items_dict.get(layer_index, None)
+
+    def __repr__(self) -> str:
+        res = (f"<{self.__class__.__name__}>\n"
+               f"    Mask Weights: {self.mask_weights}\n\n"
+               f"    Mask Weights Lock: {self.mask_weights_lock}\n\n")  # fmt:skip
+        for i, v in self._items_dict.items():
+            res += f"    {i} : " + repr(v) + "\n"
+        return res
 
 
 class FnCSkinDeform:
-    __slots__ = ("instance",)
+    __slots__ = (
+        "instance",
+        "node_name",
+    )
     instance: CSkinDeform
+    node_name: str
 
     def __init__(self, cSkin_instance: CSkinDeform):
         self.instance = cSkin_instance
+        self.node_name = self.instance.mFnDependNode.name()
 
     @classmethod
     def from_string(cls, input_string: str):
@@ -418,13 +719,13 @@ class FnCSkinDeform:
         return cls(instance)
 
     @classmethod
-    def from_object_api1(cls, mObject: OpenMaya.MObject):
-        instance = _cRegistry.SkinRegistry.get_instance_by_api1(mObject)
-        return cls(instance)
-
-    @classmethod
-    def from_object_api2(cls, mObject: OpenMaya.MObject):
-        instance = _cRegistry.SkinRegistry.get_instance_by_api2(mObject)
+    def from_mObject(cls, mObject: OpenMaya.MObject | OpenMaya2.MObject):
+        if isinstance(mObject, OpenMaya.MObject):
+            instance = _cRegistry.SkinRegistry.get_instance_by_api1(mObject)
+        elif isinstance(mObject, OpenMaya2.MObject):
+            instance = _cRegistry.SkinRegistry.get_instance_by_api2(mObject)
+        else:
+            raise TypeError("Input value must be MObject")
         return cls(instance)
 
     def fast_preview_deform(self, vertex_indices: memoryview | None = None):
@@ -457,27 +758,189 @@ class FnCSkinDeform:
         mPlug: OpenMaya.MPlug = OpenMaya.MPlug(self.instance.mObject, self.instance.aOutputGeometry).elementByLogicalIndex(0)
         return mPlug.asMObject()
 
-    def set_bind_pre_matrix(self, bind_pre_matrix_array: OpenMaya.MMatrixArray | OpenMaya2.MMatrixArray | memoryview):
-        """
-        TODO 想办法优化，最好可以直接支持UNDO
-        """
-        plug = OpenMaya.MPlug(self.instance.mObject, self.instance.aBindPreMatrix)
-        if isinstance(bind_pre_matrix_array, memoryview):
-            data = bind_pre_matrix_array.cast(bind_pre_matrix_array.format)
-            length = data.shape[0] // 16
-        elif isinstance(bind_pre_matrix_array, OpenMaya.MMatrixArray):
-            length = bind_pre_matrix_array.length()
-            address = int(bind_pre_matrix_array[0].this)
-            flat_buffer = (ctypes.c_double * (length * 16)).from_address(address)
-            data = memoryview(flat_buffer)
-        elif isinstance(bind_pre_matrix_array, OpenMaya2.MMatrixArray):
-            length = len(bind_pre_matrix_array)
-            data = bind_pre_matrix_array
-        else:
-            raise ValueError("Input value must be MMatrixArray or memoryview")
-
-        cmds.setAttr(plug.name(), length, *data, type="matrixArray")
+    def ensure_node(self):
+        """校验节点是否已绑定且在场景中真实存在"""
+        if not self.node_name:
+            raise ValueError("node_name is None, need update from string first.")
+        if not cmds.objExists(self.node_name):
+            raise ValueError(f"'{self.node_name}' is not a valid node.")
         return True
 
-    def transfer_bind_pre_matrix_from_skinCluster(self, skinCluster_name: str):
-        """ """
+    def add_layer(self):
+        """
+        添加 Layer
+        节点内部严禁调用
+        """
+        self.ensure_node()
+        indices = cmds.getAttr(f"{self.node_name}.layers.layerData", mi=1)
+        i = indices[-1] + 1 if indices else 0
+        cmds.setAttr(f"{self.node_name}.layers.layerData[{i}].layerName", "new_layer", type="string")
+        cmds.setAttr(f"{self.node_name}.layers.layerData[{i}].layerEnabled", 1)
+        return True
+
+    def delete_layer(self, index: int):
+        """
+        删除 Layer
+        节点内部严禁调用
+        """
+        self.ensure_node()
+        cmds.removeMultiInstance(f"{self.node_name}.layers.layerData[{index}]", b=True)
+        return True
+
+    def set_weights(self, weights, num_influences):
+        """
+        设置权重数据
+        节点内部严禁调用
+        TODO 暂时不支持 undo redo
+        Args:
+            weights (list|array.array|memoryview): 权重数据列表
+        """
+        weights_plug = OpenMaya.MPlug(self.instance.mObject, self.instance.aWeights)
+        weights_handle: MWeightsHandle = MWeightsHandle.from_mPlug(weights_plug)
+        weights_handle.set_weights(weights, num_influences)
+        weights_handle.set_to_mPlug(weights_plug)
+        return True
+
+    def set_weights_from_skinCluster(self, name: str):
+        """
+        从 skinCluster 中获取并设置权重数据
+        Args:
+            name (str): 输入模型名称/蒙皮节点名称
+        """
+        weights, num_influences = self._get_skinCluster_weights(name)
+        self.set_weights(weights, num_influences)
+        return True
+
+    def set_mask_weights(self, weights: list, num_layers):
+        """
+        设置Mask数据
+        节点内部严禁调用
+        Args:
+            weights (list|array.array|memoryview): 权重数据列表
+        """
+        weights_plug = OpenMaya.MPlug(self.instance.mObject, self.instance.aMaskWeights)
+        weights_handle: MWeightsHandle = MWeightsHandle.from_mPlug(weights_plug)
+        weights_handle.set_weights(weights, num_layers)
+        weights_handle.set_to_mPlug(weights_plug)
+        return True
+
+    def set_mask_weights_lock(self, lock_list: list):
+        self.ensure_node()
+        cmds.setAttr(f"{self.node_name}.layers.layersLockMask", lock_list, type="Int32Array")
+        return True
+
+    def set_layer_name(self, layer_index: int, _name: str):
+        """
+        设置 Layer 名称
+        节点内部严禁调用
+        """
+        self.ensure_node()
+        cmds.setAttr(f"{self.node_name}.layers.layerData[{layer_index}].layerName", _name, type="string")
+        return True
+
+    def set_layer_enabled(self, layer_index: int, enabled: bool):
+        """
+        设置 Layer 启用状态
+        节点内部严禁调用
+        """
+        self.ensure_node()
+        cmds.setAttr(f"{self.node_name}.layers.layerData[{layer_index}].layerEnabled", enabled)
+        return True
+
+    def set_layer_weights(self, layer_index, weights, num_influences):
+        """
+        设置 Layer 权重数据
+        节点内部严禁调用
+        """
+        attr = f"{self.node_name}.layers.layerData[{layer_index}].layerWeightsData"
+        weights_handle: MWeightsHandle = MWeightsHandle.from_string(attr)
+        weights_handle.set_weights(weights, num_influences)
+        weights_handle.set_to_string(attr)
+        return True
+
+    def set_layer_lock_influences(self, layer_index: int, lock_list: list):
+        """
+        设置 Layer 权重锁定状态
+        节点内部严禁调用
+        """
+        self.ensure_node()
+        cmds.setAttr(f"{self.node_name}.layers.layerData[{layer_index}].layerLockInfluences", lock_list, type="Int32Array")
+        return True
+
+    def get_layer_name(self, layer_index: int):
+        """
+        获取 Layer 名称
+        节点内部严禁调用
+        """
+        self.ensure_node()
+        return cmds.getAttr(f"{self.node_name}.layers.layerData[{layer_index}].layerName")
+
+    def get_layer_enabled(self, layer_index: int):
+        """
+        获取 Layer 启用状态
+        节点内部严禁调用
+        """
+        self.ensure_node()
+        return cmds.getAttr(f"{self.node_name}.layers.layerData[{layer_index}].layerEnabled")
+
+    def get_layer_lock_influences(self, layer_index: int):
+        """
+        获取 Layer 权重锁定状态
+        节点内部严禁调用
+        """
+        self.ensure_node()
+        return cmds.getAttr(f"{self.node_name}.layers.layerData[{layer_index}].layerLockInfluences")
+
+    @staticmethod
+    def _get_skinCluster_weights(name):
+        """
+        获取 maya 自身 `skinCluster` 节点的蒙皮权重
+
+        Args:
+            name (str): 输入模型名称/蒙皮节点名称
+        Return:
+            weights (OpenMaya2.MDoubleArray): 权重
+            num_influences (int): influences数量
+        """
+        # 如果输入的是模型名字, 可以通过 ‘findRelatedSkinCluster’ 找到skinCluster
+        name = mel.eval(f'findRelatedSkinCluster("{name}")') or name
+        # get mesh
+        mesh = cmds.skinCluster(name, q=1, g=1)[0]
+        sel: OpenMaya2.MSelectionList = OpenMaya2.MGlobal.getSelectionListByName(name)
+        sel.add(mesh)
+        mObj_skinCluster = sel.getDependNode(0)
+        fn_skinCluster: OpenMayaAnim2.MFnSkinCluster = OpenMayaAnim2.MFnSkinCluster(mObj_skinCluster)
+        mesh_dag = sel.getDagPath(1)
+
+        weights, num_influences = fn_skinCluster.getWeights(mesh_dag, OpenMaya2.MObject())
+
+        return weights, num_influences
+
+    @staticmethod
+    def create_cSkinDeform_from_skinCluster(skinCluster: str):
+        """
+        根据 `skinCluster` 创建 `cSkinDeform` 实例.
+        并且设置 `matrix`, `bindPreMatrix`, `weights`.
+        TODO maya api 获取权重, 再转为list传递给MWeightsHandle很慢需要优化
+
+        Args:
+            skinCluster (str): 输入 skinCluster 名称 或者 mesh 名称
+        Return:
+            name (str): cSkinDeform 名称
+            instance (CSkinDeform): cSkinDeform 实例
+        """
+
+        skinCluster = mel.eval(f'findRelatedSkinCluster("{skinCluster}")') or skinCluster
+        mesh = cmds.skinCluster(skinCluster, q=1, g=1)[0]
+        cSkin = cmds.deformer(mesh, type=CSkinDeform.NODE_TYPE)[0]
+
+        cSkin_instance = FnCSkinDeform.from_string(cSkin)
+
+        cmds.connectAttr(f"{skinCluster}.matrix", f"{cSkin}.matrix")
+        cmds.connectAttr(f"{skinCluster}.bindPreMatrix", f"{cSkin}.bindPreMatrix")
+
+        weights, num_influences = FnCSkinDeform._get_skinCluster_weights(skinCluster)
+
+        cSkin_instance.set_weights(weights, num_influences)
+        cmds.setAttr(f"{skinCluster}.envelope", 0.0)
+        return cSkin, cSkin_instance

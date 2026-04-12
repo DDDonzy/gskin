@@ -56,6 +56,8 @@ def reload_modules_in_path(target_dir=r"E:\d_maya\gskin\src"):
         # 跳过 None 和没有 __file__ 属性的内建模块 (如 sys, builtins)
         if mod is None or not hasattr(mod, "__file__") or mod.__file__ is None:
             continue
+        if mod_name == "gskin.src._cRegistry":
+            continue
 
         # 3. 获取模块的文件路径并标准化
         mod_file_path = os.path.normpath(os.path.abspath(mod.__file__))

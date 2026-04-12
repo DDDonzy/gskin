@@ -8,17 +8,15 @@ from logging import warning
 import maya.OpenMaya as om1  # type:ignore
 import maya.OpenMayaMPx as ompx  # type:ignore
 
-from . import _cRegistry
-from . import cSkinDeformCython
-from . import cTopologyCython as cTopology
-from .cBufferManager import BufferManager
-from .cWeightsManager import WeightsManager
-from .cBrushCore2Cython import CoreBrushEngine
-
-from ._cProfilerCython import MayaNativeProfiler, maya_profile
+from ..src import _cRegistry
+from ..src import cSkinDeformCython
+from ..src import cTopologyCython as cTopology
+from ..src.cBufferManager import BufferManager
+from ..src.cBrushCore2Cython import CoreBrushEngine
+from ..src._cProfilerCython import MayaNativeProfiler, maya_profile
 
 from .cSkinContext import BrushHitContext
-from . import cBrushCore2Cython
+from ..src import cBrushCore2Cython
 
 
 

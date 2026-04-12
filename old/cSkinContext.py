@@ -1,7 +1,7 @@
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .cBufferManager import BufferManager
+    from ..src.cBufferManager import BufferManager
 
 
 # ==============================================================================

@@ -1,5 +1,10 @@
+import sys
+
 import maya.OpenMaya as om1  # type:ignore
 import maya.api.OpenMaya as om2
+
+if not hasattr(sys, "_cSkinRegistry_storage"):
+    sys._cSkinRegistry_storage = {}
 
 
 class SkinRegistry:
@@ -8,7 +13,7 @@ class SkinRegistry:
     完美实现 API 1.0 与 API 2.0 的内存级通信，并绝对杜绝内存泄漏！
     """
 
-    _storage = {}
+    _storage = sys._cSkinRegistry_storage
 
     @classmethod
     def register(cls, mObj_api1: om1.MObject, python_instance):

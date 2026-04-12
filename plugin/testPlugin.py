@@ -54,12 +54,7 @@ def nodeInitializer():
 
     # 1. 创建 MVectorArray 属性
     # 使用 om1.MFnData.kVectorArray 正确指定类型
-    MemTestNode.aCustomData = tAttr.create(
-        "customData",
-        "cd",
-        om1.MFnData.kVectorArray,
-        om1.MFnVectorArrayData().create(om1.MVectorArray()),
-    )
+    MemTestNode.aCustomData = tAttr.create("customData", "cd", om1.MFnData.kVectorArray)
     tAttr.setStorable(True)
     tAttr.setKeyable(False)
 

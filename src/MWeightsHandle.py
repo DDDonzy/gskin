@@ -1,8 +1,7 @@
 import array
+import ctypes
 
-import maya.OpenMaya as OpenMaya  # type: ignore
-
-from gskin.src.MFloatArrayProxy import MFloatArrayProxy
+from .MFloatArrayProxy import MFloatArrayProxy
 
 
 class MWeightsHandle(MFloatArrayProxy):
@@ -13,24 +12,27 @@ class MWeightsHandle(MFloatArrayProxy):
     num_vertices: int
     num_influences: int
 
-    def __init__(self, dataHandle, num_vertices):
+    def __init__(self, dataHandle):
         """
         Args:
             dataHandle (OpenMaya.MDataHandle): MDataHandle 可以来自 `MPlug.asMDataHandle` 或节点内部 `MDataBlock.inputValue`
-            num_vertices (int): 模型顶点数量
         """
-
-        if num_vertices <= 0:
-            raise ValueError(f"num_vertices must be greater than 0, got {num_vertices}.")
 
         super().__init__(dataHandle)
 
-        if self.length % num_vertices != 0:
-            raise ValueError(f"Data length mismatch! Total float count ({self.length}) is not exactly divisible by num_vertices ({num_vertices}). Cannot determine a valid num_influences.")
-
         if self.is_initialized:
-            self.num_vertices = num_vertices
-            self.num_influences = self.length // self.num_vertices
+            # === 从底层 C 内存中解析 Header[2] ===
+            # Header[2] 的地址是起始地址偏移 16 个字节 (2 * 8 bytes)
+            shape_addr = self._src_address + 16
+            # 将这 8 个字节转换为两个 32位 无符号整数的指针
+            shape_ptr = ctypes.cast(shape_addr, ctypes.POINTER(ctypes.c_uint32))
+
+            mem_vtx_count = shape_ptr[0]
+            mem_inf_count = shape_ptr[1]
+
+            self.num_vertices = mem_vtx_count
+            self.num_influences = mem_inf_count
+
         else:
             self.num_vertices = 0
             self.num_influences = 0
@@ -38,16 +40,18 @@ class MWeightsHandle(MFloatArrayProxy):
     def set_array(self, *args, **kwargs):
         raise NotImplementedError("This method is disabled, Please use set_weights.")
 
-    def set_weights(self, weights):
+    def set_weights(self, weights, num_influences):
         """
         设置权重数据
         Args:
             weights (list|array.array|memoryview): 权重数据列表
+            num_influences (int): 骨骼数量
+
         Update:
             `- self.array`
         """
-        if len(weights) != self.length:
-            raise ValueError(f"Weights length mismatch. Expected {self.length}, got {len(weights)}.")
+        self.resize(len(weights) // num_influences, num_influences)
+
         try:
             self.view[:] = weights
         except (TypeError, ValueError):
@@ -96,6 +100,38 @@ class MWeightsHandle(MFloatArrayProxy):
             weights (memoryview): 权重数据视图
         """
         return self.view
+
+    def resize(self, num_vertices: int, num_influences: int):
+        """
+        当你需要重构权重, 增删骨骼时，调用这个专属方法.
+
+        它会调用父类的 resize 调整一维大小
+
+        然后在 Header[2]中写入`num_vertices` 和 `num_influences`
+        Args:
+            num_vertices (int): 顶点数量
+            num_influences (int): 骨骼数量
+        Update:
+            - `self.length`
+            - `self.array`
+            - `self.view`
+            - `self.address`
+            - `self._srcAddress`
+            - `self.num_vertices`
+            - `self.num_influences`
+        """
+        # 调用父类扩容
+        total_floats = num_vertices * num_influences
+        super().resize(total_floats)
+
+        # 注入header[2]
+        shape_addr = self._src_address + 16
+        shape_ptr = ctypes.cast(shape_addr, ctypes.POINTER(ctypes.c_uint32))
+        shape_ptr[0] = num_vertices
+        shape_ptr[1] = num_influences
+
+        self.num_vertices = num_vertices
+        self.num_influences = num_influences
 
     def remap_influences(
         self,
@@ -150,30 +186,10 @@ class MWeightsHandle(MFloatArrayProxy):
         self.view[:] = new_data
         self.num_influences = new_num_influences
 
-    @classmethod
-    def from_mPlug(cls, plug: OpenMaya.MPlug, num_vertices: int) -> MFloatArrayProxy:
-        """
-        传入 MPlug 获取实例
-        - 此方法获取的实例, 修改数据不会实时反馈到 Maya, 修改完后需要显示的调用 set 方法通知 Maya 更新数据
-        """
-        return cls(plug.asMDataHandle(), num_vertices)
-
-    @classmethod
-    def from_string(cls, input_string: str, num_vertices: int) -> MFloatArrayProxy:
-        """
-        传入字符串获取实例
-        - 此方法获取的实例, 修改数据不会实时反馈到 Maya, 修改完后需要显示的调用 set 方法通知 Maya 更新数据
-        """
-        sel = OpenMaya.MSelectionList()
-        sel.add(input_string)
-        plug = OpenMaya.MPlug()
-        sel.getPlug(0, plug)
-        return cls.from_mPlug(plug, num_vertices)
-
     def __repr__(self) -> str:
         res = super().__repr__()
         if self.is_initialized:
             return (f"{res}\n"
                     f"{' '*4}num_vertices  : {self.num_vertices}\n"
-                    f"{' '*4}num_influences: {self.num_influences}\n")  # fmt:skip
+                    f"{' '*4}num_influences: {self.num_influences}")  # fmt:skip
         return res

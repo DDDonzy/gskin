@@ -12,10 +12,10 @@ from gskin.src._cProfilerCython import MayaNativeProfiler, maya_profile
 
 from typing import TYPE_CHECKING
 
-from gskin.src.cSkinContext import BrushHitContext
+from gskin.old.cSkinContext import BrushHitContext
 
 if TYPE_CHECKING:
-    from gskin.src.cSkinDeform import CythonSkinDeformer
+    from gskin.old.cSkinDeform import CythonSkinDeformer
 
 PLUGIN_VENDOR = "DDDonzy"
 PLUGIN_VERSION = "1.0"

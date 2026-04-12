@@ -36,14 +36,7 @@ class MFloatArrayProxy:
     _MVECTOR_SIZE = 3 * _DOUBLE_SIZE
     _HEADER_SIZE = 3 * _DOUBLE_SIZE
 
-    __slots__ = (
-        "mDataHandle",
-        "length",
-        "view",
-        "array",
-        "address",
-        "_src_address",
-    )
+    __slots__ = ("mDataHandle", "length", "view", "array", "address", "_src_address", "_array_obj")
 
     mDataHandle: OpenMaya.MDataHandle
     array: OpenMaya.MVectorArray
@@ -141,9 +134,9 @@ class MFloatArrayProxy:
         needed_vector_count = (total_needed_bytes + self._MVECTOR_SIZE - 1) // self._MVECTOR_SIZE
 
         if self.array is None:  # 如果还未分配数组
-            self.array = OpenMaya.MVectorArray()
-            mObject = OpenMaya.MFnVectorArrayData().create(self.array)
+            mObject = OpenMaya.MFnVectorArrayData().create()
             self.mDataHandle.setMObject(mObject)
+            self.array = OpenMaya.MFnVectorArrayData(mObject).array()
 
         current_vector_count = self.array.length()
         if current_vector_count != needed_vector_count:  # 只在需要的时候扩容
@@ -204,7 +197,10 @@ class MFloatArrayProxy:
         - 此方法获取的实例, 修改数据不会实时反馈到 Maya节点, 修改完后需要显示的调用 set 方法通知 Maya节点 更新数据
         """
         sel = OpenMaya.MSelectionList()
-        sel.add(input_string)
+        try:
+            sel.add(input_string)
+        except RuntimeError as err:
+            raise RuntimeError(f"Object '{input_string}' does not exist") from err
         plug = OpenMaya.MPlug()
         sel.getPlug(0, plug)
         return cls.from_mPlug(plug)
@@ -223,7 +219,7 @@ class MFloatArrayProxy:
             data_obj = OpenMaya.MFnVectorArrayData().create(self.array)
             plug.setMObject(data_obj)
         else:
-            plug.setMDataHandle(self.mDataHandle)
+            plug.setMObject(self.mDataHandle.data())
 
         return True
 
