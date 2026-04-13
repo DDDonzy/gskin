@@ -1,6 +1,7 @@
 from __future__ import annotations
 import array
 import ctypes
+from re import M
 
 
 from maya import cmds, mel
@@ -11,6 +12,7 @@ import maya.OpenMayaMPx as OpenMayaMPx  # type:ignore
 
 from . import cDirtyEvent
 from . import cSkinDeformCython
+from .MProfiler import MProfiler
 from .MRegistry import MRegistry
 from .MWeightsHandle import MWeightsHandle
 from .MTopologyContext import TopologyContext
@@ -210,9 +212,6 @@ class CSkinDeform(OpenMayaMPx.MPxDeformerNode):
         # fmt:on
         MRegistry.register(self)
 
-    def __del__(self):
-        print("__del__")
-
     def _update_envelope(self, dataBlock: OpenMaya.MDataBlock):
         """
         Update:
@@ -228,15 +227,16 @@ class CSkinDeform(OpenMayaMPx.MPxDeformerNode):
         """
         ctx = self.ctx
         # input/orig meshes
-        input_handle = dataBlock.inputArrayValue(self.aInput)
-        input_handle.jumpToElement(multiIndex)
-        input_geom_obj = input_handle.outputValue().child(self.aInputGeometry).asMesh()
+        # HACK: 直接使用 outputArrayValue 读取输入网格以跳过冗余的 DG 检查, 如果遇到奇怪的BUG, 改回 inputArrayValue
+        input_array_handle: OpenMaya.MArrayDataHandle = dataBlock.outputArrayValue(self.aInput)
+        input_array_handle.jumpToElement(multiIndex)
+        input_geom_obj = input_array_handle.outputValue().child(self.aInputGeometry).asMesh()
         ctx.input_mesh.update_fnMesh(OpenMaya.MFnMesh(input_geom_obj))
         ctx.input_mesh.update_position()
         # output meshes
-        output_handle = dataBlock.outputArrayValue(self.aOutputGeometry)
-        output_handle.jumpToElement(multiIndex)
-        output_geom_obj = output_handle.outputValue().asMesh()
+        output_array_handle: OpenMaya.MArrayDataHandle = dataBlock.outputArrayValue(self.aOutputGeometry)
+        output_array_handle.jumpToElement(multiIndex)
+        output_geom_obj = output_array_handle.outputValue().asMesh()
         ctx.output_mesh.update_fnMesh(OpenMaya.MFnMesh(output_geom_obj))
         ctx.output_mesh.update_position()
         # topology
@@ -335,8 +335,6 @@ class CSkinDeform(OpenMayaMPx.MPxDeformerNode):
         weights_handle = dataBlock.inputValue(self.aWeights)
         ctx.skin_weights = MWeightsHandle(weights_handle)
 
-        print(ctx.skin_weights)
-
     def _update_deform_matrices(self):
         """
         Update:
@@ -428,18 +426,29 @@ class CSkinDeform(OpenMayaMPx.MPxDeformerNode):
 
         return super().compute(plug, dataBlock)
 
+    @MProfiler(color=9)
     def deform(self, dataBlock: OpenMaya.MDataBlock, geoIter, localToWorldMatrix, multiIndex):
         # print("deform")
-        self.event_envelope.execute(dataBlock)
-        self.event_update_mesh.execute(dataBlock, multiIndex)
-        self.event_update_influences_matrix.execute(dataBlock)
-        self.event_update_bind_pre_matrix.execute(dataBlock)
-        self.event_update_geo_matrix.execute(dataBlock)
-        self.event_update_paint_information.execute(dataBlock)
-        self.event_update_weights.execute(dataBlock)
-        self.event_update_layer_manager.execute(dataBlock)
-        self.event_update_deform_matrix.execute()
-        self._run_skinning()
+        with MProfiler("event_envelope", color=10):
+            self.event_envelope.execute(dataBlock)
+        with MProfiler("event_update_mesh", color=11):
+            self.event_update_mesh.execute(dataBlock, multiIndex)
+        with MProfiler("event_update_influences_matrix", color=12):
+            self.event_update_influences_matrix.execute(dataBlock)
+        with MProfiler("event_update_bind_pre_matrix", color=13):
+            self.event_update_bind_pre_matrix.execute(dataBlock)
+        with MProfiler("event_update_geo_matrix", color=14):
+            self.event_update_geo_matrix.execute(dataBlock)
+        with MProfiler("event_update_paint_information", color=15):
+            self.event_update_paint_information.execute(dataBlock)
+        with MProfiler("event_update_weights", color=16):
+            self.event_update_weights.execute(dataBlock)
+        with MProfiler("event_update_layer_manager", color=17):
+            self.event_update_layer_manager.execute(dataBlock)
+        with MProfiler("event_update_deform_matrix", color=18):
+            self.event_update_deform_matrix.execute()
+        with MProfiler("run_skinning", color=19):
+            self._run_skinning()
         return
 
     @classmethod
