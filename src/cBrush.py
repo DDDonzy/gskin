@@ -9,7 +9,7 @@ import maya.cmds as cmds
 import maya.api.OpenMaya as om
 import maya.api.OpenMayaUI as omui
 
-from ._cRegistry import SkinRegistry
+from .MRegistry import MRegistry
 from .cBrushTabletInput import TabletTracker
 from .cBrushInterpolator import LinearStrokeInterpolator, SplineStrokeInterpolator
 from .cBrushSettings import BrushSettings
@@ -295,7 +295,7 @@ class WeightBrushContext(omui.MPxContext):
             self.fn_mesh = om.MFnMesh(self.mesh_dag_path)
 
             cSkin_node_name = "cSkinDeformer1"
-            self.cSkin: CythonSkinDeformer = SkinRegistry.get_instance_by_string(cSkin_node_name)
+            self.cSkin: CythonSkinDeformer = MRegistry.get_instance(cSkin_node_name)
 
             if not self.cSkin:
                 raise RuntimeError("未提取到 cSkinDeformer 的 Python 实例。")

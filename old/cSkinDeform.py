@@ -8,7 +8,7 @@ from logging import warning
 import maya.OpenMaya as om1  # type:ignore
 import maya.OpenMayaMPx as ompx  # type:ignore
 
-from ..src import _cRegistry
+from ..src import MRegistry
 from ..src import cSkinDeformCython
 from ..src import cTopologyCython as cTopology
 from ..src.cBufferManager import BufferManager
@@ -266,7 +266,7 @@ class CythonSkinDeformer(ompx.MPxDeformerNode):
         self.weights_manager    = WeightsManager(self)
         # fmt:on
 
-        _cRegistry.SkinRegistry.register(self.mObject, self)
+        MRegistry.MRegistry.register(self.mObject, self)
 
     def setDirty(self):
         """

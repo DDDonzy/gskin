@@ -5,9 +5,7 @@
 import cython
 import functools
 
-# ==============================================================================
-# 1. 纯 Python 模式的虚拟导入 (编译期生效)
-# ==============================================================================
+
 if cython.compiled:
     # 从同名的 .pxd 文件中导入 C++ 接口
     from cython.cimports._cProfiler import ProfilingColor, addCategory, eventBegin, eventEnd
@@ -15,9 +13,7 @@ if cython.compiled:
     # 导入 C 标准库的 strdup
     from cython.cimports.libc.string import strdup
 
-# ==============================================================================
-# 2. 懒加载与内存分配池
-# ==============================================================================
+# 懒加载与内存分配池
 _CATEGORY_ID: cython.int = -1
 _IMMORTAL_C_STRINGS: dict = {}
 

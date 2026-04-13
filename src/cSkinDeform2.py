@@ -1,7 +1,6 @@
 from __future__ import annotations
 import array
 import ctypes
-from tkinter.filedialog import Open
 
 
 from maya import cmds, mel
@@ -10,11 +9,11 @@ import maya.api.OpenMayaAnim as OpenMayaAnim2  # type:ignore
 import maya.OpenMaya as OpenMaya  # type:ignore
 import maya.OpenMayaMPx as OpenMayaMPx  # type:ignore
 
-from . import _cRegistry
-from . import cSkinDeformCython
 from . import cDirtyEvent
-from .MTopologyContext import TopologyContext
+from . import cSkinDeformCython
+from .MRegistry import MRegistry
 from .MWeightsHandle import MWeightsHandle
+from .MTopologyContext import TopologyContext
 
 
 __all__ = ("FnCSkinDeform",)
@@ -204,12 +203,15 @@ class CSkinDeform(OpenMayaMPx.MPxDeformerNode):
             - `self.mFnDependNode`
             - `self.hashCode`
         """
+        print("postConstructor")
         # fmt:off
         self.mObject       = self.thisMObject()
         self.mFnDependNode = OpenMaya.MFnDependencyNode(self.mObject)
-        self.hashCode      = OpenMaya.MObjectHandle(self.mObject).hashCode()
         # fmt:on
-        _cRegistry.SkinRegistry.register(self.mObject, self)
+        MRegistry.register(self)
+
+    def __del__(self):
+        print("__del__")
 
     def _update_envelope(self, dataBlock: OpenMaya.MDataBlock):
         """
@@ -623,10 +625,10 @@ class WeightsLayerManager:
         obj: OpenMaya.MObject = dataHandle.data()
         if obj.isNull():
             return None
-        array = OpenMaya.MFnIntArrayData(obj).array()
-        if array.length() == 0:
+        int_array = OpenMaya.MFnIntArrayData(obj).array()
+        if int_array.length() == 0:
             return None
-        return array
+        return int_array
 
     def update(self):
         """
@@ -715,17 +717,13 @@ class FnCSkinDeform:
 
     @classmethod
     def from_string(cls, input_string: str):
-        instance = _cRegistry.SkinRegistry.get_instance_by_string(input_string)
+        instance = MRegistry.get_instance(input_string)
         return cls(instance)
 
     @classmethod
     def from_mObject(cls, mObject: OpenMaya.MObject | OpenMaya2.MObject):
-        if isinstance(mObject, OpenMaya.MObject):
-            instance = _cRegistry.SkinRegistry.get_instance_by_api1(mObject)
-        elif isinstance(mObject, OpenMaya2.MObject):
-            instance = _cRegistry.SkinRegistry.get_instance_by_api2(mObject)
-        else:
-            raise TypeError("Input value must be MObject")
+
+        instance = MRegistry.get_instance(mObject)
         return cls(instance)
 
     def fast_preview_deform(self, vertex_indices: memoryview | None = None):

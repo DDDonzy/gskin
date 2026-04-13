@@ -8,7 +8,7 @@ from gskin.src import cBufferManager as cb
 
 import gskin._debug.gskinReload as gskinReload
 from gskin._debug.convert import get_skinWeights, convert_skin_to_cSkin
-from gskin.src._cRegistry import SkinRegistry
+from gskin.src.MRegistry import MRegistry
 import numpy as np
 
 

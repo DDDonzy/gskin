@@ -124,6 +124,7 @@ class TopologyContext:
     def update_topology(self, mFnMesh: OpenMaya.MFnMesh = None, update_csr: bool = True):
         """
         更新顶点位置数据
+        TODO polygon edge 查询效率太低了,想办法优化
         Args:
             mFnMesh (OpenMaya.MFnMesh): 输入mFnMesh, 如果不输入, 自动使用`self.mFnMesh`
             update_csr (bool): 是否更新 csr 邻边数据. Default = True.
@@ -184,6 +185,7 @@ class TopologyContext:
         """
         MFnMesh 不返回三边面的边信息,
         通过输入三角面的点序号信息,计算出三角面的边信息
+        TODO python效率太低了, 想办法优化
         Args:
             tri_indices (list|memoryview|array): 三角面点索引, 通过MFnMesh.getTriangles获取
         Return:
@@ -216,6 +218,7 @@ class TopologyContext:
     def get_v2v_adjacency(num_vertices, edge_indices):
         """
         构建顶点到顶点 (Vertex-to-Vertex) 的 CSR 格式邻接表
+        TODO python效率太低了, 想办法优化
         Args:
             num_vertices (int): 模型的顶点总数
             edge_indices (memoryview): 生成的去重边数组
@@ -252,6 +255,7 @@ class TopologyContext:
     def get_v2f_adjacency(num_vertices, tri_face_indices):
         """
         构建顶点到面 (Vertex-to-Face) 的 CSR 格式邻接表
+        TODO python效率太低了, 想办法优化
         Args:
             num_vertices (int): 模型的顶点总数
             tri_face_indices (memoryview): 三角面点索引, 通过MFnMesh.getTriangles获取
@@ -300,8 +304,7 @@ class TopologyContext:
             - `self.mFnMesh`
         """
         try:
-            sel = OpenMaya.MSelectionList()
-            sel.add(input_string)
+            sel = OpenMaya.MGlobal.getSelectionListByName(input_string)
         except RuntimeError as e:
             raise RuntimeError(f"Invalid input_string '{input_string}'.") from e
 

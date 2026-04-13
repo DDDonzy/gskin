@@ -6,7 +6,7 @@ import maya.api.OpenMaya as om
 import maya.api.OpenMayaUI as omui
 import maya.api.OpenMayaRender as omr
 
-from gskin.src._cRegistry import SkinRegistry
+from gskin.src.MRegistry import MRegistry
 from gskin.src import cColorCython as cColor
 from gskin.src._cProfilerCython import MayaNativeProfiler, maya_profile
 
@@ -376,7 +376,7 @@ class TriangleShape(om.MPxSurfaceShape):
         if plug.isConnected:
             conns = plug.connectedTo(True, False)
             if conns:
-                return SkinRegistry.get_instance_by_api2(conns[0].node())
+                return MRegistry.get_instance(conns[0].node())
         return None
 
     def fast_sync_from_cSkin(self, cSkin: CythonSkinDeformer):
