@@ -42,6 +42,8 @@ class MemTestNode(mpx.MPxNode):
         h_dummy.setFloat(1.0 if refresh_val else 0.0)
 
         dataBlock.setClean(plug)
+    def __del__(self):
+        print("__del__")
 
 
 def nodeCreator():

@@ -90,7 +90,13 @@ class MRegistry:
 
         hash_code = cls.get_hash(mObject)
 
-        return cls._storage.get(hash_code, None)
+        # 先从 WeakValueDictionary 中取出真实的实例
+        instance = cls._storage.get(hash_code, None)
+
+        # 如果实例存在, 返回 weakref.proxy
+        if instance is not None:
+            return weakref.proxy(instance)
+        return None
 
     @staticmethod
     def _get_mObject_by_string(input_string: str) -> OpenMaya2.MObject:

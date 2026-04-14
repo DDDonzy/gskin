@@ -1,7 +1,7 @@
 from __future__ import annotations
-import array
+
 import ctypes
-from re import M
+import weakref
 
 
 from maya import cmds, mel
@@ -205,7 +205,6 @@ class CSkinDeform(OpenMayaMPx.MPxDeformerNode):
             - `self.mFnDependNode`
             - `self.hashCode`
         """
-        print("postConstructor")
         # fmt:off
         self.mObject       = self.thisMObject()
         self.mFnDependNode = OpenMaya.MFnDependencyNode(self.mObject)
@@ -411,7 +410,7 @@ class CSkinDeform(OpenMayaMPx.MPxDeformerNode):
             - `self.layer_manager`
         """
         self.layer_manager.update_from_dataBlock(dataBlock)
-        print(self.layer_manager)
+        # print(self.layer_manager)
 
     def compute(self, plug, dataBlock: OpenMaya.MDataBlock):
         """
@@ -714,15 +713,25 @@ class WeightsLayerManager:
 
 class FnCSkinDeform:
     __slots__ = (
-        "instance",
+        "_instance_ref",
         "node_name",
     )
     instance: CSkinDeform
     node_name: str
 
     def __init__(self, cSkin_instance: CSkinDeform):
-        self.instance = cSkin_instance
-        self.node_name = self.instance.mFnDependNode.name()
+        # 强制将传入的实例转为 proxy
+        # 如果传进来的已经是 proxy, weakref.proxy 会安全放行
+        if isinstance(cSkin_instance, weakref.ProxyTypes):
+            self._instance_ref = cSkin_instance
+        else:
+            self._instance_ref = weakref.proxy(cSkin_instance)
+
+        self.node_name = self._instance_ref.mFnDependNode.name()
+
+    @property
+    def instance(self) -> CSkinDeform:
+        return self._instance_ref
 
     @classmethod
     def from_string(cls, input_string: str):
