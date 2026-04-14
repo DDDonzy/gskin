@@ -10,10 +10,10 @@ import maya.api.OpenMayaAnim as OpenMayaAnim2  # type:ignore
 import maya.OpenMaya as OpenMaya  # type:ignore
 import maya.OpenMayaMPx as OpenMayaMPx  # type:ignore
 
-from . import cDirtyEvent
 from . import cSkinDeformCython
 from .MProfiler import MProfiler
 from .MRegistry import MRegistry
+from .MDirtyEvent import DirtyEvent
 from .MWeightsHandle import MWeightsHandle
 from .MTopologyContext import TopologyContext
 
@@ -139,29 +139,29 @@ class CSkinDeform(OpenMayaMPx.MPxDeformerNode):
     def init_dirtyEvent(self):
         # dirty flag
         # fmt:off
-        self.event_envelope                 = cDirtyEvent.DirtyEventHandler(self.aEnvelope, 
+        self.event_envelope                 = DirtyEvent(self.aEnvelope, 
                                                                             self._update_envelope)
-        self.event_update_mesh              = cDirtyEvent.DirtyEventHandler(self.aInputGeometry, 
+        self.event_update_mesh              = DirtyEvent(self.aInputGeometry, 
                                                                             self._update_mesh)
-        self.event_update_influences_matrix = cDirtyEvent.DirtyEventHandler(self.aInfluenceMatrix, 
+        self.event_update_influences_matrix = DirtyEvent(self.aInfluenceMatrix, 
                                                                             self._update_influences_matrix)
-        self.event_update_bind_pre_matrix   = cDirtyEvent.DirtyEventHandler(self.aBindPreMatrix, 
+        self.event_update_bind_pre_matrix   = DirtyEvent(self.aBindPreMatrix, 
                                                                             self._update_bind_pre_matrix)
-        self.event_update_geo_matrix        = cDirtyEvent.DirtyEventHandler(self.aGeomMatrix, 
+        self.event_update_geo_matrix        = DirtyEvent(self.aGeomMatrix, 
                                                                             self._update_geo_matrix)
-        self.event_update_deform_matrix     = cDirtyEvent.DirtyEventHandler((self.aInfluenceMatrix,
+        self.event_update_deform_matrix     = DirtyEvent((self.aInfluenceMatrix,
                                                                              self.aBindPreMatrix,
                                                                              self.aGeomMatrix),
                                                                             self._update_deform_matrices,)  # fmt:skip
-        self.event_update_paint_information = cDirtyEvent.DirtyEventHandler((self.aCurrentPaintLayerIndex,
+        self.event_update_paint_information = DirtyEvent((self.aCurrentPaintLayerIndex,
                                                                              self.aCurrentPaintInfluenceIndex,
                                                                              self.aCurrentPaintMaskBool),
                                                                             self._update_paint_information)  # fmt:skip
-        self.event_update_weights           = cDirtyEvent.DirtyEventHandler((self.aWeights,
+        self.event_update_weights           = DirtyEvent((self.aWeights,
                                                                              self.aMaskWeights,
                                                                              self.aLockMasks), 
                                                                              self._update_weights)
-        self.event_update_layer_manager     = cDirtyEvent.DirtyEventHandler((self.aMaskWeights,
+        self.event_update_layer_manager     = DirtyEvent((self.aMaskWeights,
                                                                              self.aLockMasks,
                                                                              self.aLayerCompound,
                                                                              self.aLayerName,

@@ -5,11 +5,11 @@ import weakref
 import maya.OpenMaya as OpenMaya  # type: ignore
 
 __all__ = [
-    "DirtyEventHandler",
+    "DirtyEvent",
 ]
 
 
-class DirtyEventHandler:
+class DirtyEvent:
     """
     传入 Attribute MObject 和 对应的事件函数
     通过 sync 检测是否为脏, 通过 execute 判断执行回调函数
@@ -24,7 +24,7 @@ class DirtyEventHandler:
         def __init__(self):
             super().__init__()
             # 1. 初始化并绑定监听的属性与对应的执行动作
-            self.weights_event = DirtyEventHandler(
+            self.weights_event = DirtyEvent(
                 triggers=(self.aWeights, self.aLayer),
                 functions=self._update_weights_cache
             )
