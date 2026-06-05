@@ -1,0 +1,84 @@
+%% gskin · 视口渲染流程（VP2 直写）
+%% 视角：从 triangleShape 节点求值到 GPU 显存直写。
+
+flowchart TB
+    subgraph Compute["TriangleShape.compute（Maya DG 触发）"]
+        direction TB
+        C1[outDummy 被请求求值] --> C2[读 channelBox 属性]
+        C2 --> C2a[lineWidth / pointSize]
+        C2 --> C2b[drawFaces / Lines / Points]
+        C2 --> C2c[default 三色 + draw 开关]
+        C2 --> C2d[wire / vertex / mask / weights / brush<br/>RemapA/B color × 8]
+
+        C1 --> C3[_update_from_cSkin]
+        C3 --> C3a[get_cSkin_instance<br/>不触发 DG，直接取 plug.connectedTo]
+        C3a --> C3b[MRegistry.get_instance]
+
+        C3b --> C4[挂载 cSkin.mesh_context 指针]
+        C4 --> C4a[render_data.vertices_pos<br/>← mesh_ctx.vertex_positions]
+        C4 --> C4b[render_data.face_indices<br/>← mesh_ctx.triangle_indices]
+        C4 --> C4c[render_data.line_indices<br/>← mesh_ctx.quad_edge_indices]
+
+        C3b --> C5[get_active_paint_weights<br/>取 paint_weights_view]
+        C3b --> C6[挂 brush_context<br/>hit_indices/weights/count]
+        C5 --> C7[全部脏标置位<br/>dirty_face/line/point_colors]
+        C6 --> C7
+    end
+
+    subgraph Update["TriangleOverride.update（每帧）"]
+        direction TB
+        U1{cSkin.isDirty_brushFastPreview?} -->|True| U2[fast_sync_from_cSkin<br/>跳过 DG]
+        U1 -->|False| U3[拉 outDummy.asInt<br/>触发 compute 全量]
+
+        U2 --> U4[_init_render_items<br/>6 个 RenderItem 初装]
+        U3 --> U4
+
+        U4 --> U5[_init_gpu_buffers<br/>vertex + 3×color + 3×index + 1×default]
+
+        U5 --> U6[_sync_topology_buffers]
+        U6 --> U6a[acquire vertex_buffer<br/>memmove vertices_pos]
+        U6 --> U6b[acquire index_buffer_face/line/point<br/>memmove indices]
+
+        U6 --> U7[_sync_color_buffers]
+        U7 --> U7a[gpu_write_session<br/>color_buffer_face]
+        U7 --> U7b[gpu_write_session<br/>color_buffer_line]
+        U7 --> U7c[gpu_write_session<br/>color_buffer_point]
+
+        U7a --> CC[_calculate_colors_direct]
+        U7b --> CC
+        U7c --> CC
+
+        CC --> CCa[render_fill<br/>线/点底色填充]
+        CC --> CCb{paint_weights_view?}
+        CCb -->|is_mask| CCc[render_gradient<br/>mask 双色]
+        CCb -->|alpha mode| CCd[render_gradient<br/>weights 双色]
+        CCb -->|heat mode| CCe[render_heatmap<br/>5 段静态梯度]
+        CCb -->|None| CCf[render_fill 蓝底]
+
+        CC --> CCg{brush_hit_count > 0?}
+        CCg -->|是| CCh[render_brush_gradient<br/>按 hit_indices 散点高亮]
+
+        U7 --> U8[_update_render_items_state]
+        U8 --> U8a[shader.setParameter<br/>lineWidth / pointSize / solidColor]
+        U8 --> U8b[render_item.enable<br/>has_vertices && has_*]
+
+        U8 --> U9[setGeometryForRenderItem × 6<br/>绑定 vertex/index buffer + bbox]
+    end
+
+    Compute --> Update
+
+    subgraph Items["6 个 RenderItem"]
+        direction LR
+        IT1[face<br/>k3dCPVSolidShader]
+        IT2[line<br/>k3dCPVThickLineShader]
+        IT3[point<br/>k3dCPVFatPointShader]
+        IT4[default_face<br/>k3dSolidShader]
+        IT5[default_line<br/>k3dThickLineShader]
+        IT6[default_point<br/>k3dFatPointShader]
+    end
+
+    U9 --> Items
+    Items --> GPU[Maya VP2<br/>渲染输出]
+
+    classDef hot fill:#fff1f0,stroke:#ff4d4f,color:#820014
+    class CCe,CCh,U6a hot

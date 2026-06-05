@@ -1,0 +1,58 @@
+%% gskin · 总体业务流程
+%% 涵盖三大主线：① 创建蒙皮 → ② 编辑权重（笔刷/层） → ③ 实时渲染
+
+flowchart TB
+    subgraph Boot["① 启动与编译"]
+        direction LR
+        B1[mayapy build.py]:::build --> B2[cythonize<br/>*Cython.py → .pyd]:::build
+        B3[reload_all_plugins]:::build --> B4[loadPlugin × 4]:::build
+    end
+
+    subgraph Setup["② 创建蒙皮"]
+        direction TB
+        S1[FnCSkinDeform.create_cSkinDeform_<br/>from_skinCluster] --> S2[cmds.deformer<br/>type=cSkinDeformer]
+        S2 --> S3[CSkinDeform.postConstructor]
+        S3 --> S4[MRegistry.register]
+        S2 --> S5[connect skinCluster.matrix /<br/>bindPreMatrix → cSkin]
+        S5 --> S6[FnCSkinDeform.set_weights<br/>MWeightsHandle 写入]
+        S6 --> S7[原 skinCluster.envelope = 0]
+    end
+
+    subgraph Eval["③ 蒙皮求值（每帧）"]
+        direction TB
+        E1{触发源} --> E2[Maya DG / Parallel]
+        E1 --> E3[FnCSkinDeform.set_dirty + pull_output]
+        E1 --> E4[Brush fast preview]
+        E2 --> E5[CSkinDeform.compute → deform]
+        E3 --> E5
+        E5 --> E6[8× DirtyEvent.execute]
+        E6 --> E7[cal_deform_matrices]
+        E7 --> E8[run_skinning_core 全量]
+        E4 --> E9[run_partial_skinning_core 局部]
+    end
+
+    subgraph Edit["④ 编辑权重"]
+        direction TB
+        D1[选择 mesh + setToolTo cBrushCtx] --> D2[WeightBrushContext.toolOnSetup]
+        D2 --> D3[TabletTracker 启动]
+        D2 --> D4[StrokeInterpolator 启动]
+        D2 --> D5[绑定 cSkin via MRegistry]
+        D5 --> D6[doPress / doDrag / doRelease]
+        D6 --> D7[Raycast → Falloff → Math → Undo]
+    end
+
+    subgraph Render["⑤ 视口渲染"]
+        direction TB
+        R1[triangleShape 节点连 inputMesh] --> R2[TriangleShape.compute]
+        R2 --> R3[读 channelBox + 拉 cSkin 指针]
+        R3 --> R4[TriangleOverride.update]
+        R4 --> R5[GPU buffer acquire/commit<br/>6 个 RenderItem]
+    end
+
+    Boot --> Setup --> Eval
+    Eval --> Edit
+    Edit --> Eval
+    Eval --> Render
+    Edit --> Render
+
+    classDef build fill:#fffbe6,stroke:#fadb14,color:#5c3c00

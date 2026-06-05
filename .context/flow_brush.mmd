@@ -1,0 +1,79 @@
+%% gskin · 笔刷绘制流程
+%% 视角：从用户落笔到权重写回 + 局部预览渲染。
+
+flowchart TB
+    subgraph Init["工具激活 toolOnSetup"]
+        direction TB
+        I1[setToolTo cBrushCtx] --> I2[WeightBrushContext._into_brush]
+        I2 --> I3[读 active selection 拿 mesh DAG]
+        I3 --> I4[MRegistry.get_instance<br/>cSkinDeformer1]
+        I4 --> I5[挂载 engine / mesh_ctx / brush_ctx]
+        I5 --> I6[LinearStrokeInterpolator + TabletTracker 启动]
+    end
+
+    subgraph Hover["悬停 doPtrMoved"]
+        H1[event.position] --> H2[_process_single_point<br/>pressure=1.0, is_pressed=False]
+        H2 --> H3[engine.raycast<br/>双轨制 + 全网格盲扫]
+        H3 -->|命中| H4[draw_cursor 圆环]
+        H3 -->|未命中| H5[_clear_hit_state]
+    end
+
+    subgraph Press["按下 doPress"]
+        direction TB
+        P1[doPress event] --> P2[get_active_paint_weights<br/>解析 layer/influence/mask]
+        P2 --> P3[paint_stroke_coroutine 装配<br/>weights_manager 协程]
+        P3 --> P4{装配成功?}
+        P4 -->|否| P0[丢弃协程]
+        P4 -->|是| P5[engine.lock_mesh<br/>冻结网格快照]
+        P5 --> P6[stroke_tracker.begin_stroke]
+        P6 --> P7[首笔仅 raycast 不绘制<br/>刷新光标]
+    end
+
+    subgraph Drag["拖拽 doDrag（核心循环）"]
+        direction TB
+        DR1[event.position + tablet pressure] --> DR2[stroke_tracker.drag_stroke<br/>等距重采样]
+        DR2 --> DR3{interp_points?}
+        DR3 -->|有| LOOP[for x,y,p in interp_points]
+        DR3 -->|无| DR4[只 raycast 刷新光标]
+
+        LOOP --> SP1[_process_single_point<br/>is_pressed=True]
+        SP1 --> SP2[engine.raycast<br/>已 lock 用 frozen_vtx_positions]
+        SP2 --> SP3[engine.calc_brush_falloff<br/>胶囊体 / 表面 BFS]
+        SP3 --> SP4[更新 brush_ctx.hit_indices/<br/>weights/count/center]
+        SP4 --> SP5[BrushStrokeContext 打包<br/>mode/values/channel/<br/>pressure/iter/clamp]
+        SP5 --> SP6[stroke_coroutine.send ctx]
+
+        SP6 --> ME[MathEngine 分发]
+        ME --> ME0[mode 0/1/2/3<br/>_math_standard_stroke<br/>防重叠 max_falloff]
+        ME --> ME1[mode 4 Smooth<br/>邻居 CSR 均值]
+        ME --> ME2[mode 5 Sharp<br/>远离 0.5]
+
+        ME0 --> NM[normalize_weights<br/>priority=当前骨骼<br/>locks 优先保留]
+        ME1 --> NM
+        ME2 --> NM
+
+        NM --> FP[cSkin.fast_preview_deform<br/>active_indices, hit_count]
+        FP --> FP1[run_partial_skinning_core]
+        FP1 --> FP2[isDirty_brushFastPreview = True]
+
+        SP1 --> US[BrushUndoRecorder.record_snapshot<br/>仅首次触碰备份]
+
+        DR4 --> CUR[_update_dynamic_spacing<br/>3D 半径 → 2D 像素]
+        CUR --> DRW[draw_cursor]
+    end
+
+    subgraph Release["松开 doRelease"]
+        direction TB
+        RL1[闭合最后一笔<br/>_process_single_point] --> RL2[stroke_tracker.end_stroke]
+        RL2 --> RL3[stroke_coroutine.close<br/>触发 recorder.end_stroke]
+        RL3 --> RL4[通道压缩 → 稀疏增量<br/>modified_indices /<br/>channel_indices /<br/>old_sparse / new_sparse]
+        RL4 --> RL5[engine.unlock_mesh]
+        RL5 --> RL6[_clear_hit_state]
+    end
+
+    Init --> Hover
+    Hover --> Press --> Drag --> Release
+    Release --> Hover
+
+    classDef hot fill:#fff1f0,stroke:#ff4d4f,color:#820014
+    class SP2,SP3,ME0,ME1,ME2,FP1 hot

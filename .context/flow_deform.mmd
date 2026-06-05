@@ -1,0 +1,58 @@
+%% gskin · 蒙皮 deform 求值流程
+%% 视角：从 Maya 触发节点求值，到 Cython 完成顶点变形写回。
+
+flowchart TB
+    subgraph Trigger["触发源（任选其一）"]
+        direction LR
+        T1[Maya DG 模式<br/>setDependentsDirty plug]
+        T2[Maya Parallel 模式<br/>preEvaluation evalNode]
+        T3[FnCSkinDeform.set_dirty<br/>外部强制]
+        T4[Brush fast preview<br/>另走稀疏路径]
+    end
+
+    T1 --> P1[event.sync_from_plug × 8<br/>命中的 DirtyEvent 标脏]
+    T2 --> P1
+    T3 --> P1
+    P1 --> CO[CSkinDeform.compute<br/>强制 event_update_mesh.set_dirty]
+    CO --> DF[deform 入口<br/>逐个 event.execute<br/>未脏跳过]
+
+    subgraph Update["按需更新 CSkinContext（DirtyEvent 回调）"]
+        direction TB
+        U1[event_envelope<br/>→ ctx.envelope]
+        U2[event_update_mesh<br/>→ input_mesh / output_mesh<br/>position + topology]
+        U3[event_update_influences_matrix<br/>→ ctx.influences_matrix<br/>申请 c_double × N×16]
+        U4[event_update_bind_pre_matrix<br/>→ ctx.bind_pre_matrix]
+        U5[event_update_geo_matrix<br/>→ ctx.geo_matrix / inv / is_identity]
+        U6[event_update_paint_information<br/>→ paint layer/inf/mask]
+        U7[event_update_weights<br/>→ MWeightsHandle 重新解析<br/>num_vertices, num_influences]
+        U8[event_update_layer_manager<br/>→ WeightsLayerManager 重建 _items_dict]
+    end
+
+    DF --> U1 --> U2 --> U3 --> U4 --> U5 --> U6 --> U7 --> U8 --> M
+
+    subgraph Math["矩阵预计算（cSkinDeformCython）"]
+        direction TB
+        M[event_update_deform_matrix.execute] --> M1[校验 num_influences<br/>== num_bind_pre_matrix]
+        M1 --> M2[申请 rotate_matrix B×9<br/>+ translate_vector B×3]
+        M2 --> M3[cal_deform_matrices nogil<br/>Final = Geo · BindPre · BoneWorld · GeoInv]
+        M3 --> M4[拆解 4×4 → 3×3 旋转 + 1×3 平移]
+    end
+
+    M4 --> S
+    T4 --> SP
+
+    subgraph Solve["LBS 解算"]
+        direction TB
+        S[run_skinning_core 全量] --> S1[for v in num_vertices<br/>累加 Σ wv·rotate + translate]
+        S1 --> S2[envelope blend ≠ 1.0 时<br/>插值回原坐标]
+
+        SP[run_partial_skinning_core 局部] --> SP1[for v in vertex_indices<br/>同样 LBS<br/>命中点直接覆写输出]
+    end
+
+    S2 --> O[ctx.output_mesh.position 写回<br/>触发 outputGeometry 输出]
+    SP1 --> O2[output_mesh.position 局部覆写<br/>+ isDirty_brushFastPreview = True]
+    O --> R[下游 mesh 节点接收新坐标]
+    O2 --> R2[TriangleOverride 走 fast-path<br/>render-update-fast-path]
+
+    classDef hot fill:#fff1f0,stroke:#ff4d4f,color:#820014
+    class M3,S,SP hot
